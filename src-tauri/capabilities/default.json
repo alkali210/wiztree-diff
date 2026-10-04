@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "Main window with CSV selection and native drag-and-drop",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open"
+  ]
+}
