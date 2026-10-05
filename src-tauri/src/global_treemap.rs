@@ -404,7 +404,12 @@ fn totals(conn: &Connection, metric: Metric, mode: ChartMode) -> Result<Totals> 
         ChartMode::After => "sum(after_file)",
         ChartMode::Delta => "count(*)",
     };
-    let sql = format!("SELECT coalesce({files},0),coalesce(sum({w}>0),0),coalesce(sum({w}),0),coalesce(sum(CASE WHEN {value}>0 THEN {value} ELSE 0 END),0),coalesce(sum(CASE WHEN {value}<0 THEN -{value} ELSE 0 END),0),coalesce(sum({value}),0),coalesce(sum(added),0) FROM treemap_weights WHERE leaf=1", w=COLUMNS[v]);
+    let visible = if matches!(mode, ChartMode::Delta) {
+        "added>0 OR removed>0 OR type_changed>0 OR modified>0"
+    } else {
+        "1"
+    };
+    let sql = format!("SELECT coalesce({files},0),coalesce(sum({w}>0 AND ({visible})),0),coalesce(sum({w}),0),coalesce(sum(CASE WHEN {value}>0 THEN {value} ELSE 0 END),0),coalesce(sum(CASE WHEN {value}<0 THEN -{value} ELSE 0 END),0),coalesce(sum({value}),0),coalesce(sum(added),0) FROM treemap_weights WHERE leaf=1", w=COLUMNS[v]);
     let mut t = conn
         .query_row(&sql, [], |r| {
             Ok(Totals {
@@ -496,6 +501,9 @@ impl Geometry {
     }
     fn node(self) -> i64 {
         self.key.abs()
+    }
+    fn visible(self, mode: ChartMode) -> bool {
+        !matches!(mode, ChartMode::Delta) || self.marks != 0
     }
     fn bounds(self) -> TreemapRect {
         TreemapRect {
@@ -1181,97 +1189,85 @@ fn paint(
     pixels: &mut [u8],
 ) -> Result<()> {
     let mut ticks = 0u64;
-    if matches!(mode, ChartMode::Delta) {
-        let mut query = conn.prepare("SELECT png FROM treemap_frames WHERE view=?1")?;
-        let mut rows = query.query([v])?;
-        let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-        let png = row
-            .get_ref(0)?
-            .as_blob()
-            .map_err(|e| ApiError::new("CACHE_INVALID", e.to_string()))?;
-        let mut reader = png::Decoder::new(std::io::Cursor::new(png))
-            .read_info()
-            .map_err(|e| ApiError::new("IMAGE_ERROR", e.to_string()))?;
-        reader
-            .next_frame(pixels)
-            .map_err(|e| ApiError::new("IMAGE_ERROR", e.to_string()))?;
-    } else {
-        for p in pixels.chunks_exact_mut(4) {
-            p.copy_from_slice(&[52, 55, 59, 255]);
+    for p in pixels.chunks_exact_mut(4) {
+        p.copy_from_slice(&[52, 55, 59, 255]);
+    }
+    scan_geometry(conn, control, v, |g| {
+        if !g.leaf || !g.visible(mode) {
+            return Ok(());
         }
-        scan_geometry(conn, control, v, |g| {
-            if !g.leaf {
-                return Ok(());
-            }
-            let mut x = g.rect.x * ATLAS_WIDTH as f64;
-            let mut y = g.rect.y * ATLAS_HEIGHT as f64;
-            let mut w = g.rect.w * ATLAS_WIDTH as f64;
-            let mut h = g.rect.h * ATLAS_HEIGHT as f64;
-            if g.header > 0.0 {
-                x += DIRECTORY_GUTTER;
-                y += g.header * ATLAS_HEIGHT as f64;
-                w -= DIRECTORY_GUTTER * 2.0;
-                h -= g.header * ATLAS_HEIGHT as f64 + DIRECTORY_GUTTER;
-            }
-            let x0 = x.floor().max(0.0) as u32;
-            let y0 = y.floor().max(0.0) as u32;
-            let x1 = (x + w).ceil().max(x0 as f64 + 1.0).min(ATLAS_WIDTH as f64) as u32;
-            let y1 = (y + h).ceil().max(y0 as f64 + 1.0).min(ATLAS_HEIGHT as f64) as u32;
-            for py in y0..y1 {
-                let cy = ((y + h).min(py as f64 + 1.0) - y.max(py as f64))
+        let mut x = g.rect.x * ATLAS_WIDTH as f64;
+        let mut y = g.rect.y * ATLAS_HEIGHT as f64;
+        let mut w = g.rect.w * ATLAS_WIDTH as f64;
+        let mut h = g.rect.h * ATLAS_HEIGHT as f64;
+        if g.header > 0.0 {
+            x += DIRECTORY_GUTTER;
+            y += g.header * ATLAS_HEIGHT as f64;
+            w -= DIRECTORY_GUTTER * 2.0;
+            h -= g.header * ATLAS_HEIGHT as f64 + DIRECTORY_GUTTER;
+        }
+        let x0 = x.floor().max(0.0) as u32;
+        let y0 = y.floor().max(0.0) as u32;
+        let x1 = (x + w).ceil().max(x0 as f64 + 1.0).min(ATLAS_WIDTH as f64) as u32;
+        let y1 = (y + h).ceil().max(y0 as f64 + 1.0).min(ATLAS_HEIGHT as f64) as u32;
+        for py in y0..y1 {
+            let cy = ((y + h).min(py as f64 + 1.0) - y.max(py as f64))
+                .max(0.0)
+                .min(h);
+            for px in x0..x1 {
+                ticks += 1;
+                if ticks % 512 == 0 {
+                    control.check()?;
+                }
+                let cx = ((x + w).min(px as f64 + 1.0) - x.max(px as f64))
                     .max(0.0)
-                    .min(h);
-                for px in x0..x1 {
-                    ticks += 1;
-                    if ticks % 512 == 0 {
-                        control.check()?;
-                    }
-                    let cx = ((x + w).min(px as f64 + 1.0) - x.max(px as f64))
-                        .max(0.0)
-                        .min(w);
-                    let coverage = (cx * cy).clamp(0.0, 1.0);
-                    let u = ((px as f64 + 0.5 - x) / w).clamp(0.0, 1.0);
-                    let z = ((py as f64 + 0.5 - y) / h).clamp(0.0, 1.0);
-                    let cushion = 0.74 + 0.26 * (4.0 * u * (1.0 - u) * 4.0 * z * (1.0 - z)).sqrt();
-                    let edge = if w > 5.0
-                        && h > 5.0
-                        && (px == x0 || py == y0 || px + 1 == x1 || py + 1 == y1)
+                    .min(w);
+                let coverage = (cx * cy).clamp(0.0, 1.0);
+                let u = ((px as f64 + 0.5 - x) / w).clamp(0.0, 1.0);
+                let z = ((py as f64 + 0.5 - y) / h).clamp(0.0, 1.0);
+                let cushion = 0.74 + 0.26 * (4.0 * u * (1.0 - u) * 4.0 * z * (1.0 - z)).sqrt();
+                let edge =
+                    if w > 5.0 && h > 5.0 && (px == x0 || py == y0 || px + 1 == x1 || py + 1 == y1)
                     {
                         0.65
                     } else {
                         1.0
                     };
-                    let i = ((py * ATLAS_WIDTH + px) * 4) as usize;
-                    for c in 0..3 {
-                        pixels[i + c] = (pixels[i + c] as f64 * (1.0 - coverage)
-                            + g.color[c] as f64 * cushion * edge * coverage)
-                            .round() as u8;
-                    }
+                let i = ((py * ATLAS_WIDTH + px) * 4) as usize;
+                for c in 0..3 {
+                    pixels[i + c] = (pixels[i + c] as f64 * (1.0 - coverage)
+                        + g.color[c] as f64 * cushion * edge * coverage)
+                        .round() as u8;
                 }
             }
-            Ok(())
-        })?;
-        // Directory boundaries are decoration, never omitted leaf weight.
-        let mut query=conn.prepare("SELECT r.x,r.y,r.width,r.height FROM treemap_rects r JOIN comparison_nodes c ON c.node_id=r.node_id WHERE r.view=?1 AND r.leaf=0 AND c.expandable=1 AND r.width*4096>=8 AND r.height*1024>=8 ORDER BY r.id")?;
-        let mut rows = query.query([v])?;
-        while let Some(row) = rows.next()? {
-            control.check()?;
-            let r = BoxRect {
-                x: row.get(0)?,
-                y: row.get(1)?,
-                w: row.get(2)?,
-                h: row.get(3)?,
-            };
-            let (x, y, ex, ey) = pixel_bounds(r);
-            if ex > x && ey > y {
-                for px in x..ex {
-                    darken(pixels, px, y);
-                    darken(pixels, px, ey - 1);
-                }
-                for py in y..ey {
-                    darken(pixels, x, py);
-                    darken(pixels, ex - 1, py);
-                }
+        }
+        Ok(())
+    })?;
+    // Directory boundaries are decoration, never omitted leaf weight.
+    let sql = if matches!(mode, ChartMode::Delta) {
+        "SELECT r.x,r.y,r.width,r.height FROM treemap_rects r JOIN comparison_nodes c ON c.node_id=r.node_id JOIN treemap_weights w ON w.key=r.key WHERE r.view=?1 AND r.leaf=0 AND c.expandable=1 AND r.width*4096>=8 AND r.height*1024>=8 AND (w.added>0 OR w.removed>0 OR w.type_changed>0 OR w.modified>0) ORDER BY r.id"
+    } else {
+        "SELECT r.x,r.y,r.width,r.height FROM treemap_rects r JOIN comparison_nodes c ON c.node_id=r.node_id WHERE r.view=?1 AND r.leaf=0 AND c.expandable=1 AND r.width*4096>=8 AND r.height*1024>=8 ORDER BY r.id"
+    };
+    let mut query = conn.prepare(sql)?;
+    let mut rows = query.query([v])?;
+    while let Some(row) = rows.next()? {
+        control.check()?;
+        let r = BoxRect {
+            x: row.get(0)?,
+            y: row.get(1)?,
+            w: row.get(2)?,
+            h: row.get(3)?,
+        };
+        let (x, y, ex, ey) = pixel_bounds(r);
+        if ex > x && ey > y {
+            for px in x..ex {
+                darken(pixels, px, y);
+                darken(pixels, px, ey - 1);
+            }
+            for py in y..ey {
+                darken(pixels, x, py);
+                darken(pixels, ex - 1, py);
             }
         }
     }
@@ -1394,14 +1390,6 @@ fn frame_labels(
     v: i64,
     mode: ChartMode,
 ) -> Result<(Vec<TreemapLabel>, i64)> {
-    if matches!(mode, ChartMode::Delta) {
-        let (labels, count): (String, i64) = conn.query_row(
-            "SELECT labels,rendered_block_count FROM treemap_frames WHERE view=?1",
-            [v],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        return Ok((serde_json::from_str(&labels).map_err(json_error)?, count));
-    }
     let side = if matches!(mode, ChartMode::After) {
         1
     } else {
@@ -1412,6 +1400,9 @@ fn frame_labels(
     let mut rendered = 0;
     let mut kind = conn.prepare("SELECT kind FROM entries WHERE node_id=?1 AND side=?2")?;
     scan_geometry(conn, control, v, |g| {
+        if !g.visible(mode) {
+            return Ok(());
+        }
         if g.leaf {
             rendered += 1;
         }
@@ -1550,12 +1541,15 @@ pub fn get_bounds(
         return Err(ApiError::new("INVALID_NODE", "节点不存在或已过期"));
     }
     ensure_frame(conn, metric, mode, max_depth)?;
+    if matches!(mode,ChartMode::Delta) && !conn.query_row("SELECT added>0 OR removed>0 OR type_changed>0 OR modified>0 FROM treemap_weights WHERE key=?1",[n],|r|r.get::<_,bool>(0))? {return Ok(None);}
     let v = geometry_view(conn, cache_view(metric, mode, max_depth))?;
     let mut ancestors=conn.prepare("WITH RECURSIVE ancestors(id,parent_id,d) AS (SELECT id,parent_id,0 FROM nodes WHERE id=?1 UNION ALL SELECT n.id,n.parent_id,a.d+1 FROM nodes n JOIN ancestors a ON n.id=a.parent_id) SELECT id FROM ancestors ORDER BY d")?;
     let mut rows = ancestors.query([n])?;
     while let Some(row) = rows.next()? {
         if let Some(g) = cached_geometry(conn, v, row.get(0)?)? {
-            return Ok(Some(g.bounds()));
+            if g.visible(mode) {
+                return Ok(Some(g.bounds()));
+            }
         }
     }
     Ok(None)
@@ -1592,6 +1586,9 @@ pub fn hit_test(
             let mut g = Geometry::decode(record);
             g.rect = transform.rect(g.rect);
             decorate(&mut g, &mut directory, v)?;
+            if !g.visible(mode) {
+                continue;
+            }
             let r = g.rect;
             let height = if g.leaf { r.h } else { g.header };
             if (g.leaf || g.header > 0.0)

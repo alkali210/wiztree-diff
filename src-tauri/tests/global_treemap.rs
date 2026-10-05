@@ -52,9 +52,12 @@ fn file_rects(
     } else {
         "allocated"
     };
-    let mut query=c.prepare(&format!("SELECT node_id,{column} FROM entries WHERE side=?1 AND kind='file' AND {column}>0 ORDER BY node_id")).unwrap();
+    let mut query=c.prepare(&format!("SELECT e.node_id,e.{column} FROM entries e JOIN comparison_nodes n ON n.node_id=e.node_id WHERE e.side=?1 AND e.kind='file' AND e.{column}>0 AND (?2=0 OR n.status!='unchanged') ORDER BY e.node_id")).unwrap();
     let rects = query
-        .query_map([side], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .query_map(
+            params![side, matches!(mode, ChartMode::Delta) as i64],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
         .unwrap()
         .map(|r| {
             let (id, weight) = r.unwrap();
@@ -86,7 +89,11 @@ fn appending_other_views_preserves_precise_hits_in_existing_maps() {
     let mut after = before.clone();
     for i in 0..1027 {
         before.push_str(&format!("C:\\file{i}.bin,{},{:}\n", i % 17 + 1, i % 23 + 1));
-        after.push_str(&format!("C:\\file{i}.bin,{},{:}\n", i % 11 + 1, i % 29 + 1));
+        after.push_str(&format!(
+            "C:\\file{i}.bin,{},{:}\n",
+            i % 11 + 101,
+            i % 29 + 101
+        ));
     }
     let (_dir, c) = build(&before, &after);
     for metric in [Metric::Size, Metric::Allocated] {
@@ -314,7 +321,7 @@ fn unlimited_global_baseline_views_preserve_integer_totals_hierarchy_and_ownersh
             9007199254741670i64,
         ),
         (Metric::Size, ChartMode::After, 607, 606, 9007199254742269),
-        (Metric::Size, ChartMode::Delta, 609, 606, 9007199254741670),
+        (Metric::Size, ChartMode::Delta, 609, 603, 9007199254741670),
         (
             Metric::Allocated,
             ChartMode::Before,
@@ -333,7 +340,7 @@ fn unlimited_global_baseline_views_preserve_integer_totals_hierarchy_and_ownersh
             Metric::Allocated,
             ChartMode::Delta,
             609,
-            607,
+            603,
             9007199254742281,
         ),
     ];
@@ -345,20 +352,11 @@ fn unlimited_global_baseline_views_preserve_integer_totals_hierarchy_and_ownersh
         );
         assert_eq!(frame.weight_total, weight.to_string());
         assert!(frame.labels.len() <= 320);
-        let png = base64::engine::general_purpose::STANDARD
-            .decode(
-                frame
-                    .image_data_url
-                    .strip_prefix("data:image/png;base64,")
-                    .unwrap(),
-            )
-            .unwrap();
-        let decoder = png::Decoder::new(std::io::Cursor::new(png));
-        let reader = decoder.read_info().unwrap();
-        assert_eq!((reader.info().width, reader.info().height), (4096, 1024));
         let rects = file_rects(&c, metric, mode);
         assert_eq!(rects.len() as u64, visible);
-        assert_eq!(rects.iter().map(|r| r.5).sum::<i64>(), weight);
+        if !matches!(mode, ChartMode::Delta) {
+            assert_eq!(rects.iter().map(|r| r.5).sum::<i64>(), weight);
+        }
         for &(id, x, y, w, h, file_weight) in &rects {
             assert!(w > 0.0 && h > 0.0, "positive file lost area: {id}");
             assert!(x >= -1e-12 && y >= -1e-12 && x + w <= 1.0 + 1e-10 && y + h <= 1.0 + 1e-10);
@@ -614,7 +612,14 @@ fn hundred_thousand_actual_parents_and_sparse_roots_are_not_sampled_or_capped() 
         for mode in [ChartMode::Before, ChartMode::After, ChartMode::Delta] {
             let f = global_treemap::get_frame(&c, metric, mode, 0).unwrap();
             assert_eq!(f.file_count, 100001);
-            assert_eq!(f.visible_file_count, 100001);
+            assert_eq!(
+                f.visible_file_count,
+                if matches!(mode, ChartMode::Delta) {
+                    0
+                } else {
+                    100001
+                }
+            );
             assert_eq!(
                 f.weight_total,
                 if matches!(metric, Metric::Size) {
@@ -707,7 +712,7 @@ fn real_rust_depth_smoke_preserves_all_leaf_areas_and_cancelling_descendant_mark
     let (dir, c) = build(&b, &a);
     let root = node(&c, "C:\\deep\\export");
     let deep = node(&c, "C:\\deep\\export\\sub\\deep");
-    let hidden = node(&c, "C:\\deep\\export\\sub\\deep\\more\\keep.mp3");
+    let hidden = node(&c, "C:\\deep\\export\\sub\\deep\\grow.txt");
     for metric in [Metric::Size, Metric::Allocated] {
         for depth in [1, 3, 0] {
             let before = global_treemap::get_frame(&c, metric, ChartMode::Before, depth).unwrap();
@@ -715,7 +720,7 @@ fn real_rust_depth_smoke_preserves_all_leaf_areas_and_cancelling_descendant_mark
             let after = global_treemap::get_frame(&c, metric, ChartMode::After, depth).unwrap();
             assert_eq!(before.max_depth, depth);
             assert_eq!((before.file_count, before.visible_file_count), (5, 5));
-            assert_eq!((delta.file_count, delta.visible_file_count), (6, 5));
+            assert_eq!((delta.file_count, delta.visible_file_count), (6, 2));
             assert_eq!(delta.added_file_count, 1);
             assert_eq!(
                 (
@@ -741,7 +746,7 @@ fn real_rust_depth_smoke_preserves_all_leaf_areas_and_cancelling_descendant_mark
                     _ => 5,
                 }
             );
-            assert_eq!(delta.rendered_block_count, before.rendered_block_count);
+            assert_eq!(delta.rendered_block_count, if depth == 0 { 2 } else { 1 });
             for path in [
                 "C:\\deep\\export\\root.txt",
                 "C:\\deep\\export\\sub\\keep.bin",
@@ -753,10 +758,13 @@ fn real_rust_depth_smoke_preserves_all_leaf_areas_and_cancelling_descendant_mark
                 let b = global_treemap::get_bounds(&c, metric, ChartMode::Before, &id, depth)
                     .unwrap()
                     .unwrap();
-                let d = global_treemap::get_bounds(&c, metric, ChartMode::Delta, &id, depth)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(rect_tuple(&b), rect_tuple(&d));
+                let d =
+                    global_treemap::get_bounds(&c, metric, ChartMode::Delta, &id, depth).unwrap();
+                if path.ends_with("grow.txt") || path.ends_with("removed.bin") {
+                    assert_eq!(rect_tuple(&b), rect_tuple(&d.unwrap()));
+                } else {
+                    assert!(d.is_none());
+                }
             }
             let highlight =
                 global_treemap::get_bounds(&c, metric, ChartMode::Delta, &hidden, depth)
@@ -828,19 +836,47 @@ fn real_rust_depth_smoke_preserves_all_leaf_areas_and_cancelling_descendant_mark
 }
 
 #[test]
-fn unchanged_self_comparison_is_the_filled_before_map_at_every_depth() {
+fn unchanged_self_comparison_has_no_delta_blocks_or_hits_at_any_depth() {
     let csv="文件名称,大小,分配\nC:\\r\\,20,20\nC:\\r\\sub\\,20,20\nC:\\r\\sub\\a.txt,8,8\nC:\\r\\sub\\b.mp3,12,12\n";
     let (_dir, c) = build(csv, csv);
-    for depth in [1, 3, 0] {
-        let b = global_treemap::get_frame(&c, Metric::Size, ChartMode::Before, depth).unwrap();
-        let d = global_treemap::get_frame(&c, Metric::Size, ChartMode::Delta, depth).unwrap();
-        assert_eq!(d.weight_total, "20");
-        assert_eq!(d.net_delta, "0");
-        assert_eq!(d.added_file_count, 0);
-        assert!(
-            b.image_data_url == d.image_data_url,
-            "self comparison raster differs at depth {depth}"
-        );
+    let id = node(&c, "C:\\r\\sub\\a.txt");
+    for metric in [Metric::Size, Metric::Allocated] {
+        for depth in [1, 3, 0] {
+            let before = global_treemap::get_frame(&c, metric, ChartMode::Before, depth).unwrap();
+            let delta = global_treemap::get_frame(&c, metric, ChartMode::Delta, depth).unwrap();
+            assert_eq!(
+                (
+                    delta.file_count,
+                    delta.visible_file_count,
+                    delta.rendered_block_count
+                ),
+                (2, 0, 0)
+            );
+            assert_eq!(delta.weight_total, "20");
+            assert_eq!(delta.net_delta, "0");
+            assert!(delta.labels.is_empty());
+            let rgba = pixels(&delta);
+            assert!(rgba.chunks_exact(4).all(|p| p == &rgba[..4]));
+            assert_ne!(before.image_data_url, delta.image_data_url);
+            let r = global_treemap::get_bounds(&c, metric, ChartMode::Before, &id, depth)
+                .unwrap()
+                .unwrap();
+            assert!(
+                global_treemap::get_bounds(&c, metric, ChartMode::Delta, &id, depth)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(global_treemap::hit_test(
+                &c,
+                metric,
+                ChartMode::Delta,
+                r.x + r.width / 2.0,
+                r.y + r.height / 2.0,
+                depth
+            )
+            .unwrap()
+            .is_none());
+        }
     }
 }
 
@@ -1018,12 +1054,19 @@ fn revisiting_depths_preserves_exact_frames_and_mode_bounds() {
                 _ => 3,
             }
         );
-        assert_eq!(b.image_data_url, d.image_data_url);
+        assert_eq!(d.rendered_block_count, 0);
+        assert!(d.labels.is_empty());
+        assert_ne!(b.image_data_url, d.image_data_url);
         assert_eq!(b.image_data_url, a.image_data_url);
         let bounds = global_treemap::get_bounds(&c, Metric::Size, ChartMode::Before, &id, depth)
             .unwrap()
             .unwrap();
-        for mode in [ChartMode::After, ChartMode::Delta] {
+        assert!(
+            global_treemap::get_bounds(&c, Metric::Size, ChartMode::Delta, &id, depth)
+                .unwrap()
+                .is_none()
+        );
+        for mode in [ChartMode::After] {
             assert_eq!(
                 rect_tuple(&bounds),
                 rect_tuple(
@@ -1106,10 +1149,98 @@ fn unchanged_nested_files_reposition_correctly_when_ancestor_area_and_headers_ch
                 .unwrap()
                 .unwrap();
             assert_ne!(rect_tuple(rect), rect_tuple(&previous));
-            let delta = global_treemap::get_bounds(&c, metric, ChartMode::Delta, id, 0)
+            assert!(
+                global_treemap::get_bounds(&c, metric, ChartMode::Delta, id, 0)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn delta_hides_unchanged_blocks_but_preserves_cancelling_changes_and_baseline_positions() {
+    let before="文件名称,大小,分配\nC:\\r\\,180,180\nC:\\r\\grow.txt,40,40\nC:\\r\\shrink.bin,60,60\nC:\\r\\stable\\,80,80\nC:\\r\\stable\\same.mp3,80,80\n";
+    let after = before
+        .replace("grow.txt,40,40", "grow.txt,50,50")
+        .replace("shrink.bin,60,60", "shrink.bin,50,50");
+    let (_dir, c) = build(before, &after);
+    let (_empty_dir, empty) = build(before, before);
+    let same = node(&c, "C:\\r\\stable\\same.mp3");
+    let stable = node(&c, "C:\\r\\stable");
+    for metric in [Metric::Size, Metric::Allocated] {
+        let b = global_treemap::get_frame(&c, metric, ChartMode::Before, 0).unwrap();
+        let d = global_treemap::get_frame(&c, metric, ChartMode::Delta, 0).unwrap();
+        assert_eq!(
+            (d.file_count, d.visible_file_count, d.rendered_block_count),
+            (3, 2, 2)
+        );
+        assert_eq!(
+            (
+                d.weight_total.as_str(),
+                d.positive_total.as_str(),
+                d.negative_total.as_str(),
+                d.net_delta.as_str()
+            ),
+            ("180", "10", "10", "0")
+        );
+        assert!(d
+            .labels
+            .iter()
+            .all(|l| l.node_id != same && l.node_id != stable));
+        let rgba = pixels(&d);
+        let original = pixels(&b);
+        let blank =
+            pixels(&global_treemap::get_frame(&empty, metric, ChartMode::Delta, 0).unwrap());
+        let at = |r: &wiztree_diff_lib::types::TreemapRect| {
+            let x = ((r.x + r.width / 2.0) * d.atlas_width as f64) as usize;
+            let y = ((r.y + r.height / 2.0) * d.atlas_height as f64) as usize;
+            (y * d.atlas_width as usize + x) * 4
+        };
+        let r = global_treemap::get_bounds(&c, metric, ChartMode::Before, &same, 0)
+            .unwrap()
+            .unwrap();
+        let i = at(&r);
+        assert_eq!(&rgba[i..i + 4], &blank[..4]);
+        assert_ne!(&rgba[i..i + 4], &original[i..i + 4]);
+        assert!(
+            global_treemap::get_bounds(&c, metric, ChartMode::Delta, &same, 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(global_treemap::hit_test(
+            &c,
+            metric,
+            ChartMode::Delta,
+            r.x + r.width / 2.0,
+            r.y + r.height / 2.0,
+            0
+        )
+        .unwrap()
+        .is_none());
+        for (path, delta) in [("C:\\r\\grow.txt", "10"), ("C:\\r\\shrink.bin", "-10")] {
+            let id = node(&c, path);
+            let r = global_treemap::get_bounds(&c, metric, ChartMode::Before, &id, 0)
                 .unwrap()
                 .unwrap();
-            assert_eq!(rect_tuple(&previous), rect_tuple(&delta));
+            let changed = global_treemap::get_bounds(&c, metric, ChartMode::Delta, &id, 0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(rect_tuple(&r), rect_tuple(&changed));
+            let hit = global_treemap::hit_test(
+                &c,
+                metric,
+                ChartMode::Delta,
+                r.x + r.width / 2.0,
+                r.y + r.height / 2.0,
+                0,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(hit.node_id, id);
+            assert_eq!(hit.value, delta);
+            let i = at(&r);
+            assert_ne!(&rgba[i..i + 4], &rgba[..4]);
         }
     }
 }

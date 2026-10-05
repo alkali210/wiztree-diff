@@ -402,7 +402,7 @@ export function OccupancyCharts({
           </span>
           {mode === "delta" && (
             <>
-              <span className="scope-note">之前布局 · 差异边框</span>
+              <span className="scope-note">之前布局 · 仅差异块</span>
               {data.addedFileCount > 0 && (
                 <span title="新增文件没有之前面积；通过祖先边框提示，完整新增项目可在之后视图或目录树查看">
                   新增 {data.addedFileCount.toLocaleString()} 文件（见之后视图）
