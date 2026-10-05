@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension, Statement};
 
 pub const ATLAS_WIDTH: u32 = 4096;
 pub const ATLAS_HEIGHT: u32 = 1024;
+const SPATIAL_BLOCK: i64 = 256;
 const DIRECTORY_HEADER: f64 = 64.0;
 const DIRECTORY_GUTTER: f64 = 8.0;
 const PALETTE: [[u8; 3]; 16] = [
@@ -46,7 +47,6 @@ fn view(metric: Metric, mode: ChartMode) -> usize {
         }
 }
 const COLUMNS: [&str; 6] = ["sb", "sa", "sb", "ab", "aa", "ab"];
-const MODES: [ChartMode; 3] = [ChartMode::Before, ChartMode::After, ChartMode::Delta];
 
 pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
     control.check()?;
@@ -61,46 +61,59 @@ pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
     result
 }
 fn build(conn: &Connection, control: &JobControl) -> Result<()> {
-    conn.execute_batch("PRAGMA cache_size=-32768; PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-32768; PRAGMA mmap_size=0;")?;
     let transaction = conn.unchecked_transaction()?;
-    conn.execute_batch("CREATE TABLE treemap_weights(
+    // Ordinary files are their own leaves. Directory/file type changes and
+    // sparse exports with children under an opposite-side file retain both
+    // a container and an own-file leaf. Positive sibling keys stay unchanged.
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent_id);
+        CREATE TABLE treemap_weights(
         key INTEGER PRIMARY KEY,node_id INTEGER NOT NULL,parent_id INTEGER NOT NULL,depth INTEGER NOT NULL,leaf INTEGER NOT NULL,
         sb INTEGER NOT NULL CHECK(typeof(sb)='integer'),sa INTEGER NOT NULL CHECK(typeof(sa)='integer'),
         ab INTEGER NOT NULL CHECK(typeof(ab)='integer'),aa INTEGER NOT NULL CHECK(typeof(aa)='integer'),
         size_value INTEGER NOT NULL CHECK(typeof(size_value)='integer'),allocated_value INTEGER NOT NULL CHECK(typeof(allocated_value)='integer'),
         before_file INTEGER NOT NULL,after_file INTEGER NOT NULL,
         added INTEGER NOT NULL,removed INTEGER NOT NULL,type_changed INTEGER NOT NULL,modified INTEGER NOT NULL);
-        WITH RECURSIVE levels(id,level) AS (
-            SELECT id,1 FROM nodes WHERE parent_id IS NULL
-            UNION ALL SELECT n.id,l.level+1 FROM nodes n JOIN levels l ON n.parent_id=l.id)
-        INSERT INTO treemap_weights SELECT id,id,coalesce(parent_id,0),level,0,0,0,0,0,0,0,0,0,0,0,0,0 FROM nodes JOIN levels USING(id);
+        WITH RECURSIVE parents(id) AS MATERIALIZED (SELECT DISTINCT parent_id FROM nodes WHERE parent_id IS NOT NULL),
+        levels(id,level) AS (
+            SELECT n.id,1 FROM nodes n JOIN parents p ON p.id=n.id WHERE n.parent_id IS NULL
+            UNION ALL SELECT n.id,l.level+1 FROM levels l JOIN nodes n ON n.parent_id=l.id JOIN parents p ON p.id=n.id)
+        , own AS (SELECT n.id,coalesce(n.parent_id,0) parent_id,coalesce(l.level+1,1) level,
+            CASE WHEN c.before_kind='directory' OR c.after_kind='directory' OR child.id IS NOT NULL THEN 0 ELSE 1 END leaf,
+            CASE WHEN c.before_kind='file' THEN c.before_size ELSE 0 END sb,CASE WHEN c.after_kind='file' THEN c.after_size ELSE 0 END sa,
+            CASE WHEN c.before_kind='file' THEN c.before_allocated ELSE 0 END ab,CASE WHEN c.after_kind='file' THEN c.after_allocated ELSE 0 END aa,
+            coalesce(c.before_kind='file',0) bf,coalesce(c.after_kind='file',0) af,
+            coalesce(c.after_kind='file' AND (c.before_kind IS NULL OR c.before_kind!='file'),0) added,
+            coalesce(c.status='removed',0) removed,coalesce(c.status='typeChanged',0) changed,coalesce(c.status='modified',0) modified
+            FROM nodes n NOT INDEXED CROSS JOIN comparison_nodes c ON c.node_id=n.id
+            LEFT JOIN levels l ON l.id=n.parent_id LEFT JOIN parents child ON child.id=n.id)
+        INSERT INTO treemap_weights SELECT id,id,parent_id,level,leaf,
+            sb*leaf,sa*leaf,ab*leaf,aa*leaf,(sa-sb)*leaf,(aa-ab)*leaf,
+            bf*leaf,af*leaf,added*leaf,removed*leaf,changed*leaf,modified*leaf FROM own;
+        CREATE INDEX treemap_depth ON treemap_weights(depth,key) WHERE leaf=0;
         INSERT INTO treemap_weights
-        SELECT -n.id,n.id,n.id,w.depth+1,1,
-        CASE WHEN b.kind='file' THEN b.size ELSE 0 END,CASE WHEN a.kind='file' THEN a.size ELSE 0 END,
-        CASE WHEN b.kind='file' THEN b.allocated ELSE 0 END,CASE WHEN a.kind='file' THEN a.allocated ELSE 0 END,
-        (CASE WHEN a.kind='file' THEN a.size ELSE 0 END)-(CASE WHEN b.kind='file' THEN b.size ELSE 0 END),
-        (CASE WHEN a.kind='file' THEN a.allocated ELSE 0 END)-(CASE WHEN b.kind='file' THEN b.allocated ELSE 0 END),
-        coalesce(b.kind='file',0),coalesce(a.kind='file',0),
-        coalesce(a.kind='file' AND (b.kind IS NULL OR b.kind!='file'),0),coalesce(c.status='removed',0),
+        SELECT -c.node_id,c.node_id,c.node_id,w.depth+1,1,
+        CASE WHEN c.before_kind='file' THEN c.before_size ELSE 0 END,CASE WHEN c.after_kind='file' THEN c.after_size ELSE 0 END,
+        CASE WHEN c.before_kind='file' THEN c.before_allocated ELSE 0 END,CASE WHEN c.after_kind='file' THEN c.after_allocated ELSE 0 END,
+        (CASE WHEN c.after_kind='file' THEN c.after_size ELSE 0 END)-(CASE WHEN c.before_kind='file' THEN c.before_size ELSE 0 END),
+        (CASE WHEN c.after_kind='file' THEN c.after_allocated ELSE 0 END)-(CASE WHEN c.before_kind='file' THEN c.before_allocated ELSE 0 END),
+        coalesce(c.before_kind='file',0),coalesce(c.after_kind='file',0),
+        coalesce(c.after_kind='file' AND (c.before_kind IS NULL OR c.before_kind!='file'),0),coalesce(c.status='removed',0),
         coalesce(c.status='typeChanged',0),coalesce(c.status='modified',0)
-        FROM nodes n JOIN treemap_weights w ON w.key=n.id LEFT JOIN comparison_nodes c ON c.node_id=n.id
-        LEFT JOIN entries b ON b.node_id=n.id AND b.side=0 LEFT JOIN entries a ON a.node_id=n.id AND a.side=1
-        WHERE b.kind='file' OR a.kind='file';
-        CREATE INDEX treemap_depth ON treemap_weights(depth,key);
+        FROM treemap_weights w INDEXED BY treemap_depth CROSS JOIN comparison_nodes c ON c.node_id=w.node_id
+        WHERE w.leaf=0 AND (c.before_kind='file' OR c.after_kind='file');
         CREATE INDEX treemap_parent ON treemap_weights(parent_id);
         CREATE TABLE treemap_rects(id INTEGER PRIMARY KEY,view INTEGER NOT NULL,key INTEGER NOT NULL,node_id INTEGER NOT NULL,leaf INTEGER NOT NULL,
             x REAL NOT NULL,y REAL NOT NULL,width REAL NOT NULL,height REAL NOT NULL,weight INTEGER NOT NULL,value INTEGER NOT NULL,
             header_height REAL NOT NULL DEFAULT 0,
             UNIQUE(view,key));
-        CREATE INDEX treemap_rect_nodes ON treemap_rects(view,node_id,leaf);
-        CREATE INDEX treemap_leaf_scan ON treemap_rects(view,leaf,id);
+        CREATE INDEX treemap_leaf_scan ON treemap_rects(view,id) WHERE leaf=1;
         CREATE INDEX treemap_label_page ON treemap_rects(view,(width*height) DESC,node_id) WHERE leaf=1 AND width*4096>=96 AND height*1024>=22;
         CREATE INDEX treemap_directory_labels ON treemap_rects(view,(width*height) DESC,node_id) WHERE header_height>0;
         CREATE VIRTUAL TABLE treemap_spatial USING rtree(id,x0,x1,y0,y1);
         CREATE TABLE treemap_frames(view INTEGER PRIMARY KEY,png BLOB NOT NULL,file_count INTEGER NOT NULL,visible_file_count INTEGER NOT NULL,
             weight_total INTEGER NOT NULL,positive_total INTEGER NOT NULL,negative_total INTEGER NOT NULL,net_delta INTEGER NOT NULL,exported_total INTEGER NOT NULL,rendered_block_count INTEGER NOT NULL,added_file_count INTEGER NOT NULL);").map_err(store::aggregate_error)?;
     let depth: i64 = conn.query_row(
-        "SELECT coalesce(max(depth),0) FROM treemap_weights",
+        "SELECT coalesce(max(depth),0)+1 FROM treemap_weights WHERE leaf=0",
         [],
         |r| r.get(0),
     )?;
@@ -109,19 +122,17 @@ fn build(conn: &Connection, control: &JobControl) -> Result<()> {
         control.check()?;
         propagate.execute([d]).map_err(store::aggregate_error)?;
     }
-    for v in [0, 1, 3, 4] {
-        conn.execute_batch(&format!(
-            "CREATE INDEX treemap_order_{v} ON treemap_weights(parent_id,{} DESC,key DESC)",
-            COLUMNS[v]
-        ))?;
-    }
-    // Unlimited geometry is the default. Delta copies Before, not a sixth layout.
+    // The initial unlimited After map is complete before import is published.
+    // Other metrics/modes/depths are cached only when actually requested.
     let mut pixels = vec![0u8; ATLAS_WIDTH as usize * ATLAS_HEIGHT as usize * 4];
-    for metric in [Metric::Size, Metric::Allocated] {
-        for mode in MODES {
-            generate(conn, control, metric, mode, 0, &mut pixels)?;
-        }
-    }
+    generate(
+        conn,
+        control,
+        Metric::Size,
+        ChartMode::After,
+        0,
+        &mut pixels,
+    )?;
     transaction.commit()?;
     Ok(())
 }
@@ -204,11 +215,16 @@ fn generate(
             totals.weight,
         )?;
         let depth: i64 = conn.query_row(
-            "SELECT coalesce(max(depth),0) FROM treemap_weights",
+            "SELECT coalesce(max(depth),0)+1 FROM treemap_weights WHERE leaf=0",
             [],
             |r| r.get(0),
         )?;
-        let mut parents = conn.prepare("SELECT w.key,r.x,r.y,r.width,r.height,r.weight FROM treemap_weights w INDEXED BY treemap_depth JOIN treemap_rects r ON r.view=?1 AND r.key=w.key WHERE w.depth=?2 AND w.leaf=0 ORDER BY w.key")?;
+        let side = if matches!(mode, ChartMode::Before) {
+            0
+        } else {
+            1
+        };
+        let mut parents = conn.prepare("SELECT w.key,r.x,r.y,r.width,r.height,r.weight,coalesce(CASE WHEN ?3=0 THEN c.before_kind ELSE c.after_kind END='directory',0) FROM treemap_weights w INDEXED BY treemap_depth JOIN treemap_rects r ON r.view=?1 AND r.key=w.key JOIN comparison_nodes c ON c.node_id=w.node_id WHERE w.depth=?2 AND w.leaf=0 ORDER BY w.key")?;
         let end = if max_depth == 0 {
             depth
         } else {
@@ -216,11 +232,11 @@ fn generate(
         };
         for d in 1..end {
             control.check()?;
-            let mut rows = parents.query(params![v, d])?;
+            let mut rows = parents.query(params![v, d, side])?;
             while let Some(row) = rows.next()? {
                 layout.tick()?;
                 let key: i64 = row.get(0)?;
-                let is_directory: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM entries WHERE node_id=?1 AND side=?2 AND kind='directory')", params![key, if matches!(mode,ChartMode::Before) {0} else {1}], |r| r.get(0))?;
+                let is_directory: bool = row.get(6)?;
                 let mut content = BoxRect {
                     x: row.get::<_, f64>(1)? * ATLAS_WIDTH as f64,
                     y: row.get::<_, f64>(2)? * ATLAS_HEIGHT as f64,
@@ -250,8 +266,13 @@ fn generate(
             }
         }
     }
-    // Directory title bars are selectable without covering their child blocks.
-    conn.execute("INSERT INTO treemap_spatial SELECT id,x,x+width,y,y+CASE WHEN leaf=1 THEN height ELSE header_height END FROM treemap_rects WHERE view=?1 AND (leaf=1 OR header_height>0)",[v])?;
+    // Index bounded geometry blocks rather than every subpixel file separately.
+    // Rebuild the shared last block when another view appends to it; hit tests
+    // still check each candidate rectangle and its half-open title/file bounds.
+    conn.execute(&format!("INSERT OR REPLACE INTO treemap_spatial
+        SELECT id/{SPATIAL_BLOCK},min(x),max(x+width),min(y),max(y+CASE WHEN leaf=1 THEN height ELSE header_height END)
+        FROM treemap_rects WHERE id>=(SELECT min(id)/{SPATIAL_BLOCK}*{SPATIAL_BLOCK} FROM treemap_rects WHERE view=?1)
+        AND id<=(SELECT max(id) FROM treemap_rects WHERE view=?1) AND (leaf=1 OR header_height>0) GROUP BY id/{SPATIAL_BLOCK}"), [v])?;
     paint(conn, control, v, mode, pixels)?;
     let mut png = Vec::new();
     {
@@ -376,6 +397,9 @@ impl<'a> Layout<'a> {
             "FROM treemap_weights INDEXED BY treemap_order_{order} WHERE parent_id=?1 AND {col}>0"
         );
         let value = col;
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS treemap_order_{order} ON treemap_weights(parent_id,{col} DESC,key DESC) WHERE {col}>0"
+        ))?;
         Ok(Self {control,v,
             scan:conn.prepare(&format!("SELECT key,{col} {base} ORDER BY {col} DESC,key DESC"))?,
             range:conn.prepare(&format!("SELECT key,node_id,leaf,{col},{value} {base} AND ({col},key)<=(?2,?3) AND ({col},key)>=(?4,?5) ORDER BY {col} DESC,key DESC"))?,
@@ -559,7 +583,7 @@ fn paint(
     } else {
         0
     };
-    let mut query=conn.prepare("SELECT r.x,r.y,r.width,r.height,coalesce(e.extension,''),r.header_height FROM treemap_rects r INDEXED BY treemap_leaf_scan LEFT JOIN entries e ON e.node_id=r.node_id AND e.side=?2 WHERE r.view=?1 AND r.leaf=1 ORDER BY r.id")?;
+    let mut query=conn.prepare("SELECT r.x,r.y,r.width,r.height,CASE WHEN r.key<0 OR (CASE WHEN ?2=0 THEN c.before_kind ELSE c.after_kind END)='file' THEN c.extension ELSE '' END,r.header_height FROM treemap_rects r INDEXED BY treemap_leaf_scan JOIN comparison_nodes c ON c.node_id=r.node_id WHERE r.view=?1 AND r.leaf=1 ORDER BY r.id")?;
     let mut rows = query.query(params![v, side])?;
     let mut ticks = 0u64;
     while let Some(row) = rows.next()? {
@@ -849,7 +873,7 @@ pub fn hit_test(
     } else {
         0
     };
-    let mut query=conn.prepare("SELECT r.node_id,n.name,coalesce(e.path,n.path),coalesce(e.extension,''),r.weight,r.value,c.status,r.x,r.y,r.width,r.height,e.kind,w.leaf,w.added,w.removed,w.type_changed,w.modified,r.leaf FROM treemap_spatial s CROSS JOIN treemap_rects r JOIN nodes n ON n.id=r.node_id JOIN comparison_nodes c ON c.node_id=r.node_id JOIN treemap_weights w ON w.key=r.key LEFT JOIN entries e ON e.node_id=n.id AND e.side=?4 WHERE s.x0<=?2 AND s.x1>=?2 AND s.y0<=?3 AND s.y1>=?3 AND r.id=s.id AND r.view=?1 AND (r.leaf=1 OR r.header_height>0) AND r.x<=?2 AND r.y<=?3 AND (?2<r.x+r.width OR (?2=1.0 AND r.x+r.width>=1.0)) AND (?3<r.y+CASE WHEN r.leaf=1 THEN r.height ELSE r.header_height END OR (?3=1.0 AND r.y+CASE WHEN r.leaf=1 THEN r.height ELSE r.header_height END>=1.0)) ORDER BY r.node_id LIMIT 1")?;
+    let mut query=conn.prepare(&format!("SELECT r.node_id,n.name,coalesce(e.path,n.path),coalesce(e.extension,''),r.weight,r.value,c.status,r.x,r.y,r.width,r.height,e.kind,w.leaf,w.added,w.removed,w.type_changed,w.modified,r.leaf FROM treemap_spatial s CROSS JOIN treemap_rects r NOT INDEXED JOIN nodes n ON n.id=r.node_id JOIN comparison_nodes c ON c.node_id=r.node_id JOIN treemap_weights w ON w.key=r.key LEFT JOIN entries e ON e.node_id=n.id AND e.side=?4 WHERE s.x0<=?2 AND s.x1>=?2 AND s.y0<=?3 AND s.y1>=?3 AND r.id>=s.id*{SPATIAL_BLOCK} AND r.id<(s.id+1)*{SPATIAL_BLOCK} AND r.view=?1 AND (r.leaf=1 OR r.header_height>0) AND r.x<=?2 AND r.y<=?3 AND (?2<r.x+r.width OR (?2=1.0 AND r.x+r.width>=1.0)) AND (?3<r.y+CASE WHEN r.leaf=1 THEN r.height ELSE r.header_height END OR (?3=1.0 AND r.y+CASE WHEN r.leaf=1 THEN r.height ELSE r.header_height END>=1.0)) ORDER BY r.node_id LIMIT 1"))?;
     Ok(query
         .query_row(
             params![cache_view(metric, mode, max_depth), x, y, side],

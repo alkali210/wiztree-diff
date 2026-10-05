@@ -14,13 +14,13 @@ pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
         changed_descendant_count INTEGER NOT NULL DEFAULT 0,child_count INTEGER NOT NULL DEFAULT 0,
         before_kind TEXT,after_kind TEXT,before_size INTEGER NOT NULL,after_size INTEGER NOT NULL,
         before_allocated INTEGER NOT NULL,after_allocated INTEGER NOT NULL,
-        size_delta INTEGER NOT NULL,allocated_delta INTEGER NOT NULL);
-        INSERT INTO comparison_nodes(node_id,parent_id,name,basename_key,expandable,status,has_changes,before_kind,after_kind,before_size,after_size,before_allocated,after_allocated,size_delta,allocated_delta)
+        size_delta INTEGER NOT NULL,allocated_delta INTEGER NOT NULL,extension TEXT NOT NULL);
+        INSERT INTO comparison_nodes(node_id,parent_id,name,basename_key,expandable,status,has_changes,before_kind,after_kind,before_size,after_size,before_allocated,after_allocated,size_delta,allocated_delta,extension)
         SELECT n.id,coalesce(n.parent_id,0),n.name,n.basename_key,coalesce(b.kind='directory',0) OR coalesce(a.kind='directory',0),
         CASE WHEN b.node_id IS NULL THEN 'added' WHEN a.node_id IS NULL THEN 'removed' WHEN b.kind!=a.kind THEN 'typeChanged' WHEN b.size!=a.size OR b.allocated!=a.allocated THEN 'modified' ELSE 'unchanged' END,
         b.node_id IS NULL OR a.node_id IS NULL OR b.kind!=a.kind OR b.size!=a.size OR b.allocated!=a.allocated,
         b.kind,a.kind,coalesce(b.size,0),coalesce(a.size,0),coalesce(b.allocated,0),coalesce(a.allocated,0),
-        coalesce(a.size,0)-coalesce(b.size,0),coalesce(a.allocated,0)-coalesce(b.allocated,0)
+        coalesce(a.size,0)-coalesce(b.size,0),coalesce(a.allocated,0)-coalesce(b.allocated,0),CASE WHEN b.kind='file' THEN b.extension ELSE coalesce(a.extension,'') END
         FROM nodes n LEFT JOIN entries b ON b.node_id=n.id AND b.side=0 LEFT JOIN entries a ON a.node_id=n.id AND a.side=1;
         CREATE INDEX comparison_parent ON comparison_nodes(parent_id);")?;
     conn.execute_batch("UPDATE comparison_nodes SET child_count=(SELECT count(*) FROM comparison_nodes c WHERE c.parent_id=comparison_nodes.node_id) WHERE expandable=1;")?;
@@ -35,7 +35,8 @@ pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
         parent_id INTEGER PRIMARY KEY,child_count INTEGER NOT NULL,changed_children INTEGER NOT NULL,internal_changes INTEGER NOT NULL);
         INSERT INTO comparison_aggregates SELECT parent_id,count(*),sum(has_changes),sum(status='unchanged' AND has_changes AND expandable) FROM comparison_nodes GROUP BY parent_id;
         CREATE INDEX tree_page ON comparison_nodes(parent_id,expandable DESC,basename_key,node_id);
-        CREATE INDEX tree_changes_page ON comparison_nodes(parent_id,has_changes,expandable DESC,basename_key,node_id);
+        CREATE INDEX tree_changes_page ON comparison_nodes(parent_id,expandable DESC,basename_key,node_id) WHERE has_changes=1;
+        DROP INDEX comparison_parent;
         ").map_err(aggregate_error)?;
     control.check()
 }

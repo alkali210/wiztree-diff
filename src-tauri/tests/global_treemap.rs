@@ -1,7 +1,7 @@
 use base64::Engine;
 use rusqlite::{params, Connection};
 use wiztree_diff_lib::{
-    global_treemap,
+    diff, global_treemap,
     import::{self, JobControl},
     store,
     types::{ChartMode, Metric, Status},
@@ -36,6 +36,81 @@ fn node(conn: &Connection, path: &str) -> String {
         )
         .unwrap()
     )
+}
+
+#[test]
+fn appending_other_views_preserves_precise_hits_in_existing_maps() {
+    let mut before = String::from("文件名称,大小,分配\n");
+    let mut after = before.clone();
+    for i in 0..1027 {
+        before.push_str(&format!("C:\\file{i}.bin,{},{:}\n", i % 17 + 1, i % 23 + 1));
+        after.push_str(&format!("C:\\file{i}.bin,{},{:}\n", i % 11 + 1, i % 29 + 1));
+    }
+    let (_dir, c) = build(&before, &after);
+    for metric in [Metric::Size, Metric::Allocated] {
+        for mode in [ChartMode::After, ChartMode::Before, ChartMode::Delta] {
+            let frame = global_treemap::get_frame(&c, metric, mode, 0).unwrap();
+            assert_eq!(frame.rendered_block_count, 1027);
+        }
+    }
+    // Later maps share the final spatial bucket of earlier maps. Their bounds
+    // must not replace earlier candidates or leak into the selected view.
+    for metric in [Metric::Size, Metric::Allocated] {
+        for mode in [ChartMode::After, ChartMode::Before, ChartMode::Delta] {
+            for i in [0, 19, 300, 700, 1026] {
+                let id = node(&c, &format!("C:\\file{i}.bin"));
+                let r = global_treemap::get_bounds(&c, metric, mode, &id, 0)
+                    .unwrap()
+                    .unwrap();
+                let hit = global_treemap::hit_test(
+                    &c,
+                    metric,
+                    mode,
+                    r.x + r.width / 2.0,
+                    r.y + r.height / 2.0,
+                    0,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(hit.node_id, id);
+            }
+        }
+    }
+}
+
+#[test]
+fn sparse_opposite_snapshot_children_keep_the_real_file_ancestor_and_all_leaves() {
+    let b = "文件名称,大小,分配\nC:\\swap,12,16\n";
+    let a = "文件名称,大小,分配\nC:\\swap\\child.bin,12,16\n";
+    let (_dir, c) = build(b, a);
+    for (mode, path) in [
+        (ChartMode::Before, "C:\\swap"),
+        (ChartMode::After, "C:\\swap\\child.bin"),
+        (ChartMode::Delta, "C:\\swap"),
+    ] {
+        let frame = global_treemap::get_frame(&c, Metric::Size, mode, 0).unwrap();
+        assert_eq!(frame.weight_total, "12");
+        assert_eq!(
+            (frame.visible_file_count, frame.rendered_block_count),
+            (1, 1)
+        );
+        let id = node(&c, path);
+        let rect = global_treemap::get_bounds(&c, Metric::Size, mode, &id, 0)
+            .unwrap()
+            .unwrap();
+        let hit = global_treemap::hit_test(
+            &c,
+            Metric::Size,
+            mode,
+            rect.x + rect.width / 2.0,
+            rect.y + rect.height / 2.0,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(hit.node_id, id);
+        assert!(!hit.collapsed);
+    }
 }
 
 #[test]
@@ -311,7 +386,7 @@ fn unlimited_global_baseline_views_preserve_integer_totals_hierarchy_and_ownersh
     let orphan = node(&c, "C:\\root\\gap\\lost.py");
     let orphan_parent: i64 = c
         .query_row(
-            "SELECT parent_id FROM treemap_weights WHERE node_id=?1 AND leaf=0",
+            "SELECT parent_id FROM treemap_weights WHERE node_id=?1 AND leaf=1",
             [orphan[1..].parse::<i64>().unwrap()],
             |r| r.get(0),
         )
@@ -453,7 +528,7 @@ fn equal_siblings_have_deterministic_shared_edge_and_outer_edge_hits() {
 fn raw_connection() -> Connection {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(store::SCHEMA).unwrap();
-    c.execute_batch("CREATE TABLE export_roots(side INTEGER,node_id INTEGER,path TEXT,eligible INTEGER);CREATE TABLE comparison_nodes(node_id INTEGER PRIMARY KEY,status TEXT,expandable INTEGER);").unwrap();
+    c.execute_batch("CREATE INDEX nodes_depth ON nodes(depth); CREATE TABLE export_roots(side INTEGER,node_id INTEGER,path TEXT,eligible INTEGER);").unwrap();
     c
 }
 #[test]
@@ -463,6 +538,7 @@ fn leaf_aggregate_overflow_fails_and_cancelled_build_writes_nothing() {
         c.execute("INSERT INTO nodes(id,path,parent_path,parent_id,name,depth,basename_key) VALUES(?1,?2,NULL,NULL,?2,0,?2)",params![id,format!("c:\\{id}.bin")]).unwrap();
         c.execute("INSERT INTO entries(side,node_id,path,kind,size,allocated,details,volume,extension) VALUES(0,?1,?2,'file',?3,0,'{}','c:','.bin')",params![id,format!("c:\\{id}.bin"),i64::MAX]).unwrap();
     }
+    diff::materialize(&c, &JobControl::default()).unwrap();
     let error = global_treemap::materialize(&c, &JobControl::default()).unwrap_err();
     assert_eq!(error.code, "AGGREGATE_OVERFLOW");
     assert_eq!(
@@ -488,9 +564,6 @@ fn hundred_thousand_actual_parents_and_sparse_roots_are_not_sampled_or_capped() 
     let tx = c.unchecked_transaction().unwrap();
     let mut n=c.prepare("INSERT INTO nodes(id,path,parent_path,parent_id,name,depth,basename_key) VALUES(?1,?2,NULL,?3,?2,?4,?2)").unwrap();
     let mut e=c.prepare("INSERT INTO entries(side,node_id,path,kind,size,allocated,details,volume,extension) VALUES(?1,?2,?3,?4,?5,?6,'{}','c:',?7)").unwrap();
-    let mut status = c
-        .prepare("INSERT INTO comparison_nodes VALUES(?1,'unchanged',?2)")
-        .unwrap();
     for i in 0..100001i64 {
         let parent = 2 * i + 1;
         let leaf = parent + 1;
@@ -503,8 +576,6 @@ fn hundred_thousand_actual_parents_and_sparse_roots_are_not_sampled_or_capped() 
         .unwrap();
         n.execute(params![leaf, format!("c:\\actual{i}\\f.bin"), parent, 1])
             .unwrap();
-        status.execute(params![parent, 1]).unwrap();
-        status.execute(params![leaf, 0]).unwrap();
         for side in 0..=1 {
             e.execute(params![
                 side,
@@ -530,8 +601,8 @@ fn hundred_thousand_actual_parents_and_sparse_roots_are_not_sampled_or_capped() 
     }
     drop(n);
     drop(e);
-    drop(status);
     tx.commit().unwrap();
+    diff::materialize(&c, &JobControl::default()).unwrap();
     global_treemap::materialize(&c, &JobControl::default()).unwrap();
     for metric in [Metric::Size, Metric::Allocated] {
         for mode in [ChartMode::Before, ChartMode::After, ChartMode::Delta] {
@@ -564,7 +635,7 @@ fn hundred_thousand_actual_parents_and_sparse_roots_are_not_sampled_or_capped() 
             |r| r.get::<_, i64>(0)
         )
         .unwrap(),
-        200002
+        100001
     );
 }
 
@@ -572,6 +643,7 @@ fn hundred_thousand_actual_parents_and_sparse_roots_are_not_sampled_or_capped() 
 fn active_job_cancellation_interrupts_sql_and_rolls_back_materialization() {
     let c = raw_connection();
     c.execute_batch("WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<10000) INSERT INTO nodes(id,path,parent_id,name,depth,basename_key) SELECT id,'c:\\f'||id||'.bin',NULL,'f'||id,0,'f'||id FROM ids;INSERT INTO entries(side,node_id,path,kind,size,allocated,details,volume,extension) SELECT 0,id,path,'file',1,2,'{}','c:','.bin' FROM nodes;").unwrap();
+    diff::materialize(&c, &JobControl::default()).unwrap();
     let control = JobControl::default();
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -808,6 +880,33 @@ fn type_changes_keep_before_own_leaf_and_exclude_after_directory_children_from_d
     let b="文件名称,大小,分配\nC:\\r\\,20,20\nC:\\r\\swap,12,12\nC:\\r\\reverse\\,8,8\nC:\\r\\reverse\\child.bin,8,8\n";
     let a="文件名称,大小,分配\nC:\\r\\,20,20\nC:\\r\\swap\\,12,12\nC:\\r\\swap\\child.txt,12,12\nC:\\r\\reverse,8,8\n";
     let (_dir, c) = build(b, a);
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM treemap_weights WHERE key<0 AND leaf=1",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM treemap_weights WHERE key>0 AND leaf=0",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        3
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM treemap_weights WHERE key>0 AND leaf=1",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
     for depth in [3, 0] {
         let d = global_treemap::get_frame(&c, Metric::Size, ChartMode::Delta, depth).unwrap();
         assert_eq!(d.weight_total, "20");

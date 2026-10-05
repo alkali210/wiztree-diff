@@ -1,8 +1,8 @@
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use wiztree_diff_lib::{
     file_categories::{self, CATEGORIES},
     file_extensions,
-    import::JobControl,
+    import::{self, JobControl},
     store,
     types::{Metric, SnapshotSide},
 };
@@ -154,28 +154,27 @@ fn empty_comparison_still_returns_all_eight_zero_categories() {
 
 #[test]
 fn category_aggregation_checks_overflow_and_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("overflow.csv");
+    std::fs::write(
+        &path,
+        "文件名称,大小,分配\nC:\\first.txt,9223372036854775807,0\nC:\\second.txt,1,0\n",
+    )
+    .unwrap();
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch(store::SCHEMA).unwrap();
-    for (id, size) in [(1, i64::MAX), (2, 1)] {
-        c.execute(
-            "INSERT INTO nodes(id,path,name,depth,basename_key) VALUES(?1,?2,?2,0,?2)",
-            params![id, format!("{id}.txt")],
-        )
-        .unwrap();
-        c.execute("INSERT INTO entries(side,node_id,path,kind,size,allocated,details,volume) VALUES(0,?1,?2,'file',?3,0,'{}','c:')", params![id, format!("{id}.txt"), size]).unwrap();
-    }
     assert_eq!(
-        file_categories::materialize(&c, &JobControl::default())
+        import::load(&c, &path, 0, &JobControl::default(), &mut |_| {})
             .unwrap_err()
             .code,
         "AGGREGATE_OVERFLOW"
     );
     let control = JobControl::default();
-    control
-        .cancelled
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    control.cancel();
     assert_eq!(
-        file_categories::materialize(&c, &control).unwrap_err().code,
+        import::load(&c, &path, 0, &control, &mut |_| {})
+            .unwrap_err()
+            .code,
         "CANCELLED"
     );
 }

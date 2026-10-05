@@ -177,7 +177,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     }
     return count + add <= CACHE_LIMIT;
   }
-  async function load(parent: string, more = false, nav?: number) {
+  async function load(parent: string, more = false) {
     const generation = epoch.current;
     let p = pages.current.get(parent);
     if (p?.loading || (more && p && !p.cursor)) return false;
@@ -212,7 +212,6 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
       if (
         generation !== epoch.current ||
         pages.current.get(parent) !== own ||
-        (nav !== undefined && nav !== navigation.current) ||
         (parent && !expanded.current.has(parent))
       )
         return false;
@@ -239,8 +238,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     } catch (e) {
       if (
         generation === epoch.current &&
-        pages.current.get(parent) === own &&
-        (nav === undefined || nav === navigation.current)
+        pages.current.get(parent) === own
       )
         own.error = errorText(e);
       return false;
@@ -256,7 +254,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     currentSelected.current = id;
     onSelect(id);
     const p = pages.current.get(id);
-    if (expanded.current.has(id) && p && !p.loading && !p.error) {
+    if (expanded.current.has(id) && p && !p.error) {
       p.stamp = ++clock.current;
       scope.current = ancestors(id);
       onScope(scope.current);
@@ -267,7 +265,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
       nav = navigation.current;
     const more = pages.current.get(parent)?.retryMore ?? false;
     if (
-      (await load(parent, more, nav)) &&
+      (await load(parent, more)) &&
       generation === epoch.current &&
       nav === navigation.current &&
       parent &&
@@ -292,20 +290,20 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
       if (existing) existing.stamp = ++clock.current;
       redraw();
       if (!existing || existing.error) {
-        if (!(await load(node, false, nav))) return false;
+        if (!(await load(node, false))) return false;
       }
       return live() && expanded.current.has(node);
     }
     async function locate(node: string, parent: string) {
       let page = pages.current.get(parent);
       if (!page) {
-        if (!(await load(parent, false, nav))) return false;
+        if (!(await load(parent, false))) return false;
         page = pages.current.get(parent);
       }
       if (!page || page.loading || !live()) return false;
       // Evicted pages can contain the target: restart once, then seek forward.
       if (!find(node) && page.rows.length < page.through) {
-        if (!(await load(parent, false, nav))) return false;
+        if (!(await load(parent, false))) return false;
       }
       while (!find(node)) {
         const current = pages.current.get(parent);
@@ -314,7 +312,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
             setHint("此目录不在当前过滤结果中，请关闭“仅变化”后定位。");
           return false;
         }
-        if (!(await load(parent, true, nav)) || !live()) return false;
+        if (!(await load(parent, true)) || !live()) return false;
       }
       return true;
     }
@@ -349,7 +347,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
   }
   async function reloadFirst(parent: string) {
     const nav = ++navigation.current;
-    if (!(await load(parent, false, nav))) return;
+    if (!(await load(parent, false)) || nav !== navigation.current) return;
     const first = pages.current
       .get(parent)
       ?.rows.find(

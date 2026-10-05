@@ -9,7 +9,11 @@ use std::path::Path;
 pub const SCHEMA: &str = "
 CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE nodes(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,parent_path TEXT,parent_id INTEGER,name TEXT NOT NULL,depth INTEGER NOT NULL,basename_key TEXT NOT NULL);
-CREATE TABLE entries(side INTEGER NOT NULL,node_id INTEGER NOT NULL,path TEXT NOT NULL,kind TEXT NOT NULL,size INTEGER NOT NULL,allocated INTEGER NOT NULL,details TEXT NOT NULL,files INTEGER,folders INTEGER,mft TEXT,volume TEXT NOT NULL,extension TEXT NOT NULL DEFAULT '',PRIMARY KEY(side,node_id));";
+CREATE TABLE entries(side INTEGER NOT NULL,node_id INTEGER NOT NULL,path TEXT NOT NULL,kind TEXT NOT NULL,size INTEGER NOT NULL,allocated INTEGER NOT NULL,details TEXT NOT NULL,files INTEGER,folders INTEGER,mft TEXT,volume TEXT NOT NULL,extension TEXT NOT NULL DEFAULT '',PRIMARY KEY(side,node_id)) WITHOUT ROWID;
+CREATE TABLE file_category_stats(side INTEGER NOT NULL,category TEXT NOT NULL,size INTEGER NOT NULL,allocated INTEGER NOT NULL,files INTEGER NOT NULL,PRIMARY KEY(side,category)) WITHOUT ROWID;
+CREATE TABLE extension_stats(side INTEGER NOT NULL,node_id INTEGER NOT NULL,extension TEXT NOT NULL,
+size INTEGER NOT NULL CHECK(typeof(size)='integer' AND size>=0),allocated INTEGER NOT NULL CHECK(typeof(allocated)='integer' AND allocated>=0),
+files INTEGER NOT NULL CHECK(typeof(files)='integer' AND files>=0),PRIMARY KEY(side,node_id,extension)) WITHOUT ROWID;";
 
 pub fn open_reader(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -61,7 +65,9 @@ pub fn build_comparison(
             .lock()
             .map_err(|_| ApiError::new("LOCK_ERROR", "取消锁失效"))? =
             Some(conn.get_interrupt_handle());
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=FILE; PRAGMA mmap_size=0; PRAGMA cache_size=-32768;")?;
+        // Bulk writes belong only to this unpublished, disposable database.
+        // Flush it before publishing; an interrupted build is discarded.
+        conn.execute_batch("PRAGMA page_size=8192; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; PRAGMA mmap_size=536870912; PRAGMA cache_size=-262144;")?;
         conn.execute_batch(SCHEMA)?;
         let mut before_summary = import::load(&conn, before, 0, control, progress)?;
         let mut after_summary = import::load(&conn, after, 1, control, progress)?;
@@ -79,9 +85,7 @@ pub fn build_comparison(
             total_bytes: 0,
             rows: before_summary.rows + after_summary.rows,
         });
-        diff::materialize(&conn, control)?;
         crate::file_extensions::materialize(&conn, control)?;
-        crate::file_categories::materialize(&conn, control)?;
         crate::global_treemap::materialize(&conn, control)?;
         let mut counts = Counts {
             files: StatusCounts::default(),
@@ -118,9 +122,11 @@ pub fn build_comparison(
             params![serde_json::to_string(&summary)
                 .map_err(|e| ApiError::new("SERIALIZATION_ERROR", e.to_string()))?],
         )?;
-        conn.execute_batch(
-            "INSERT INTO metadata VALUES('state','ready'); PRAGMA wal_checkpoint(TRUNCATE);",
-        )?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; INSERT INTO metadata VALUES('state','ready'); PRAGMA wal_checkpoint(TRUNCATE);")?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(db_path)?
+            .sync_all()?;
         control.check()?;
         Ok(summary)
     })();
@@ -147,13 +153,21 @@ pub fn finish_import(
     after: &mut SourceSummary,
     control: &JobControl,
 ) -> Result<Vec<String>> {
-    conn.execute_batch("CREATE INDEX nodes_parent_path ON nodes(parent_path); UPDATE nodes SET parent_id=(SELECT p.id FROM nodes p WHERE p.path=nodes.parent_path); CREATE INDEX nodes_parent ON nodes(parent_id); CREATE INDEX nodes_depth ON nodes(depth); CREATE INDEX entries_mft ON entries(side,volume,mft) WHERE kind='file' AND mft IS NOT NULL;")?;
-    let bad: Option<String> = conn.query_row("SELECT e.path FROM entries e JOIN nodes n ON n.id=e.node_id JOIN entries p ON p.node_id=n.parent_id AND p.side=e.side WHERE p.kind='file' LIMIT 1", [], |r| r.get(0)).optional()?;
-    if let Some(path) = bad {
-        return Err(ApiError::new(
-            "INVALID_HIERARCHY",
-            format!("同侧父路径记录是文件：{path}"),
-        ));
+    conn.execute_batch("CREATE INDEX nodes_parent ON nodes(parent_id); UPDATE nodes SET parent_id=(SELECT p.id FROM nodes p WHERE p.path=nodes.parent_path) WHERE parent_id IS NULL AND parent_path IS NOT NULL; CREATE INDEX nodes_depth ON nodes(depth); CREATE INDEX entries_mft ON entries(side,volume,mft) WHERE kind='file' AND mft IS NOT NULL;")?;
+    let mut bad_parent = conn.prepare("SELECT e.path FROM (SELECT DISTINCT parent_id FROM nodes WHERE parent_id IS NOT NULL) parents
+        CROSS JOIN entries p ON p.side=?1 AND p.node_id=parents.parent_id
+        CROSS JOIN nodes n INDEXED BY nodes_parent ON n.parent_id=p.node_id
+        JOIN entries e ON e.side=p.side AND e.node_id=n.id WHERE p.kind='file' LIMIT 1")?;
+    for side in [0, 1] {
+        if let Some(path) = bad_parent
+            .query_row([side], |r| r.get::<_, String>(0))
+            .optional()?
+        {
+            return Err(ApiError::new(
+                "INVALID_HIERARCHY",
+                format!("同侧父路径记录是文件：{path}"),
+            ));
+        }
     }
     let mut warnings = Vec::new();
     conn.execute_batch("CREATE TABLE export_roots(side INTEGER NOT NULL,node_id INTEGER NOT NULL,path TEXT NOT NULL,eligible INTEGER NOT NULL,PRIMARY KEY(side,node_id));")?;
@@ -161,7 +175,14 @@ pub fn finish_import(
     // The completed build checkpoints WAL before publishing the ready manifest.
     let root_transaction = conn.unchecked_transaction()?;
     for (side, summary) in [(0, &mut *before), (1, &mut *after)] {
-        let mut roots = conn.prepare("SELECT n.id,n.path,e.path,e.kind,e.size,e.allocated,n.parent_path FROM entries e JOIN nodes n ON n.id=e.node_id LEFT JOIN entries p ON p.node_id=n.parent_id AND p.side=e.side WHERE e.side=?1 AND p.node_id IS NULL ORDER BY n.path")?;
+        let mut roots = conn.prepare("WITH missing(id) AS MATERIALIZED (
+            SELECT parents.parent_id FROM (SELECT DISTINCT parent_id FROM nodes WHERE parent_id IS NOT NULL) parents
+            LEFT JOIN entries p ON p.side=?1 AND p.node_id=parents.parent_id WHERE p.node_id IS NULL)
+            SELECT n.id,n.path,e.path,e.kind,e.size,e.allocated,n.parent_path
+            FROM nodes n INDEXED BY nodes_parent CROSS JOIN entries e ON e.side=?1 AND e.node_id=n.id WHERE n.parent_id IS NULL
+            UNION ALL SELECT n.id,n.path,e.path,e.kind,e.size,e.allocated,n.parent_path
+            FROM missing m CROSS JOIN nodes n INDEXED BY nodes_parent ON n.parent_id=m.id
+            CROSS JOIN entries e ON e.side=?1 AND e.node_id=n.id ORDER BY 2")?;
         let mut ancestor = conn.prepare("SELECT e.kind='file' FROM nodes n JOIN entries e ON e.node_id=n.id AND e.side=?1 WHERE n.path=?2")?;
         let mut save_root = conn
             .prepare("INSERT INTO export_roots(side,node_id,path,eligible) VALUES(?1,?2,?3,?4)")?;
@@ -248,20 +269,39 @@ pub fn finish_import(
     if different_roots {
         warnings.push("导出根范围不同；差异仅表示 CSV 记录差异，不断言磁盘删除".into());
     }
-    // Counts are descendant counts, not direct child counts. Propagate one depth at a time on disk.
-    conn.execute_batch("CREATE TABLE export_counts(side INTEGER,node_id INTEGER,files INTEGER,folders INTEGER,PRIMARY KEY(side,node_id)); INSERT INTO export_counts SELECT side,node_id,0,0 FROM entries;")?;
-    let depth: i64 =
-        conn.query_row("SELECT coalesce(max(depth),0) FROM nodes", [], |r| r.get(0))?;
-    let mut propagate = conn.prepare("UPDATE export_counts SET (files,folders)=(SELECT coalesce(sum(c.files+(e.kind='file')),0),coalesce(sum(c.folders+(e.kind='directory')),0) FROM nodes n INDEXED BY nodes_parent CROSS JOIN entries e CROSS JOIN export_counts c WHERE n.parent_id=export_counts.node_id AND e.node_id=n.id AND e.side=?2 AND c.side=e.side AND c.node_id=e.node_id) WHERE side=?2 AND node_id IN (SELECT n.id FROM nodes n INDEXED BY nodes_depth CROSS JOIN entries e WHERE n.depth=?1 AND e.node_id=n.id AND e.side=?2 AND e.kind='directory')")?;
+    diff::materialize(conn, control)?;
+    // Reuse compact comparison rows instead of re-reading both detail tables.
+    // Absent/file parents cannot carry that side's directory counts.
+    conn.execute_batch("CREATE TABLE export_counts(
+        node_id INTEGER PRIMARY KEY,parent_id INTEGER,depth INTEGER,b_dir INTEGER,a_dir INTEGER,
+        b_files INTEGER,b_folders INTEGER,a_files INTEGER,a_folders INTEGER);
+        WITH direct AS (SELECT parent_id id,sum(before_kind='file') b_files,sum(before_kind='directory') b_folders,
+            sum(after_kind='file') a_files,sum(after_kind='directory') a_folders FROM comparison_nodes GROUP BY parent_id)
+        INSERT INTO export_counts SELECT c.node_id,c.parent_id,n.depth,coalesce(c.before_kind='directory',0),coalesce(c.after_kind='directory',0),
+            CASE WHEN c.before_kind='directory' THEN coalesce(d.b_files,0) ELSE 0 END,
+            CASE WHEN c.before_kind='directory' THEN coalesce(d.b_folders,0) ELSE 0 END,
+            CASE WHEN c.after_kind='directory' THEN coalesce(d.a_files,0) ELSE 0 END,
+            CASE WHEN c.after_kind='directory' THEN coalesce(d.a_folders,0) ELSE 0 END
+            FROM comparison_nodes c JOIN nodes n ON n.id=c.node_id LEFT JOIN direct d ON d.id=c.node_id WHERE c.expandable=1;
+        CREATE INDEX export_counts_depth ON export_counts(depth);
+        CREATE INDEX export_counts_parent ON export_counts(parent_id);")?;
+    let depth: i64 = conn.query_row(
+        "SELECT coalesce(max(depth),0) FROM export_counts",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut propagate = conn.prepare("UPDATE export_counts INDEXED BY export_counts_depth SET (b_files,b_folders,a_files,a_folders)=(
+        SELECT export_counts.b_files+export_counts.b_dir*coalesce(sum(c.b_files),0),export_counts.b_folders+export_counts.b_dir*coalesce(sum(c.b_folders),0),
+            export_counts.a_files+export_counts.a_dir*coalesce(sum(c.a_files),0),export_counts.a_folders+export_counts.a_dir*coalesce(sum(c.a_folders),0)
+        FROM export_counts c INDEXED BY export_counts_parent WHERE c.parent_id=export_counts.node_id) WHERE depth=?1")?;
     for d in (0..=depth).rev() {
-        for side in 0..2 {
-            control.check()?;
-            propagate
-                .execute(params![d, side])
-                .map_err(aggregate_error)?;
-        }
+        control.check()?;
+        propagate.execute([d]).map_err(aggregate_error)?;
     }
-    let mismatch: i64 = conn.query_row("SELECT count(*) FROM entries e JOIN export_counts c ON c.side=e.side AND c.node_id=e.node_id WHERE e.kind='directory' AND ((e.files IS NOT NULL AND e.files!=c.files) OR (e.folders IS NOT NULL AND e.folders!=c.folders))", [], |r| r.get(0))?;
+    let mismatch: i64 = conn.query_row("SELECT (SELECT count(*) FROM export_counts c CROSS JOIN entries e ON e.node_id=c.node_id AND e.side=0
+        WHERE c.b_dir AND ((e.files IS NOT NULL AND e.files!=c.b_files) OR (e.folders IS NOT NULL AND e.folders!=c.b_folders)))
+        +(SELECT count(*) FROM export_counts c CROSS JOIN entries e ON e.node_id=c.node_id AND e.side=1
+        WHERE c.a_dir AND ((e.files IS NOT NULL AND e.files!=c.a_files) OR (e.folders IS NOT NULL AND e.folders!=c.a_folders)))", [], |r| r.get(0))?;
     if mismatch > 0 {
         warnings.push(format!(
             "{mismatch} 条目录导出计数与实际后代不符；导出范围可能不一致/不完整"

@@ -1,6 +1,25 @@
 use crate::{diff, import::JobControl, store, types::*};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+pub(crate) fn save_import(
+    conn: &Connection,
+    side: i64,
+    totals: &mut HashMap<String, [i64; 3]>,
+) -> Result<()> {
+    let mut insert = conn.prepare("INSERT INTO extension_stats VALUES(?1,0,?2,?3,?4,?5)
+        ON CONFLICT(side,node_id,extension) DO UPDATE SET size=size+excluded.size,allocated=allocated+excluded.allocated,files=files+excluded.files")?;
+    for (extension, value) in totals {
+        if value[2] != 0 {
+            insert
+                .execute(params![side, extension, value[0], value[1], value[2]])
+                .map_err(aggregate_error)?;
+            *value = [0; 3];
+        }
+    }
+    Ok(())
+}
 
 /// The caller supplies the normalized lowercase basename, not a full path.
 pub fn extension(name: &str) -> &str {
@@ -29,32 +48,13 @@ pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
         Some(conn.get_interrupt_handle());
     conn.execute_batch("BEGIN")?;
     let result = (|| {
-        conn.execute_batch("CREATE INDEX IF NOT EXISTS nodes_depth ON nodes(depth);
-            CREATE TABLE extension_stats(side INTEGER NOT NULL,node_id INTEGER NOT NULL,extension TEXT NOT NULL,
-                size INTEGER NOT NULL CHECK(typeof(size)='integer' AND size>=0),
-                allocated INTEGER NOT NULL CHECK(typeof(allocated)='integer' AND allocated>=0),
-                files INTEGER NOT NULL CHECK(typeof(files)='integer' AND files>=0),PRIMARY KEY(side,node_id,extension)) WITHOUT ROWID;
-            INSERT INTO extension_stats SELECT side,0,extension,sum(size),sum(allocated),count(*) FROM entries WHERE kind='file' GROUP BY side,extension;
-            INSERT INTO extension_stats SELECT side,node_id,extension,size,allocated,1 FROM entries WHERE kind='file';
-            INSERT INTO extension_stats SELECT e.side,n.parent_id,e.extension,sum(e.size),sum(e.allocated),count(*) FROM entries e JOIN nodes n ON n.id=e.node_id JOIN entries p ON p.node_id=n.parent_id AND p.side=e.side AND p.kind='directory' WHERE e.kind='file' GROUP BY e.side,n.parent_id,e.extension;") .map_err(aggregate_error)?;
-        let depth: i64 =
-            conn.query_row("SELECT coalesce(max(depth),0) FROM nodes", [], |r| r.get(0))?;
-        let mut propagate = conn.prepare("INSERT INTO extension_stats SELECT s.side,n.parent_id,s.extension,sum(s.size),sum(s.allocated),sum(s.files) FROM nodes n INDEXED BY nodes_depth JOIN extension_stats s ON s.node_id=n.id JOIN entries e ON e.node_id=n.id AND e.side=s.side AND e.kind='directory' JOIN entries p ON p.node_id=n.parent_id AND p.side=s.side AND p.kind='directory' WHERE n.depth=?1 GROUP BY s.side,n.parent_id,s.extension ON CONFLICT(side,node_id,extension) DO UPDATE SET size=extension_stats.size+excluded.size,allocated=extension_stats.allocated+excluded.allocated,files=extension_stats.files+excluded.files")?;
-        for level in (0..=depth).rev() {
-            control.check()?;
-            propagate.execute([level]).map_err(aggregate_error)?;
-        }
         conn.execute_batch("CREATE TABLE extension_totals(side INTEGER NOT NULL,node_id INTEGER NOT NULL,
             extensions INTEGER NOT NULL,size INTEGER NOT NULL CHECK(typeof(size)='integer' AND size>=0),
             allocated INTEGER NOT NULL CHECK(typeof(allocated)='integer' AND allocated>=0),
             files INTEGER NOT NULL CHECK(typeof(files)='integer' AND files>=0),PRIMARY KEY(side,node_id)) WITHOUT ROWID;
             INSERT INTO extension_totals SELECT side,node_id,count(*),sum(size),sum(allocated),sum(files) FROM extension_stats GROUP BY side,node_id;
-            CREATE INDEX extension_before_size ON extension_stats(side,node_id,size DESC,extension) WHERE side=0;
-            CREATE INDEX extension_after_size ON extension_stats(side,node_id,size DESC,extension) WHERE side=1;
-            CREATE INDEX extension_before_allocated ON extension_stats(side,node_id,allocated DESC,extension) WHERE side=0;
-            CREATE INDEX extension_after_allocated ON extension_stats(side,node_id,allocated DESC,extension) WHERE side=1;
-            CREATE INDEX extension_before_files ON extension_stats(side,node_id,files DESC,extension) WHERE side=0;
-            CREATE INDEX extension_after_files ON extension_stats(side,node_id,files DESC,extension) WHERE side=1;") .map_err(aggregate_error)?;
+            CREATE INDEX extension_size ON extension_stats(side,node_id,size DESC,extension);
+            CREATE INDEX extension_allocated ON extension_stats(side,node_id,allocated DESC,extension);") .map_err(aggregate_error)?;
         control.check()
     })();
     match result {
@@ -71,6 +71,47 @@ pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
             }
         }
     }
+}
+
+// Cache only requested directory scopes; the complete workspace is ready at import.
+fn ensure_scope(conn: &Connection, side: i64, node: i64) -> Result<()> {
+    let ready: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM extension_totals WHERE side=?1 AND node_id=?2)",
+        params![side, node],
+        |r| r.get(0),
+    )?;
+    if ready {
+        return Ok(());
+    }
+    let writer = conn
+        .path()
+        .filter(|p| !p.is_empty())
+        .map(Connection::open)
+        .transpose()?;
+    let conn = writer.as_ref().unwrap_or(conn);
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    conn.execute_batch(
+        "PRAGMA cache_size=-65536; PRAGMA temp_store=FILE; PRAGMA mmap_size=536870912;",
+    )?;
+    let tx = conn.unchecked_transaction()?;
+    let (kind, size, allocated) = if side == 0 {
+        ("before_kind", "before_size", "before_allocated")
+    } else {
+        ("after_kind", "after_size", "after_allocated")
+    };
+    // Directory-only recursion and explicit join order avoid scanning the
+    // complete side once for every parent. Reuse compact comparison values.
+    conn.execute(&format!("WITH RECURSIVE directories(id) AS (
+        SELECT node_id FROM comparison_nodes WHERE node_id=?2 AND {kind}='directory'
+        UNION ALL SELECT c.node_id FROM directories p CROSS JOIN comparison_nodes c INDEXED BY tree_page
+        ON c.parent_id=p.id WHERE c.{kind}='directory')
+        INSERT INTO extension_stats SELECT ?1,?2,c.extension,sum(c.{size}),sum(c.{allocated}),count(*)
+        FROM directories p CROSS JOIN comparison_nodes c INDEXED BY tree_page ON c.parent_id=p.id
+        WHERE c.{kind}='file' GROUP BY c.extension"), params![side, node]).map_err(aggregate_error)?;
+    conn.execute("INSERT INTO extension_totals SELECT ?1,?2,count(*),coalesce(sum(size),0),coalesce(sum(allocated),0),coalesce(sum(files),0)
+        FROM extension_stats WHERE side=?1 AND node_id=?2", params![side, node]).map_err(aggregate_error)?;
+    tx.commit()?;
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -118,6 +159,25 @@ pub fn list_extensions(
         Metric::Size => "size",
         Metric::Allocated => "allocated",
     };
+    if node != 0 {
+        let file: Option<(String, i64, i64)> = conn.query_row(
+            "SELECT extension,size,allocated FROM entries WHERE side=?1 AND node_id=?2 AND kind='file'",
+            params![side_number, node],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        if let Some((extension, size, allocated)) = file {
+            if cursor.is_some() {
+                return Err(ApiError::new("INVALID_CURSOR", "文件范围没有后续分页"));
+            }
+            return Ok(ExtensionPage {
+                rows: vec![ExtensionItem { extension, size: size.to_string(), allocated: allocated.to_string(), files: 1 }],
+                next_cursor: None, total_extensions: 1,
+                total: TypeValue { size: size.to_string(), allocated: allocated.to_string(), files: 1 },
+                warnings: vec!["按实际文件路径汇总；不使用目录导出汇总，不按 MFT 去重；缺失父目录会中断目录范围汇总".into()],
+            });
+        }
+        ensure_scope(conn, side_number, node)?;
+    }
     let cursor = cursor.map(|text| {
         if text.len() > 32768 { return Err(ApiError::new("INVALID_CURSOR", "分页游标过长")); }
         let c: Cursor = serde_json::from_str(text).map_err(|_| ApiError::new("INVALID_CURSOR", "无效分页游标"))?;

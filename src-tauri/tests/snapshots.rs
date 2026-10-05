@@ -57,6 +57,18 @@ fn rejects_invalid_fields_duplicate_paths_and_malformed_csv() {
         ("文件名称,大小,分配\n\"C:\\a,0,0\n", "CSV_ERROR"),
         ("文件名称,大小,分配\n\"C:\\a\"suffix,0,0\n", "CSV_ERROR"),
         ("文件名称,大小,分配\nC:\\a\"bad,0,0\n", "CSV_ERROR"),
+        ("文件名称,大小,分配\n\"C:\\a\" ,0,0\n", "CSV_ERROR"),
+        ("文件名称,大小,分配\n///,0,0\n", "INVALID_FIELD"),
+        ("文件名称,大小,分配,大小\nC:\\a,0,0,0\n", "INVALID_FIELD"),
+        ("文件名称,分配\nC:\\a,0\n", "UNSUPPORTED_HEADER"),
+        (
+            "文件名称,大小,分配,MFTRECNO\nC:\\a,0,0,1x\n",
+            "INVALID_FIELD",
+        ),
+        (
+            "文件名称,大小,分配,MFTPARENTRECNO\nC:\\a,0,0,-1\n",
+            "INVALID_FIELD",
+        ),
         ("文件名称,大小,分配\n", "EMPTY_SNAPSHOT"),
         ("", "EMPTY_SNAPSHOT"),
         ("Name,Size,Allocated\nC:\\a,0,0\n", "UNSUPPORTED_HEADER"),
@@ -88,6 +100,113 @@ fn rejects_invalid_fields_duplicate_paths_and_malformed_csv() {
         "CSV_ERROR"
     );
 }
+#[test]
+fn importer_canonicalizes_optional_numbers_without_losing_text_or_precision() {
+    let text = concat!(
+        "文件名称,大小,分配,修改时间,属性,文件,文件夹,MFTRECNO,MFTPARENTRECNO,LASTACCESSDATE,CREATEDDATE,FOLDERSIZE,FOLDERALLOCATED,DRIVECAPACITY,FREESPACE,USEDSPACE,RESERVEDSPACE\n",
+        "C:/ΟΣ,0001,0002,原样,00009,0000,0003,000184467440737095516160,0000,访问,创建,0009223372036854775807,0000,0004,0005,0006,0007\n"
+    );
+    let (_, conn, summary) = import_one(text).unwrap();
+    assert_eq!((summary.rows, summary.files, summary.folders), (1, 1, 0));
+    let (key, name, details, mft): (String, String, String, String) = conn
+        .query_row(
+            "SELECT n.path,n.name,e.details,e.mft FROM nodes n JOIN entries e ON e.node_id=n.id",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(key, "c:\\ος");
+    assert_eq!(name, "ΟΣ");
+    assert_eq!(mft, "184467440737095516160");
+    let values: Vec<Option<String>> = serde_json::from_str(&details).unwrap();
+    assert_eq!(
+        values.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
+        vec![
+            Some("原样"),
+            Some("00009"),
+            Some("0"),
+            Some("3"),
+            Some("184467440737095516160"),
+            Some("0"),
+            Some("访问"),
+            Some("创建"),
+            Some("9223372036854775807"),
+            Some("0"),
+            Some("4"),
+            Some("5"),
+            Some("6"),
+            Some("7"),
+        ]
+    );
+    for column in [
+        "文件",
+        "文件夹",
+        "FOLDERSIZE",
+        "FOLDERALLOCATED",
+        "DRIVECAPACITY",
+        "FREESPACE",
+        "USEDSPACE",
+        "RESERVEDSPACE",
+    ] {
+        for value in ["-1", "1x", "9223372036854775808"] {
+            let text = format!("文件名称,大小,分配,{column}\nC:\\a,0,0,{value}\n");
+            let error = import_one(&text).err().unwrap();
+            assert_eq!(error.code, "INVALID_FIELD");
+            assert_eq!(error.column.as_deref(), Some(column));
+            assert_eq!(error.record, Some(2));
+        }
+    }
+}
+
+#[test]
+fn importer_reuses_ids_across_committed_batches_and_rejects_late_conflicts() {
+    let dir = TempDir::new().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(store::SCHEMA).unwrap();
+    let mut text = "文件名称,大小,分配\n".to_owned();
+    for i in 0..10_005 {
+        text.push_str(&format!("C:\\Root\\a{i}.TXT,1,2\n"));
+    }
+    let before = source(&dir, "before.csv", &text);
+    let summary = import::load(&conn, &before, 0, &JobControl::default(), &mut |_| {}).unwrap();
+    assert_eq!(summary.rows, 10_005);
+    let after = source(&dir, "after.csv", &text.replace("C:\\Root\\", "c:/root/"));
+    import::load(&conn, &after, 1, &JobControl::default(), &mut |_| {}).unwrap();
+    let counts: (i64, i64, i64) = conn.query_row(
+        "SELECT (SELECT count(*) FROM nodes),(SELECT count(*) FROM entries),(SELECT count(*) FROM entries a JOIN entries b ON a.node_id=b.node_id WHERE a.side=0 AND b.side=1)", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap();
+    assert_eq!(counts, (10_005, 20_010, 10_005));
+    let category_counts: (i64, i64, i64) = conn.query_row(
+        "SELECT sum(size),sum(allocated),sum(files) FROM file_category_stats WHERE category='text'", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap();
+    assert_eq!(category_counts, (20_010, 40_020, 20_010));
+    assert!(conn.is_autocommit());
+    text.push_str("c:/ROOT/A0.txt,1,2\n");
+    let conflict = source(&dir, "conflict.csv", &text);
+    let fresh = Connection::open_in_memory().unwrap();
+    fresh.execute_batch(store::SCHEMA).unwrap();
+    let error =
+        import::load(&fresh, &conflict, 0, &JobControl::default(), &mut |_| {}).unwrap_err();
+    assert_eq!(error.code, "INVALID_FIELD");
+    assert_eq!(error.record, Some(10_007));
+    assert!(fresh.is_autocommit());
+    assert_eq!(
+        fresh
+            .query_row("SELECT count(*) FROM entries", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        10_000
+    );
+    assert_eq!(
+        fresh
+            .query_row("SELECT count(*) FROM file_category_stats", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
 #[test]
 fn roots_are_windows_unc_and_nonnested_with_count_warnings() {
     for (raw, key, parent) in [
@@ -131,7 +250,7 @@ fn rejects_file_parent_and_root_sum_overflow() {
             "INVALID_HIERARCHY",
         ),
         (
-            "文件名称,大小,分配\nC:\\a,9223372036854775807,0\nD:\\b,1,0\n",
+            "文件名称,大小,分配\nC:\\a\\,9223372036854775807,0\nD:\\b\\,1,0\n",
             "AGGREGATE_OVERFLOW",
         ),
     ] {

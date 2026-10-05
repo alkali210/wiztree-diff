@@ -1,4 +1,4 @@
-use crate::{import::JobControl, store, types::*};
+use crate::{store, types::*};
 use rusqlite::{params, Connection};
 
 pub const CATEGORIES: [&str; 8] = [
@@ -75,46 +75,13 @@ pub fn category(name: &str) -> &'static str {
     "other"
 }
 
-/// One streaming import pass with sixteen fixed counters; UI reads only this table.
-pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
-    control.check()?;
-    *control
-        .interrupt
-        .lock()
-        .map_err(|_| ApiError::new("LOCK_ERROR", "取消锁失效"))? =
-        Some(conn.get_interrupt_handle());
-    let mut values = [[[0i64; 3]; 8]; 2];
-    let mut stmt = conn.prepare("SELECT e.side,n.name,e.size,e.allocated FROM entries e JOIN nodes n ON n.id=e.node_id WHERE e.kind='file'")?;
-    let mut rows = stmt.query([])?;
-    let mut batch = 0;
-    while let Some(row) = rows.next()? {
-        if batch == 0 {
-            control.check()?;
-        }
-        batch = (batch + 1) % 1024;
-        let side: usize = row.get(0)?;
-        let name = store::root_text(row, 1)?;
-        let classification = category(name);
-        let index = CATEGORIES
-            .iter()
-            .position(|c| *c == classification)
-            .unwrap();
-        let v = &mut values[side][index];
-        v[0] = store::checked_add(v[0], row.get(2)?, "文件类别大小")?;
-        v[1] = store::checked_add(v[1], row.get(3)?, "文件类别分配")?;
-        v[2] = store::checked_add(v[2], 1, "文件类别数量")?;
-    }
-    drop(rows);
-    drop(stmt);
-    control.check()?;
-    conn.execute_batch("CREATE TABLE file_category_stats(side INTEGER NOT NULL,category TEXT NOT NULL,size INTEGER NOT NULL,allocated INTEGER NOT NULL,files INTEGER NOT NULL,PRIMARY KEY(side,category)) WITHOUT ROWID;")?;
+/// Persist the fixed-size counters collected while parsing this snapshot.
+pub(crate) fn save_import(conn: &Connection, side: i64, categories: &[[i64; 3]; 8]) -> Result<()> {
     let mut insert = conn.prepare("INSERT INTO file_category_stats VALUES(?1,?2,?3,?4,?5)")?;
-    for (side, categories) in values.iter().enumerate() {
-        for (index, v) in categories.iter().enumerate() {
-            insert.execute(params![side as i64, CATEGORIES[index], v[0], v[1], v[2]])?;
-        }
+    for (index, v) in categories.iter().enumerate() {
+        insert.execute(params![side, CATEGORIES[index], v[0], v[1], v[2]])?;
     }
-    control.check()
+    Ok(())
 }
 
 fn value(v: [i64; 3]) -> TypeValue {

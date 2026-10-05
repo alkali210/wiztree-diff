@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager, State};
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 type Reader = Arc<Mutex<Option<Connection>>>;
 struct Ready {
     id: String,
@@ -563,7 +563,9 @@ pub async fn get_file_categories(
     blocking(move || {
         let reader = state.reader(&comparison_id)?;
         let guard = locked(&reader)?;
-        let conn = guard.as_ref().ok_or_else(|| ApiError::new("STALE_COMPARISON", "对比已替换"))?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| ApiError::new("STALE_COMPARISON", "对比已替换"))?;
         crate::file_categories::get_file_categories(conn)
     })
     .await

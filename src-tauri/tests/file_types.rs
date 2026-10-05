@@ -279,29 +279,17 @@ fn absent_side_and_empty_directory_have_true_zero_totals() {
 fn totals_overflow_and_cancel_do_not_publish_partial_statistics() {
     for csv in [
         "文件名称,大小,分配\nC:\\a.py,9223372036854775807,0\nC:\\b.py,1,0\n",
-        "文件名称,大小,分配\nC:\\a.py,9223372036854775807,0\nC:\\b.exe,1,0\n",
-        "文件名称,大小,分配\nC:\\a.py,0,9223372036854775807\nC:\\b.exe,0,1\n",
+        "文件名称,大小,分配\nC:\\a.py,9223372036854775807,0\nC:\\b.png,1,0\n",
+        "文件名称,大小,分配\nC:\\a.py,0,9223372036854775807\nC:\\b.png,0,1\n",
     ] {
         let d = tempfile::TempDir::new().unwrap();
         let p = d.path().join("input.csv");
         std::fs::write(&p, csv).unwrap();
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch(store::SCHEMA).unwrap();
-        import::load(&c, &p, 0, &JobControl::default(), &mut |_| {}).unwrap();
-        assert_eq!(
-            file_extensions::materialize(&c, &JobControl::default())
-                .unwrap_err()
-                .code,
-            "AGGREGATE_OVERFLOW"
-        );
-        let count: i64 = c
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name='extension_stats'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0);
+        let result = import::load(&c, &p, 0, &JobControl::default(), &mut |_| {})
+            .and_then(|_| file_extensions::materialize(&c, &JobControl::default()));
+        assert_eq!(result.unwrap_err().code, "AGGREGATE_OVERFLOW");
         let control = JobControl::default();
         control.cancel();
         assert_eq!(
@@ -325,6 +313,42 @@ fn a_file_scope_never_inherits_descendants_from_the_directory_side() {
     assert_eq!((after.total.size.as_str(), after.total.files), ("20", 1));
     assert_eq!(after.rows[0].extension, ".exe");
     assert_eq!(page(&c, None, SnapshotSide::Before).total.size, "23");
+}
+
+#[test]
+fn global_and_directory_extension_totals_survive_bounded_cache_eviction() {
+    let mut csv = String::from("文件名称,大小,分配\nC:\\root\\,0,0\n");
+    for i in 0..8201 {
+        csv.push_str(&format!("C:\\root\\a.type{i},3,4\n"));
+    }
+    csv.push_str("C:\\root\\revisited.type0,7,9\n");
+    let (_dir, c) = build(&csv, &csv);
+    let root = id(&c, "C:\\root\\");
+    for parent in [None, Some(root.as_str())] {
+        let result = page(&c, parent, SnapshotSide::After);
+        assert_eq!(result.total_extensions, 8201);
+        assert_eq!(
+            (
+                result.total.size.as_str(),
+                result.total.allocated.as_str(),
+                result.total.files
+            ),
+            ("24610", "32813", 8202)
+        );
+        let revisited = result
+            .rows
+            .iter()
+            .find(|row| row.extension == ".type0")
+            .unwrap();
+        assert_eq!(
+            (
+                revisited.size.as_str(),
+                revisited.allocated.as_str(),
+                revisited.files
+            ),
+            ("10", "13", 2)
+        );
+    }
 }
 
 #[test]
