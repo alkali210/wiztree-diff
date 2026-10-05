@@ -25,11 +25,13 @@ fn build(b: &str, a: &str) -> (tempfile::TempDir, Connection) {
     (dir, conn)
 }
 fn id(c: &Connection, p: &str) -> String {
+    let key = import::normalize(p).0;
+    let parts = import::canonical_parts(&key);
     format!(
         "n{}",
         c.query_row(
-            "SELECT id FROM nodes WHERE path=?1",
-            [import::normalize(p).0],
+            "SELECT n.id FROM path_prefixes p JOIN node_records n ON n.prefix_id=p.id WHERE p.path=?1 AND n.basename_key=?2",
+            parts,
             |r| r.get::<_, i64>(0)
         )
         .unwrap()

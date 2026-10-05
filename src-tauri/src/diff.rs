@@ -8,25 +8,34 @@ use serde::{Deserialize, Serialize};
 
 pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
     control.check()?;
+    // Rank SQLite's exact BINARY lexical order once. The temporary table holds
+    // only integer pairs; display/sort text remains solely in node_records.
+    conn.execute_batch("CREATE TEMP TABLE lexical_order(node_id INTEGER PRIMARY KEY,sort_rank INTEGER NOT NULL) WITHOUT ROWID;
+        INSERT INTO lexical_order SELECT node_id,sort_rank FROM (SELECT id node_id,dense_rank() OVER(ORDER BY basename_key COLLATE BINARY) sort_rank FROM node_records) ORDER BY node_id;")?;
+    control.check()?;
     conn.execute_batch("CREATE TABLE comparison_nodes(
-        node_id INTEGER PRIMARY KEY,parent_id INTEGER NOT NULL,name TEXT NOT NULL,basename_key TEXT NOT NULL,
+        node_id INTEGER PRIMARY KEY,parent_id INTEGER NOT NULL,sort_rank INTEGER NOT NULL,
         expandable INTEGER NOT NULL,status TEXT NOT NULL,has_changes INTEGER NOT NULL,
         changed_descendant_count INTEGER NOT NULL DEFAULT 0,child_count INTEGER NOT NULL DEFAULT 0,
         before_kind TEXT,after_kind TEXT,before_size INTEGER NOT NULL,after_size INTEGER NOT NULL,
         before_allocated INTEGER NOT NULL,after_allocated INTEGER NOT NULL,
         size_delta INTEGER NOT NULL,allocated_delta INTEGER NOT NULL,extension TEXT NOT NULL);
-        INSERT INTO comparison_nodes(node_id,parent_id,name,basename_key,expandable,status,has_changes,before_kind,after_kind,before_size,after_size,before_allocated,after_allocated,size_delta,allocated_delta,extension)
-        SELECT n.id,coalesce(n.parent_id,0),n.name,n.basename_key,coalesce(b.kind='directory',0) OR coalesce(a.kind='directory',0),
+        INSERT INTO comparison_nodes(node_id,parent_id,sort_rank,expandable,status,has_changes,before_kind,after_kind,before_size,after_size,before_allocated,after_allocated,size_delta,allocated_delta,extension)
+        SELECT n.id,coalesce(n.parent_id,0),r.sort_rank,coalesce(b.kind=1,0) OR coalesce(a.kind=1,0),
         CASE WHEN b.node_id IS NULL THEN 'added' WHEN a.node_id IS NULL THEN 'removed' WHEN b.kind!=a.kind THEN 'typeChanged' WHEN b.size!=a.size OR b.allocated!=a.allocated THEN 'modified' ELSE 'unchanged' END,
         b.node_id IS NULL OR a.node_id IS NULL OR b.kind!=a.kind OR b.size!=a.size OR b.allocated!=a.allocated,
-        b.kind,a.kind,coalesce(b.size,0),coalesce(a.size,0),coalesce(b.allocated,0),coalesce(a.allocated,0),
-        coalesce(a.size,0)-coalesce(b.size,0),coalesce(a.allocated,0)-coalesce(b.allocated,0),CASE WHEN b.kind='file' THEN b.extension ELSE coalesce(a.extension,'') END
-        FROM nodes n LEFT JOIN entries b ON b.node_id=n.id AND b.side=0 LEFT JOIN entries a ON a.node_id=n.id AND a.side=1;
+        CASE b.kind WHEN 0 THEN 'file' WHEN 1 THEN 'directory' END,CASE a.kind WHEN 0 THEN 'file' WHEN 1 THEN 'directory' END,
+        coalesce(b.size,0),coalesce(a.size,0),coalesce(b.allocated,0),coalesce(a.allocated,0),
+        coalesce(a.size,0)-coalesce(b.size,0),coalesce(a.allocated,0)-coalesce(b.allocated,0),CASE WHEN b.kind=0 OR a.kind=0 THEN n.extension ELSE '' END
+        FROM node_records n NOT INDEXED CROSS JOIN lexical_order r ON r.node_id=n.id
+        LEFT JOIN snapshot_entries b ON b.node_id=n.id AND b.side=0 LEFT JOIN snapshot_entries a ON a.node_id=n.id AND a.side=1;
+        DROP TABLE lexical_order;
         CREATE INDEX comparison_parent ON comparison_nodes(parent_id);")?;
-    conn.execute_batch("UPDATE comparison_nodes SET child_count=(SELECT count(*) FROM comparison_nodes c WHERE c.parent_id=comparison_nodes.node_id) WHERE expandable=1;")?;
     let depth: i64 =
-        conn.query_row("SELECT coalesce(max(depth),0) FROM nodes", [], |r| r.get(0))?;
-    let mut propagate = conn.prepare("UPDATE comparison_nodes SET (changed_descendant_count,has_changes)=(SELECT coalesce(sum(c.changed_descendant_count+(c.status!='unchanged')),0),comparison_nodes.status!='unchanged' OR coalesce(max(c.has_changes),0) FROM comparison_nodes c INDEXED BY comparison_parent WHERE c.parent_id=comparison_nodes.node_id) WHERE node_id IN (SELECT n.id FROM nodes n INDEXED BY nodes_depth CROSS JOIN comparison_nodes c WHERE n.depth=?1 AND c.node_id=n.id AND c.expandable=1)")?;
+        conn.query_row("SELECT coalesce(max(depth),0) FROM node_records", [], |r| {
+            r.get(0)
+        })?;
+    let mut propagate = conn.prepare("UPDATE comparison_nodes SET (changed_descendant_count,has_changes)=(SELECT coalesce(sum(c.changed_descendant_count+(c.status!='unchanged')),0),comparison_nodes.status!='unchanged' OR coalesce(max(c.has_changes),0) FROM comparison_nodes c INDEXED BY comparison_parent WHERE c.parent_id=comparison_nodes.node_id) WHERE node_id IN (SELECT n.id FROM node_records n INDEXED BY nodes_depth CROSS JOIN comparison_nodes c WHERE n.depth=?1 AND c.node_id=n.id AND c.expandable=1)")?;
     for d in (0..=depth).rev() {
         control.check()?;
         propagate.execute([d]).map_err(aggregate_error)?;
@@ -34,8 +43,9 @@ pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
     conn.execute_batch("CREATE TABLE comparison_aggregates(
         parent_id INTEGER PRIMARY KEY,child_count INTEGER NOT NULL,changed_children INTEGER NOT NULL,internal_changes INTEGER NOT NULL);
         INSERT INTO comparison_aggregates SELECT parent_id,count(*),sum(has_changes),sum(status='unchanged' AND has_changes AND expandable) FROM comparison_nodes GROUP BY parent_id;
-        CREATE INDEX tree_page ON comparison_nodes(parent_id,expandable DESC,basename_key,node_id);
-        CREATE INDEX tree_changes_page ON comparison_nodes(parent_id,expandable DESC,basename_key,node_id) WHERE has_changes=1;
+        UPDATE comparison_nodes SET child_count=coalesce((SELECT a.child_count FROM comparison_aggregates a WHERE a.parent_id=comparison_nodes.node_id),0) WHERE expandable=1;
+        CREATE INDEX tree_page ON comparison_nodes(parent_id,expandable DESC,sort_rank,node_id);
+        CREATE INDEX tree_changes_page ON comparison_nodes(parent_id,expandable DESC,sort_rank,node_id) WHERE has_changes=1;
         DROP INDEX comparison_parent;
         ").map_err(aggregate_error)?;
     control.check()
@@ -212,7 +222,7 @@ struct Cursor {
     parent: Option<String>,
     changes: bool,
     directory: bool,
-    name: String,
+    rank: i64,
     node: i64,
 }
 
@@ -234,7 +244,7 @@ pub fn list_children(
         if c.comparison != comparison_id || c.parent.as_deref() != parent || c.changes != changes_only || c.node <= 0 {
             return Err(ApiError::new("INVALID_CURSOR", "分页游标范围不匹配"));
         }
-        let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM comparison_nodes WHERE node_id=?1 AND parent_id=?2 AND expandable=?3 AND basename_key=?4 AND (?5=0 OR has_changes=1))", params![c.node,parent_id,c.directory,c.name,changes_only], |r| r.get(0))?;
+        let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM comparison_nodes WHERE node_id=?1 AND parent_id=?2 AND expandable=?3 AND sort_rank=?4 AND (?5=0 OR has_changes=1))", params![c.node,parent_id,c.directory,c.rank,changes_only], |r| r.get(0))?;
         if !valid { return Err(ApiError::new("INVALID_CURSOR", "分页游标排序键无效")); }
         Ok(c)
     }).transpose()?;
@@ -269,14 +279,14 @@ pub fn list_children(
         }
         let seek = cursor.as_ref().filter(|c| c.directory == directory);
         let range = if seek.is_some() {
-            " AND (c.basename_key,c.node_id)>(?3,?4)"
+            " AND (c.sort_rank,c.node_id)>(?3,?4)"
         } else {
             ""
         };
-        let sql = format!("SELECT c.node_id,c.name,c.expandable,c.status,c.has_changes,c.changed_descendant_count,c.child_count,c.before_kind,c.after_kind,c.before_size,c.after_size,c.before_allocated,c.after_allocated,c.size_delta,c.allocated_delta,c.basename_key,json_extract(b.details,'$[0]'),json_extract(b.details,'$[1]'),json_extract(a.details,'$[0]'),json_extract(a.details,'$[1]') FROM comparison_nodes c INDEXED BY {index} LEFT JOIN entries b ON b.node_id=c.node_id AND b.side=0 LEFT JOIN entries a ON a.node_id=c.node_id AND a.side=1 WHERE c.parent_id=?1 AND c.expandable=?2{filter}{range} ORDER BY c.basename_key,c.node_id LIMIT {}",201-rows.len());
+        let sql = format!("SELECT c.node_id,n.name,c.expandable,c.status,c.has_changes,c.changed_descendant_count,c.child_count,c.before_kind,c.after_kind,c.before_size,c.after_size,c.before_allocated,c.after_allocated,c.size_delta,c.allocated_delta,c.sort_rank,json_extract(b.details,'$[0]'),json_extract(b.details,'$[1]'),json_extract(a.details,'$[0]'),json_extract(a.details,'$[1]') FROM comparison_nodes c INDEXED BY {index} JOIN node_records n ON n.id=c.node_id LEFT JOIN snapshot_entries bs ON bs.node_id=c.node_id AND bs.side=0 LEFT JOIN entry_values b ON b.id=bs.value_id LEFT JOIN snapshot_entries aas ON aas.node_id=c.node_id AND aas.side=1 LEFT JOIN entry_values a ON a.id=aas.value_id WHERE c.parent_id=?1 AND c.expandable=?2{filter}{range} ORDER BY c.sort_rank,c.node_id LIMIT {}",201-rows.len());
         let mut stmt = conn.prepare(&sql)?;
         let mut query = match seek {
-            Some(c) => stmt.query(params![parent_id, directory, c.name, c.node])?,
+            Some(c) => stmt.query(params![parent_id, directory, c.rank, c.node])?,
             None => stmt.query(params![parent_id, directory])?,
         };
         while let Some(row) = query.next()? {
@@ -290,7 +300,7 @@ pub fn list_children(
                 parent: parent.map(str::to_owned),
                 changes: changes_only,
                 directory: value.expandable,
-                name: row.get(15)?,
+                rank: row.get(15)?,
                 node: row.get(0)?,
             });
             rows.push(value);
@@ -347,7 +357,7 @@ pub fn get_details(conn: &Connection, node_id: &str) -> Result<NodeDetails> {
             let [modified, attributes, files, folders, _, parent_mft, accessed, created, direct_size, direct_allocated, drive_capacity, free_space, used_space, reserved_space] =
                 values;
             let hardlink_count = if kind == "file" && mft.is_some() {
-                conn.query_row("SELECT count(*) FROM entries INDEXED BY entries_mft WHERE side=?1 AND volume=?2 AND mft=?3 AND kind='file' AND mft IS NOT NULL", params![side,volume,mft], |r| r.get::<_,i64>(0))? as u64
+                conn.query_row("SELECT count(*) FROM entry_values v INDEXED BY entry_values_mft CROSS JOIN snapshot_entries s INDEXED BY snapshot_values ON s.value_id=v.id WHERE s.side=?1 AND s.kind=0 AND v.volume=?2 AND v.mft=?3 AND v.mft IS NOT NULL", params![side,volume,mft], |r| r.get::<_,i64>(0))? as u64
             } else {
                 0
             };

@@ -1,7 +1,7 @@
 use base64::Engine;
 use rusqlite::{params, Connection};
 use wiztree_diff_lib::{
-    diff, global_treemap,
+    global_treemap,
     import::{self, JobControl},
     store,
     types::{ChartMode, Metric, Status},
@@ -27,17 +27,59 @@ fn build(before: &str, after: &str) -> (tempfile::TempDir, Connection) {
     (dir, conn)
 }
 fn node(conn: &Connection, path: &str) -> String {
-    format!(
-        "n{}",
-        conn.query_row(
-            "SELECT id FROM nodes WHERE path=?1",
-            [import::normalize(path).0],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap()
-    )
+    let normalized = import::normalize(path).0;
+    let (prefix, basename) = import::canonical_parts(&normalized);
+    format!("n{}",conn.query_row(
+        "SELECT n.id FROM path_prefixes p JOIN node_records n ON n.prefix_id=p.id WHERE p.path=?1 AND n.basename_key=?2",
+        params![prefix,basename],|r|r.get::<_,i64>(0),
+    ).unwrap())
 }
 
+// Expected files come from imported CSV records; geometry is observed only through
+// the public bounds/hit APIs, independent of the persistent representation.
+fn file_rects(
+    c: &Connection,
+    metric: Metric,
+    mode: ChartMode,
+) -> Vec<(i64, f64, f64, f64, f64, i64)> {
+    let side = if matches!(mode, ChartMode::After) {
+        1
+    } else {
+        0
+    };
+    let column = if matches!(metric, Metric::Size) {
+        "size"
+    } else {
+        "allocated"
+    };
+    let mut query=c.prepare(&format!("SELECT node_id,{column} FROM entries WHERE side=?1 AND kind='file' AND {column}>0 ORDER BY node_id")).unwrap();
+    let rects = query
+        .query_map([side], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .unwrap()
+        .map(|r| {
+            let (id, weight) = r.unwrap();
+            let b = global_treemap::get_bounds(c, metric, mode, &format!("n{id}"), 0)
+                .unwrap()
+                .unwrap();
+            (id, b.x, b.y, b.width, b.height, weight)
+        })
+        .collect();
+    rects
+}
+fn imported_connection(before: &str, after: &str) -> (tempfile::TempDir, Connection) {
+    let dir = tempfile::tempdir().unwrap();
+    let b = dir.path().join("before.csv");
+    let a = dir.path().join("after.csv");
+    std::fs::write(&b, before).unwrap();
+    std::fs::write(&a, after).unwrap();
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(store::SCHEMA).unwrap();
+    let control = JobControl::default();
+    let mut bs = import::load(&c, &b, 0, &control, &mut |_| {}).unwrap();
+    let mut as_ = import::load(&c, &a, 1, &control, &mut |_| {}).unwrap();
+    store::finish_import(&c, &mut bs, &mut as_, &control).unwrap();
+    (dir, c)
+}
 #[test]
 fn appending_other_views_preserves_precise_hits_in_existing_maps() {
     let mut before = String::from("文件名称,大小,分配\n");
@@ -53,8 +95,7 @@ fn appending_other_views_preserves_precise_hits_in_existing_maps() {
             assert_eq!(frame.rendered_block_count, 1027);
         }
     }
-    // Later maps share the final spatial bucket of earlier maps. Their bounds
-    // must not replace earlier candidates or leak into the selected view.
+    // Independently persisted mode families must not replace earlier hit candidates.
     for metric in [Metric::Size, Metric::Allocated] {
         for mode in [ChartMode::After, ChartMode::Before, ChartMode::Delta] {
             for i in [0, 19, 300, 700, 1026] {
@@ -157,29 +198,37 @@ fn nested_directory_headers_select_real_ancestors_without_occluding_files() {
         assert_eq!(hit.weight, weight);
         assert!(hit.rect.height > label.height);
     }
-    let mut q=c.prepare("SELECT r.node_id,r.x,r.y,r.width,r.height,p.y+p.header_height FROM treemap_rects r JOIN treemap_weights w ON w.key=r.key JOIN treemap_rects p ON p.view=r.view AND p.key=w.parent_id WHERE r.view=6 AND r.leaf=1").unwrap();
-    let mut rows = q.query([]).unwrap();
-    while let Some(r) = rows.next().unwrap() {
-        let (id, x, y, w, h): (i64, f64, f64, f64, f64) = (
-            r.get(0).unwrap(),
-            r.get(1).unwrap(),
-            r.get(2).unwrap(),
-            r.get(3).unwrap(),
-            r.get(4).unwrap(),
-        );
-        assert!(y >= r.get::<_, f64>(5).unwrap() - 1e-12);
-        assert!(w > 0.0 && h > 0.0);
+    for path in [
+        "C:\\r\\root.txt",
+        "C:\\r\\A\\a.txt",
+        "C:\\r\\A\\sub\\one.bin",
+        "C:\\r\\A\\sub\\two.py",
+        "C:\\r\\B\\big.dll",
+        "C:\\r\\B\\small.jpg",
+    ] {
+        let id = node(&c, path);
+        let r = global_treemap::get_bounds(&c, Metric::Size, ChartMode::Before, &id, 0)
+            .unwrap()
+            .unwrap();
+        assert!(r.width > 0.0 && r.height > 0.0);
+        let parent = path.rsplit_once('\\').unwrap().0;
+        let p = frame
+            .labels
+            .iter()
+            .find(|l| l.node_id == node(&c, parent))
+            .unwrap();
+        assert!(r.y >= p.y + p.height - 1e-12);
         let hit = global_treemap::hit_test(
             &c,
             Metric::Size,
             ChartMode::Before,
-            x + w / 2.0,
-            y + h / 2.0,
+            r.x + r.width / 2.0,
+            r.y + r.height / 2.0,
             0,
         )
         .unwrap()
         .unwrap();
-        assert_eq!(hit.node_id, format!("n{id}"));
+        assert_eq!(hit.node_id, id);
         assert_eq!(hit.kind, NodeKind::File);
     }
     let limited = global_treemap::get_frame(&c, Metric::Size, ChartMode::After, 1).unwrap();
@@ -288,8 +337,7 @@ fn unlimited_global_baseline_views_preserve_integer_totals_hierarchy_and_ownersh
             9007199254742281,
         ),
     ];
-    for (v, (metric, mode, files, visible, weight)) in expected.into_iter().enumerate() {
-        let v = v + 6;
+    for (metric, mode, files, visible, weight) in expected {
         let frame = global_treemap::get_frame(&c, metric, mode, 0).unwrap();
         assert_eq!(
             (frame.file_count, frame.visible_file_count),
@@ -308,21 +356,7 @@ fn unlimited_global_baseline_views_preserve_integer_totals_hierarchy_and_ownersh
         let decoder = png::Decoder::new(std::io::Cursor::new(png));
         let reader = decoder.read_info().unwrap();
         assert_eq!((reader.info().width, reader.info().height), (4096, 1024));
-        let mut query=c.prepare("SELECT node_id,x,y,width,height,weight FROM treemap_rects WHERE view=?1 AND leaf=1 ORDER BY node_id").unwrap();
-        let rects: Vec<(i64, f64, f64, f64, f64, i64)> = query
-            .query_map([v as i64], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            })
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let rects = file_rects(&c, metric, mode);
         assert_eq!(rects.len() as u64, visible);
         assert_eq!(rects.iter().map(|r| r.5).sum::<i64>(), weight);
         for &(id, x, y, w, h, file_weight) in &rects {
@@ -340,14 +374,47 @@ fn unlimited_global_baseline_views_preserve_integer_totals_hierarchy_and_ownersh
         }
         // Header/gutter space is decoration. Proportions remain exact within
         // each parent content area rather than the entire image rectangle.
-        let mut shares=c.prepare("SELECT r.width*r.height,r.weight,p.weight,(p.width-CASE WHEN p.header_height>0 THEN 16.0/4096 ELSE 0 END)*(p.height-p.header_height-CASE WHEN p.header_height>0 THEN 8.0/1024 ELSE 0 END) FROM treemap_rects r JOIN treemap_weights w ON w.key=r.key JOIN treemap_rects p ON p.view=r.view AND p.key=w.parent_id WHERE r.view=?1 AND r.leaf=1").unwrap();
-        let mut shares = shares.query([v as i64]).unwrap();
-        while let Some(row) = shares.next().unwrap() {
-            let area: f64 = row.get(0).unwrap();
-            let weight: i64 = row.get(1).unwrap();
-            let parent_weight: i64 = row.get(2).unwrap();
-            let content: f64 = row.get(3).unwrap();
-            assert!((area / content - weight as f64 / parent_weight as f64).abs() < 1e-10);
+        for &(id, x, y, w, h, file_weight) in &rects {
+            let parent: Option<i64> = c
+                .query_row("SELECT parent_id FROM nodes WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            if let Some(parent) = parent {
+                let pid = format!("n{parent}");
+                let p = global_treemap::get_bounds(&c, metric, mode, &pid, 0)
+                    .unwrap()
+                    .unwrap();
+                let header = frame
+                    .labels
+                    .iter()
+                    .find(|l| {
+                        l.node_id == pid && l.kind == wiztree_diff_lib::types::NodeKind::Directory
+                    })
+                    .map_or(0.0, |l| l.height);
+                let side = if matches!(mode, ChartMode::After) {
+                    1
+                } else {
+                    0
+                };
+                let col = if matches!(metric, Metric::Size) {
+                    "size"
+                } else {
+                    "allocated"
+                };
+                let parent_weight:i64=c.query_row(&format!("WITH RECURSIVE scope(id) AS (SELECT ?2 UNION ALL SELECT n.id FROM nodes n JOIN scope s ON n.parent_id=s.id) SELECT sum(e.{col}) FROM scope s JOIN entries e ON e.node_id=s.id WHERE e.side=?1 AND e.kind='file'"),params![side,parent],|r|r.get(0)).unwrap();
+                let content = (p.width - if header > 0.0 { 16.0 / 4096.0 } else { 0.0 })
+                    * (p.height - header - if header > 0.0 { 8.0 / 1024.0 } else { 0.0 });
+                assert!(
+                    (w * h / content - file_weight as f64 / parent_weight as f64).abs() < 1e-10
+                );
+                assert!(
+                    x >= p.x - 1e-10
+                        && y >= p.y - 1e-10
+                        && x + w <= p.x + p.width + 1e-10
+                        && y + h <= p.y + p.height + 1e-10
+                );
+            }
         }
         // Nonoverlap uses strict interior overlap, tolerating floating boundary rounding.
         for (i, a) in rects.iter().enumerate() {
@@ -362,8 +429,6 @@ fn unlimited_global_baseline_views_preserve_integer_totals_hierarchy_and_ownersh
                 );
             }
         }
-        let bad:i64=c.query_row("SELECT count(*) FROM treemap_rects r JOIN treemap_weights w ON w.key=r.key JOIN treemap_rects p ON p.view=r.view AND p.key=w.parent_id WHERE r.view=?1 AND (r.x<p.x-1e-10 OR r.y<p.y-1e-10 OR r.x+r.width>p.x+p.width+1e-10 OR r.y+r.height>p.y+p.height+1e-10)",[v as i64],|r|r.get(0)).unwrap();
-        assert_eq!(bad, 0);
     }
     let delta = global_treemap::get_frame(&c, Metric::Size, ChartMode::Delta, 0).unwrap();
     assert_eq!(
@@ -384,26 +449,17 @@ fn unlimited_global_baseline_views_preserve_integer_totals_hierarchy_and_ownersh
         ("1244".into(), "40".into(), "1204".into())
     );
     let orphan = node(&c, "C:\\root\\gap\\lost.py");
-    let orphan_parent: i64 = c
-        .query_row(
-            "SELECT parent_id FROM treemap_weights WHERE node_id=?1 AND leaf=1",
-            [orphan[1..].parse::<i64>().unwrap()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(orphan_parent, 0);
     assert_eq!(
-        c.query_row(
-            "SELECT count(*) FROM nodes WHERE path=?1",
-            [import::normalize("C:\\root\\gap\\").0],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
+        wiztree_diff_lib::diff::get_details(&c, &orphan)
+            .unwrap()
+            .parent_id,
+        None
     );
     let swap = node(&c, "C:\\root\\swap");
-    let own=c.query_row("SELECT x,y,width,height,weight,value FROM treemap_rects WHERE view=8 AND leaf=1 AND node_id=?1",[swap[1..].parse::<i64>().unwrap()],|r|Ok((r.get::<_,f64>(0)?,r.get::<_,f64>(1)?,r.get::<_,f64>(2)?,r.get::<_,f64>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?))).unwrap();
-    assert_eq!((own.4, own.5), (31, -31));
+    let own_rect = global_treemap::get_bounds(&c, Metric::Size, ChartMode::Delta, &swap, 0)
+        .unwrap()
+        .unwrap();
+    let own = (own_rect.x, own_rect.y, own_rect.width, own_rect.height);
     let hit = global_treemap::hit_test(
         &c,
         Metric::Size,
@@ -489,31 +545,14 @@ fn zero_and_empty_frames_keep_counts_and_exported_directory_values_without_fake_
             assert_eq!(f.exported_total, exported);
         }
     }
-    assert_eq!(
-        c.query_row("SELECT count(*) FROM treemap_rects", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
 }
 
 #[test]
 fn equal_siblings_have_deterministic_shared_edge_and_outer_edge_hits() {
     let csv = "文件名称,大小,分配\nC:\\a.bin,1,1\nC:\\b.bin,1,1\n";
     let (_dir, c) = build(csv, csv);
-    let mut q = c
-        .prepare(
-            "SELECT node_id,x,y,width,height FROM treemap_rects WHERE view=7 AND leaf=1 ORDER BY x",
-        )
-        .unwrap();
-    let r: Vec<(i64, f64, f64, f64, f64)> = q
-        .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    assert_eq!(r.len(), 2);
+    let mut r = file_rects(&c, Metric::Size, ChartMode::After);
+    r.sort_by(|a, b| a.1.total_cmp(&b.1));
     let right = &r[1];
     let edge = global_treemap::hit_test(&c, Metric::Size, ChartMode::After, right.1, 0.5, 0)
         .unwrap()
@@ -525,30 +564,34 @@ fn equal_siblings_have_deterministic_shared_edge_and_outer_edge_hits() {
     assert_eq!(outer.node_id, format!("n{}", right.0));
 }
 
-fn raw_connection() -> Connection {
-    let c = Connection::open_in_memory().unwrap();
-    c.execute_batch(store::SCHEMA).unwrap();
-    c.execute_batch("CREATE INDEX nodes_depth ON nodes(depth); CREATE TABLE export_roots(side INTEGER,node_id INTEGER,path TEXT,eligible INTEGER);").unwrap();
-    c
-}
 #[test]
 fn leaf_aggregate_overflow_fails_and_cancelled_build_writes_nothing() {
-    let c = raw_connection();
-    for id in 1..=2 {
-        c.execute("INSERT INTO nodes(id,path,parent_path,parent_id,name,depth,basename_key) VALUES(?1,?2,NULL,NULL,?2,0,?2)",params![id,format!("c:\\{id}.bin")]).unwrap();
-        c.execute("INSERT INTO entries(side,node_id,path,kind,size,allocated,details,volume,extension) VALUES(0,?1,?2,'file',?3,0,'{}','c:','.bin')",params![id,format!("c:\\{id}.bin"),i64::MAX]).unwrap();
-    }
-    diff::materialize(&c, &JobControl::default()).unwrap();
-    let error = global_treemap::materialize(&c, &JobControl::default()).unwrap_err();
+    let dir = tempfile::tempdir().unwrap();
+    let b = dir.path().join("before.csv");
+    let a = dir.path().join("after.csv");
+    std::fs::write(
+        &b,
+        format!(
+            "文件名称,大小,分配\nC:\\1.bin,{},0\nC:\\2.bin,{},0\n",
+            i64::MAX,
+            i64::MAX
+        ),
+    )
+    .unwrap();
+    std::fs::write(&a, "文件名称,大小,分配\nC:\\zero.bin,0,0\n").unwrap();
+    let error = store::build_comparison(
+        &b,
+        &a,
+        &dir.path().join("overflow.sqlite"),
+        "overflow",
+        &JobControl::default(),
+        &mut |_| {},
+    )
+    .unwrap_err();
     assert_eq!(error.code, "AGGREGATE_OVERFLOW");
-    assert_eq!(
-        c.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name='treemap_frames'",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
+    let (_dir, c) = imported_connection(
+        "文件名称,大小,分配\nC:\\one.bin,1,1\n",
+        "文件名称,大小,分配\nC:\\zero.bin,0,0\n",
     );
     let control = JobControl::default();
     control.cancel();
@@ -560,50 +603,13 @@ fn leaf_aggregate_overflow_fails_and_cancelled_build_writes_nothing() {
 
 #[test]
 fn hundred_thousand_actual_parents_and_sparse_roots_are_not_sampled_or_capped() {
-    let c = raw_connection();
-    let tx = c.unchecked_transaction().unwrap();
-    let mut n=c.prepare("INSERT INTO nodes(id,path,parent_path,parent_id,name,depth,basename_key) VALUES(?1,?2,NULL,?3,?2,?4,?2)").unwrap();
-    let mut e=c.prepare("INSERT INTO entries(side,node_id,path,kind,size,allocated,details,volume,extension) VALUES(?1,?2,?3,?4,?5,?6,'{}','c:',?7)").unwrap();
-    for i in 0..100001i64 {
-        let parent = 2 * i + 1;
-        let leaf = parent + 1;
-        n.execute(params![
-            parent,
-            format!("c:\\actual{i}"),
-            Option::<i64>::None,
-            0
-        ])
-        .unwrap();
-        n.execute(params![leaf, format!("c:\\actual{i}\\f.bin"), parent, 1])
-            .unwrap();
-        for side in 0..=1 {
-            e.execute(params![
-                side,
-                parent,
-                format!("c:\\actual{i}"),
-                "directory",
-                1000000,
-                1000000,
-                ""
-            ])
-            .unwrap();
-            e.execute(params![
-                side,
-                leaf,
-                format!("c:\\actual{i}\\f.bin"),
-                "file",
-                1,
-                2,
-                ".bin"
-            ])
-            .unwrap();
-        }
+    let mut csv = String::from("文件名称,大小,分配\n");
+    for i in 0..100001 {
+        csv.push_str(&format!(
+            "C:\\actual{i}\\,1000000,1000000\nC:\\actual{i}\\f.bin,1,2\n"
+        ));
     }
-    drop(n);
-    drop(e);
-    tx.commit().unwrap();
-    diff::materialize(&c, &JobControl::default()).unwrap();
-    global_treemap::materialize(&c, &JobControl::default()).unwrap();
+    let (_dir, c) = build(&csv, &csv);
     for metric in [Metric::Size, Metric::Allocated] {
         for mode in [ChartMode::Before, ChartMode::After, ChartMode::Delta] {
             let f = global_treemap::get_frame(&c, metric, mode, 0).unwrap();
@@ -619,31 +625,34 @@ fn hundred_thousand_actual_parents_and_sparse_roots_are_not_sampled_or_capped() 
             );
         }
     }
-    assert_eq!(
-        c.query_row(
-            "SELECT count(*) FROM treemap_rects WHERE view=7 AND leaf=1",
-            [],
-            |r| r.get::<_, i64>(0)
+    let frame = global_treemap::get_frame(&c, Metric::Size, ChartMode::After, 0).unwrap();
+    assert_eq!(frame.rendered_block_count, 100001);
+    for i in [0, 50000, 100000] {
+        let id = node(&c, &format!("C:\\actual{i}\\f.bin"));
+        let r = global_treemap::get_bounds(&c, Metric::Size, ChartMode::After, &id, 0)
+            .unwrap()
+            .unwrap();
+        let hit = global_treemap::hit_test(
+            &c,
+            Metric::Size,
+            ChartMode::After,
+            r.x + r.width / 2.0,
+            r.y + r.height / 2.0,
+            0,
         )
-        .unwrap(),
-        100001
-    );
-    assert_eq!(
-        c.query_row(
-            "SELECT count(*) FROM treemap_rects WHERE view=7 AND leaf=0",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        100001
-    );
+        .unwrap()
+        .unwrap();
+        assert_eq!(hit.node_id, id);
+    }
 }
 
 #[test]
 fn active_job_cancellation_interrupts_sql_and_rolls_back_materialization() {
-    let c = raw_connection();
-    c.execute_batch("WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<10000) INSERT INTO nodes(id,path,parent_id,name,depth,basename_key) SELECT id,'c:\\f'||id||'.bin',NULL,'f'||id,0,'f'||id FROM ids;INSERT INTO entries(side,node_id,path,kind,size,allocated,details,volume,extension) SELECT 0,id,path,'file',1,2,'{}','c:','.bin' FROM nodes;").unwrap();
-    diff::materialize(&c, &JobControl::default()).unwrap();
+    let mut csv = String::from("文件名称,大小,分配\n");
+    for i in 0..10000 {
+        csv.push_str(&format!("C:\\f{i}.bin,1,2\n"));
+    }
+    let (_dir, c) = imported_connection(&csv, "文件名称,大小,分配\nC:\\after.bin,0,0\n");
     let control = JobControl::default();
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -661,15 +670,11 @@ fn active_job_cancellation_interrupts_sql_and_rolls_back_materialization() {
             "CANCELLED"
         );
     });
-    assert_eq!(
-        c.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name='treemap_frames'",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
-    );
+    global_treemap::materialize(&c, &JobControl::default()).unwrap();
+    let frame = global_treemap::get_frame(&c, Metric::Size, ChartMode::Before, 0).unwrap();
+    assert_eq!(frame.file_count, 10000);
+    assert_eq!(frame.rendered_block_count, 10000);
+    assert_eq!(frame.weight_total, "10000");
 }
 
 fn rect_tuple(r: &wiztree_diff_lib::types::TreemapRect) -> (f64, f64, f64, f64) {
@@ -737,22 +742,22 @@ fn real_rust_depth_smoke_preserves_all_leaf_areas_and_cancelling_descendant_mark
                 }
             );
             assert_eq!(delta.rendered_block_count, before.rendered_block_count);
-            let base = if matches!(metric, Metric::Size) { 0 } else { 3 };
-            let v = if depth == 3 {
-                base
-            } else {
-                (depth as i64 + 1) * 6 + base
-            };
-            let different:i64=c.query_row("SELECT count(*) FROM (SELECT key,leaf,x,y,width,height,weight,header_height FROM treemap_rects WHERE view=?1 EXCEPT SELECT key,leaf,x,y,width,height,weight,header_height FROM treemap_rects WHERE view=?2)",params![v,v+2],|r|r.get(0)).unwrap();
-            assert_eq!(different, 0);
-            let (blocks, sum): (i64, i64) = c
-                .query_row(
-                    "SELECT count(*),sum(weight) FROM treemap_rects WHERE view=?1 AND leaf=1",
-                    [v],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!((blocks as u64, sum), (before.rendered_block_count, 100));
+            for path in [
+                "C:\\deep\\export\\root.txt",
+                "C:\\deep\\export\\sub\\keep.bin",
+                "C:\\deep\\export\\sub\\deep\\grow.txt",
+                "C:\\deep\\export\\sub\\deep\\removed.bin",
+                "C:\\deep\\export\\sub\\deep\\more\\keep.mp3",
+            ] {
+                let id = node(&c, path);
+                let b = global_treemap::get_bounds(&c, metric, ChartMode::Before, &id, depth)
+                    .unwrap()
+                    .unwrap();
+                let d = global_treemap::get_bounds(&c, metric, ChartMode::Delta, &id, depth)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(rect_tuple(&b), rect_tuple(&d));
+            }
             let highlight =
                 global_treemap::get_bounds(&c, metric, ChartMode::Delta, &hidden, depth)
                     .unwrap()
@@ -794,8 +799,6 @@ fn real_rust_depth_smoke_preserves_all_leaf_areas_and_cancelling_descendant_mark
                 for rgb in [[35, 148, 107], [218, 83, 97], [225, 183, 80]] {
                     assert!(rgba.chunks_exact(4).any(|p| p[..3] == rgb));
                 }
-                let deeper:i64=c.query_row("SELECT count(*) FROM treemap_rects r JOIN treemap_weights w ON w.key=r.key WHERE r.view=?1 AND w.leaf=0 AND w.depth>?2",params![v,depth],|r|r.get(0)).unwrap();
-                assert_eq!(deeper, 0);
             } else {
                 let hit = global_treemap::hit_test(
                     &c,
@@ -880,33 +883,6 @@ fn type_changes_keep_before_own_leaf_and_exclude_after_directory_children_from_d
     let b="文件名称,大小,分配\nC:\\r\\,20,20\nC:\\r\\swap,12,12\nC:\\r\\reverse\\,8,8\nC:\\r\\reverse\\child.bin,8,8\n";
     let a="文件名称,大小,分配\nC:\\r\\,20,20\nC:\\r\\swap\\,12,12\nC:\\r\\swap\\child.txt,12,12\nC:\\r\\reverse,8,8\n";
     let (_dir, c) = build(b, a);
-    assert_eq!(
-        c.query_row(
-            "SELECT count(*) FROM treemap_weights WHERE key<0 AND leaf=1",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        2
-    );
-    assert_eq!(
-        c.query_row(
-            "SELECT count(*) FROM treemap_weights WHERE key>0 AND leaf=0",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        3
-    );
-    assert_eq!(
-        c.query_row(
-            "SELECT count(*) FROM treemap_weights WHERE key>0 AND leaf=1",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        2
-    );
     for depth in [3, 0] {
         let d = global_treemap::get_frame(&c, Metric::Size, ChartMode::Delta, depth).unwrap();
         assert_eq!(d.weight_total, "20");
@@ -940,28 +916,200 @@ fn type_changes_keep_before_own_leaf_and_exclude_after_directory_children_from_d
         assert!(pixels(&d)
             .chunks_exact(4)
             .any(|p| p[..3] == [148, 114, 204]));
-        let v = if depth == 3 { 2 } else { 8 };
         let after_child = node(&c, "C:\\r\\swap\\child.txt");
-        assert_eq!(
-            c.query_row(
-                "SELECT count(*) FROM treemap_rects WHERE view=?1 AND leaf=1 AND node_id=?2",
-                params![v, after_child[1..].parse::<i64>().unwrap()],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
-        );
+        let child =
+            global_treemap::get_bounds(&c, Metric::Size, ChartMode::Delta, &after_child, depth)
+                .unwrap()
+                .unwrap();
+        assert_eq!(rect_tuple(&child), rect_tuple(&rect));
         let before_child = node(&c, "C:\\r\\reverse\\child.bin");
         let after = global_treemap::get_frame(&c, Metric::Size, ChartMode::After, depth).unwrap();
         assert_eq!(after.rendered_block_count, 2);
+        let child =
+            global_treemap::get_bounds(&c, Metric::Size, ChartMode::After, &before_child, depth)
+                .unwrap()
+                .unwrap();
+        let hit = global_treemap::hit_test(
+            &c,
+            Metric::Size,
+            ChartMode::After,
+            child.x + child.width / 2.0,
+            child.y + child.height / 2.0,
+            depth,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(hit.node_id, before_child);
+    }
+}
+#[test]
+fn switching_modes_keeps_every_subpixel_hit_and_published_frames_read_only() {
+    let mut before = String::from("文件名称,大小,分配\nC:\\big.bin,1000000000000,2000000000000\n");
+    let mut after = String::from("文件名称,大小,分配\nC:\\big.bin,2000000000000,3000000000000\n");
+    for i in 0..1030 {
+        before.push_str(&format!("C:\\tiny{i}.bin,1,2\n"));
+        after.push_str(&format!("C:\\tiny{i}.bin,2,3\n"));
+    }
+    let (dir, c) = build(&before, &after);
+    let db = dir.path().join("comparison.sqlite");
+    for metric in [Metric::Size, Metric::Allocated] {
+        global_treemap::get_frame(&c, metric, ChartMode::Before, 0).unwrap();
+        let bytes = std::fs::metadata(&db).unwrap().len();
+        let data_version: i64 = c
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap();
+        for mode in [ChartMode::Delta, ChartMode::Before, ChartMode::After] {
+            let frame = global_treemap::get_frame(&c, metric, mode, 0).unwrap();
+            assert_eq!(frame.rendered_block_count, 1031);
+        }
+        for i in 0..1030 {
+            let id = node(&c, &format!("C:\\tiny{i}.bin"));
+            let b = global_treemap::get_bounds(&c, metric, ChartMode::Before, &id, 0)
+                .unwrap()
+                .unwrap();
+            assert!(b.width > 0.0 && b.height > 0.0);
+            assert!(b.width * 4096.0 < 1.0 || b.height * 1024.0 < 1.0);
+            let d = global_treemap::get_bounds(&c, metric, ChartMode::Delta, &id, 0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(rect_tuple(&b), rect_tuple(&d));
+            for mode in [ChartMode::Before, ChartMode::Delta, ChartMode::After] {
+                let r = global_treemap::get_bounds(&c, metric, mode, &id, 0)
+                    .unwrap()
+                    .unwrap();
+                let hit = global_treemap::hit_test(
+                    &c,
+                    metric,
+                    mode,
+                    r.x + r.width / 2.0,
+                    r.y + r.height / 2.0,
+                    0,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(hit.node_id, id);
+            }
+        }
+        assert_eq!(std::fs::metadata(&db).unwrap().len(), bytes);
         assert_eq!(
-            c.query_row(
-                "SELECT count(*) FROM treemap_rects WHERE view=?1 AND leaf=1 AND node_id=?2",
-                params![v - 1, before_child[1..].parse::<i64>().unwrap()],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
+            c.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            data_version
         );
+    }
+}
+
+#[test]
+fn revisiting_depths_preserves_exact_frames_and_mode_bounds() {
+    let csv="文件名称,大小,分配\nC:\\r\\,1000,2000\nC:\\r\\sub\\,1000,2000\nC:\\r\\sub\\deep\\,1000,2000\nC:\\r\\root.bin,10,20\nC:\\r\\sub\\leaf.txt,30,60\nC:\\r\\sub\\deep\\last.bin,60,120\n";
+    let (_dir, c) = build(csv, csv);
+    let id = node(&c, "C:\\r\\sub\\deep\\last.bin");
+    for depth in [1, 2, 3, 4, 5, 1, 0, 2] {
+        let b = global_treemap::get_frame(&c, Metric::Size, ChartMode::Before, depth).unwrap();
+        let d = global_treemap::get_frame(&c, Metric::Size, ChartMode::Delta, depth).unwrap();
+        let a = global_treemap::get_frame(&c, Metric::Size, ChartMode::After, depth).unwrap();
+        assert_eq!((b.file_count, b.visible_file_count), (3, 3));
+        assert_eq!(b.weight_total, "100");
+        assert_eq!(
+            b.rendered_block_count,
+            match depth {
+                1 => 1,
+                2 => 2,
+                _ => 3,
+            }
+        );
+        assert_eq!(b.image_data_url, d.image_data_url);
+        assert_eq!(b.image_data_url, a.image_data_url);
+        let bounds = global_treemap::get_bounds(&c, Metric::Size, ChartMode::Before, &id, depth)
+            .unwrap()
+            .unwrap();
+        for mode in [ChartMode::After, ChartMode::Delta] {
+            assert_eq!(
+                rect_tuple(&bounds),
+                rect_tuple(
+                    &global_treemap::get_bounds(&c, Metric::Size, mode, &id, depth)
+                        .unwrap()
+                        .unwrap()
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn hit_and_label_paths_preserve_exact_snapshot_spelling() {
+    let before_path = "C:/Root/Leaf.TXT";
+    let after_path = "c:\\root\\leaf.txt";
+    let (_dir, c) = build(
+        &format!("文件名称,大小,分配\n{before_path},10,20\n"),
+        &format!("文件名称,大小,分配\n{after_path},30,40\n"),
+    );
+    let id = node(&c, before_path);
+    for mode in [ChartMode::Before, ChartMode::After, ChartMode::Delta] {
+        let expected = if matches!(mode, ChartMode::After) {
+            after_path
+        } else {
+            before_path
+        };
+        let frame = global_treemap::get_frame(&c, Metric::Size, mode, 0).unwrap();
+        let label = frame.labels.iter().find(|l| l.node_id == id).unwrap();
+        assert_eq!(label.path, expected);
+        let hit = global_treemap::hit_test(&c, Metric::Size, mode, 0.5, 0.5, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.node_id, id);
+        assert_eq!(hit.path, expected);
+    }
+}
+
+#[test]
+fn unchanged_nested_files_reposition_correctly_when_ancestor_area_and_headers_change() {
+    let before="文件名称,大小,分配\nC:\\r\\,5100,5100\nC:\\r\\outside.bin,5000,5000\nC:\\r\\stable\\,100,100\nC:\\r\\stable\\sub\\,100,100\nC:\\r\\stable\\sub\\a.txt,40,40\nC:\\r\\stable\\sub\\b.mp3,60,60\n";
+    let after = before
+        .replace("5100,5100", "600,600")
+        .replace("5000,5000", "500,500");
+    let (_dir, c) = build(before, &after);
+    let sub = node(&c, "C:\\r\\stable\\sub");
+    let a = node(&c, "C:\\r\\stable\\sub\\a.txt");
+    let b = node(&c, "C:\\r\\stable\\sub\\b.mp3");
+    for metric in [Metric::Size, Metric::Allocated] {
+        let old = global_treemap::get_frame(&c, metric, ChartMode::Before, 0).unwrap();
+        let current = global_treemap::get_frame(&c, metric, ChartMode::After, 0).unwrap();
+        assert_eq!(
+            (old.weight_total.as_str(), current.weight_total.as_str()),
+            ("5100", "600")
+        );
+        assert!(!old.labels.iter().any(|l| l.node_id == sub));
+        let title = current.labels.iter().find(|l| l.node_id == sub).unwrap();
+        let ar = global_treemap::get_bounds(&c, metric, ChartMode::After, &a, 0)
+            .unwrap()
+            .unwrap();
+        let br = global_treemap::get_bounds(&c, metric, ChartMode::After, &b, 0)
+            .unwrap()
+            .unwrap();
+        assert!((ar.width * ar.height / (br.width * br.height) - 2.0 / 3.0).abs() < 1e-12);
+        for (id, rect, weight) in [(&a, &ar, "40"), (&b, &br, "60")] {
+            assert!(rect.y >= title.y + title.height - 1e-12);
+            let hit = global_treemap::hit_test(
+                &c,
+                metric,
+                ChartMode::After,
+                rect.x + rect.width / 2.0,
+                rect.y + rect.height / 2.0,
+                0,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(&hit.node_id, id);
+            assert_eq!(hit.weight, weight);
+            let previous = global_treemap::get_bounds(&c, metric, ChartMode::Before, id, 0)
+                .unwrap()
+                .unwrap();
+            assert_ne!(rect_tuple(rect), rect_tuple(&previous));
+            let delta = global_treemap::get_bounds(&c, metric, ChartMode::Delta, id, 0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(rect_tuple(&previous), rect_tuple(&delta));
+        }
     }
 }

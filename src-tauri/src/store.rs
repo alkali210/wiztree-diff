@@ -6,10 +6,16 @@ use crate::{
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
+// Share exact same-node cold metadata without collapsing paths or MFT hardlinks.
+// Kind and byte values remain canonical, precise, side-specific membership data.
 pub const SCHEMA: &str = "
 CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE nodes(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,parent_path TEXT,parent_id INTEGER,name TEXT NOT NULL,depth INTEGER NOT NULL,basename_key TEXT NOT NULL);
-CREATE TABLE entries(side INTEGER NOT NULL,node_id INTEGER NOT NULL,path TEXT NOT NULL,kind TEXT NOT NULL,size INTEGER NOT NULL,allocated INTEGER NOT NULL,details TEXT NOT NULL,files INTEGER,folders INTEGER,mft TEXT,volume TEXT NOT NULL,extension TEXT NOT NULL DEFAULT '',PRIMARY KEY(side,node_id)) WITHOUT ROWID;
+CREATE TABLE path_prefixes(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE);
+CREATE TABLE node_records(id INTEGER PRIMARY KEY,prefix_id INTEGER NOT NULL,basename_key TEXT NOT NULL,name TEXT NOT NULL,depth INTEGER NOT NULL,parent_id INTEGER,parent_path TEXT,extension TEXT NOT NULL DEFAULT '',UNIQUE(prefix_id,basename_key));
+CREATE VIEW nodes AS SELECT n.id,p.path||n.basename_key path,n.parent_path,n.parent_id,n.name,n.depth,n.basename_key FROM node_records n JOIN path_prefixes p ON p.id=n.prefix_id;
+CREATE TABLE entry_values(id INTEGER PRIMARY KEY,prefix_id INTEGER NOT NULL,suffix TEXT NOT NULL,details TEXT NOT NULL,files INTEGER,folders INTEGER,mft TEXT,volume TEXT NOT NULL,extension TEXT NOT NULL DEFAULT '');
+CREATE TABLE snapshot_entries(side INTEGER NOT NULL,node_id INTEGER NOT NULL,value_id INTEGER NOT NULL,kind INTEGER NOT NULL CHECK(kind IN(0,1)),size INTEGER NOT NULL,allocated INTEGER NOT NULL,PRIMARY KEY(side,node_id)) WITHOUT ROWID;
+CREATE VIEW entries AS SELECT s.side,s.node_id,p.path||v.suffix path,CASE s.kind WHEN 0 THEN 'file' ELSE 'directory' END kind,s.size,s.allocated,v.details,v.files,v.folders,v.mft,v.volume,v.extension FROM snapshot_entries s JOIN entry_values v ON v.id=s.value_id JOIN path_prefixes p ON p.id=v.prefix_id;
 CREATE TABLE file_category_stats(side INTEGER NOT NULL,category TEXT NOT NULL,size INTEGER NOT NULL,allocated INTEGER NOT NULL,files INTEGER NOT NULL,PRIMARY KEY(side,category)) WITHOUT ROWID;
 CREATE TABLE extension_stats(side INTEGER NOT NULL,node_id INTEGER NOT NULL,extension TEXT NOT NULL,
 size INTEGER NOT NULL CHECK(typeof(size)='integer' AND size>=0),allocated INTEGER NOT NULL CHECK(typeof(allocated)='integer' AND allocated>=0),
@@ -67,7 +73,7 @@ pub fn build_comparison(
             Some(conn.get_interrupt_handle());
         // Bulk writes belong only to this unpublished, disposable database.
         // Flush it before publishing; an interrupted build is discarded.
-        conn.execute_batch("PRAGMA page_size=8192; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; PRAGMA mmap_size=536870912; PRAGMA cache_size=-262144;")?;
+        conn.execute_batch("PRAGMA page_size=8192; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-32768; PRAGMA mmap_size=536870912; PRAGMA cache_size=-262144;")?;
         conn.execute_batch(SCHEMA)?;
         let mut before_summary = import::load(&conn, before, 0, control, progress)?;
         let mut after_summary = import::load(&conn, after, 1, control, progress)?;
@@ -153,11 +159,30 @@ pub fn finish_import(
     after: &mut SourceSummary,
     control: &JobControl,
 ) -> Result<Vec<String>> {
-    conn.execute_batch("CREATE INDEX nodes_parent ON nodes(parent_id); UPDATE nodes SET parent_id=(SELECT p.id FROM nodes p WHERE p.path=nodes.parent_path) WHERE parent_id IS NULL AND parent_path IS NOT NULL; CREATE INDEX nodes_depth ON nodes(depth); CREATE INDEX entries_mft ON entries(side,volume,mft) WHERE kind='file' AND mft IS NOT NULL;")?;
-    let mut bad_parent = conn.prepare("SELECT e.path FROM (SELECT DISTINCT parent_id FROM nodes WHERE parent_id IS NOT NULL) parents
-        CROSS JOIN entries p ON p.side=?1 AND p.node_id=parents.parent_id
-        CROSS JOIN nodes n INDEXED BY nodes_parent ON n.parent_id=p.node_id
-        JOIN entries e ON e.side=p.side AND e.node_id=n.id WHERE p.kind='file' LIMIT 1")?;
+    // Spool unresolved links to SQLite, not a Rust path list. Resolve each compact
+    // key once before creating the hierarchy indexes; absent parents stay absent.
+    let links = conn.unchecked_transaction()?;
+    conn.execute_batch("CREATE TEMP TABLE unresolved_parents AS SELECT id,parent_path FROM node_records WHERE parent_path IS NOT NULL;")?;
+    {
+        let mut pending = conn.prepare("SELECT id,parent_path FROM unresolved_parents")?;
+        let mut lookup = conn.prepare("SELECT n.id FROM path_prefixes p JOIN node_records n ON n.prefix_id=p.id WHERE p.path=?1 AND n.basename_key=?2")?;
+        let mut save = conn.prepare("UPDATE node_records SET parent_id=?2,parent_path=NULL WHERE id=?1")?;
+        let mut rows = pending.query([])?;
+        while let Some(row) = rows.next()? {
+            control.check()?;
+            let (prefix, basename) = import::canonical_parts(root_text(row, 1)?);
+            let parent: Option<i64> = lookup.query_row((prefix, basename), |r| r.get(0)).optional()?;
+            save.execute((row.get::<_, i64>(0)?, parent))?;
+        }
+    }
+    conn.execute_batch("DROP TABLE unresolved_parents; CREATE INDEX nodes_parent ON node_records(parent_id); CREATE INDEX nodes_depth ON node_records(depth); CREATE INDEX entry_values_mft ON entry_values(volume,mft) WHERE mft IS NOT NULL; CREATE INDEX snapshot_values ON snapshot_entries(value_id,side) WHERE kind=0;")?;
+    links.commit()?;
+    let mut bad_parent = conn.prepare("SELECT ep.path||e.suffix FROM (SELECT DISTINCT parent_id FROM node_records WHERE parent_id IS NOT NULL) parents
+        CROSS JOIN snapshot_entries p ON p.side=?1 AND p.node_id=parents.parent_id
+        CROSS JOIN node_records n INDEXED BY nodes_parent ON n.parent_id=p.node_id
+        CROSS JOIN snapshot_entries child ON child.side=p.side AND child.node_id=n.id
+        CROSS JOIN entry_values e ON e.id=child.value_id
+        CROSS JOIN path_prefixes ep ON ep.id=e.prefix_id WHERE p.kind=0 LIMIT 1")?;
     for side in [0, 1] {
         if let Some(path) = bad_parent
             .query_row([side], |r| r.get::<_, String>(0))
@@ -176,14 +201,14 @@ pub fn finish_import(
     let root_transaction = conn.unchecked_transaction()?;
     for (side, summary) in [(0, &mut *before), (1, &mut *after)] {
         let mut roots = conn.prepare("WITH missing(id) AS MATERIALIZED (
-            SELECT parents.parent_id FROM (SELECT DISTINCT parent_id FROM nodes WHERE parent_id IS NOT NULL) parents
-            LEFT JOIN entries p ON p.side=?1 AND p.node_id=parents.parent_id WHERE p.node_id IS NULL)
-            SELECT n.id,n.path,e.path,e.kind,e.size,e.allocated,n.parent_path
-            FROM nodes n INDEXED BY nodes_parent CROSS JOIN entries e ON e.side=?1 AND e.node_id=n.id WHERE n.parent_id IS NULL
-            UNION ALL SELECT n.id,n.path,e.path,e.kind,e.size,e.allocated,n.parent_path
-            FROM missing m CROSS JOIN nodes n INDEXED BY nodes_parent ON n.parent_id=m.id
-            CROSS JOIN entries e ON e.side=?1 AND e.node_id=n.id ORDER BY 2")?;
-        let mut ancestor = conn.prepare("SELECT e.kind='file' FROM nodes n JOIN entries e ON e.node_id=n.id AND e.side=?1 WHERE n.path=?2")?;
+            SELECT parents.parent_id FROM (SELECT DISTINCT parent_id FROM node_records WHERE parent_id IS NOT NULL) parents
+            LEFT JOIN snapshot_entries p ON p.side=?1 AND p.node_id=parents.parent_id WHERE p.node_id IS NULL)
+            SELECT n.id,np.path||n.basename_key,e.path,e.kind,e.size,e.allocated
+            FROM node_records n INDEXED BY nodes_parent CROSS JOIN path_prefixes np ON np.id=n.prefix_id CROSS JOIN entries e ON e.side=?1 AND e.node_id=n.id WHERE n.parent_id IS NULL
+            UNION ALL SELECT n.id,np.path||n.basename_key,e.path,e.kind,e.size,e.allocated
+            FROM missing m CROSS JOIN node_records n INDEXED BY nodes_parent ON n.parent_id=m.id
+            CROSS JOIN path_prefixes np ON np.id=n.prefix_id CROSS JOIN entries e ON e.side=?1 AND e.node_id=n.id ORDER BY 2")?;
+        let mut ancestor = conn.prepare("SELECT e.kind=0 FROM path_prefixes p JOIN node_records n ON n.prefix_id=p.id JOIN snapshot_entries e ON e.node_id=n.id AND e.side=?1 WHERE p.path=?2 AND n.basename_key=?3")?;
         let mut save_root = conn
             .prepare("INSERT INTO export_roots(side,node_id,path,eligible) VALUES(?1,?2,?3,?4)")?;
         let mut rows = roots.query([side])?;
@@ -199,14 +224,12 @@ pub fn finish_import(
                     examples.push(path.to_owned());
                 }
             }
-            let mut parent = match row.get_ref(6)? {
-                rusqlite::types::ValueRef::Null => None,
-                _ => Some(root_text(row, 6)?),
-            };
+            let mut parent = canonical_parent(root_text(row, 1)?);
             let mut nested = false;
             while let Some(p) = parent {
+                let (prefix, basename) = import::canonical_parts(p);
                 if let Some(parent_is_file) = ancestor
-                    .query_row(params![side, p], |r| r.get::<_, bool>(0))
+                    .query_row(params![side, prefix, basename], |r| r.get::<_, bool>(0))
                     .optional()?
                 {
                     if parent_is_file {
@@ -282,7 +305,7 @@ pub fn finish_import(
             CASE WHEN c.before_kind='directory' THEN coalesce(d.b_folders,0) ELSE 0 END,
             CASE WHEN c.after_kind='directory' THEN coalesce(d.a_files,0) ELSE 0 END,
             CASE WHEN c.after_kind='directory' THEN coalesce(d.a_folders,0) ELSE 0 END
-            FROM comparison_nodes c JOIN nodes n ON n.id=c.node_id LEFT JOIN direct d ON d.id=c.node_id WHERE c.expandable=1;
+            FROM comparison_nodes c JOIN node_records n ON n.id=c.node_id LEFT JOIN direct d ON d.id=c.node_id WHERE c.expandable=1;
         CREATE INDEX export_counts_depth ON export_counts(depth);
         CREATE INDEX export_counts_parent ON export_counts(parent_id);")?;
     let depth: i64 = conn.query_row(
@@ -298,9 +321,9 @@ pub fn finish_import(
         control.check()?;
         propagate.execute([d]).map_err(aggregate_error)?;
     }
-    let mismatch: i64 = conn.query_row("SELECT (SELECT count(*) FROM export_counts c CROSS JOIN entries e ON e.node_id=c.node_id AND e.side=0
+    let mismatch: i64 = conn.query_row("SELECT (SELECT count(*) FROM export_counts c CROSS JOIN snapshot_entries s ON s.node_id=c.node_id AND s.side=0 JOIN entry_values e ON e.id=s.value_id
         WHERE c.b_dir AND ((e.files IS NOT NULL AND e.files!=c.b_files) OR (e.folders IS NOT NULL AND e.folders!=c.b_folders)))
-        +(SELECT count(*) FROM export_counts c CROSS JOIN entries e ON e.node_id=c.node_id AND e.side=1
+        +(SELECT count(*) FROM export_counts c CROSS JOIN snapshot_entries s ON s.node_id=c.node_id AND s.side=1 JOIN entry_values e ON e.id=s.value_id
         WHERE c.a_dir AND ((e.files IS NOT NULL AND e.files!=c.a_files) OR (e.folders IS NOT NULL AND e.folders!=c.a_folders)))", [], |r| r.get(0))?;
     if mismatch > 0 {
         warnings.push(format!(

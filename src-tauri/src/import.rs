@@ -161,6 +161,53 @@ fn field_error(path: &Path, record: u64, column: &str, message: impl Into<String
     }
 }
 
+// Canonical roots retain their whole key; other keys use a shared directory prefix.
+pub fn canonical_parts(path: &str) -> (&str, &str) {
+    if path.ends_with('\\') {
+        ("", path)
+    } else {
+        raw_parts(path)
+    }
+}
+fn raw_parts(path: &str) -> (&str, &str) {
+    match path.rfind(['\\', '/']) {
+        Some(i) => path.split_at(i + 1),
+        None => ("", path),
+    }
+}
+
+struct Prefixes<'a> {
+    conn: &'a Connection,
+    insert: rusqlite::Statement<'a>,
+    lookup: rusqlite::Statement<'a>,
+    ids: HashMap<String, i64>,
+}
+impl<'a> Prefixes<'a> {
+    fn new(conn: &'a Connection) -> Result<Self> {
+        Ok(Self {
+            conn,
+            insert: conn.prepare("INSERT INTO path_prefixes(path) VALUES(?1) ON CONFLICT(path) DO NOTHING")?,
+            lookup: conn.prepare("SELECT id FROM path_prefixes WHERE path=?1")?,
+            ids: HashMap::with_capacity(4096),
+        })
+    }
+    fn intern(&mut self, path: &str) -> Result<i64> {
+        if let Some(id) = self.ids.get(path) {
+            return Ok(*id);
+        }
+        let id = if self.insert.execute([path])? != 0 {
+            self.conn.last_insert_rowid()
+        } else {
+            self.lookup.query_row([path], |r| r.get(0))?
+        };
+        if self.ids.len() == 4096 {
+            self.ids.clear();
+        }
+        self.ids.insert(path.to_owned(), id);
+        Ok(id)
+    }
+}
+
 pub fn load(
     conn: &Connection,
     path: &Path,
@@ -183,9 +230,12 @@ pub fn load(
     control.check()?;
     conn.execute_batch("BEGIN")?;
     let result = (|| {
-        let mut node = conn.prepare("INSERT INTO nodes(path,parent_path,name,depth,basename_key,parent_id) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(path) DO NOTHING")?;
-        let mut lookup = conn.prepare("SELECT id FROM nodes WHERE path=?1")?;
-        let mut entry = conn.prepare("INSERT INTO entries(side,node_id,path,kind,size,allocated,details,files,folders,mft,volume,extension) VALUES(?1,?11,?2,?3,?4,?5,?6,?7,?8,?9,?10,?12)")?;
+        let mut prefixes = Prefixes::new(conn)?;
+        let mut node = conn.prepare("INSERT INTO node_records(prefix_id,parent_path,name,depth,basename_key,parent_id,extension) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(prefix_id,basename_key) DO NOTHING")?;
+        let mut lookup = conn.prepare("SELECT id FROM node_records WHERE prefix_id=?1 AND basename_key=?2")?;
+        let mut value = conn.prepare("INSERT INTO entry_values(prefix_id,suffix,details,files,folders,mft,volume,extension) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?;
+        let mut matching = conn.prepare("SELECT n.id,CASE WHEN v.prefix_id=?1 AND v.suffix=?2 AND v.details=?3 AND v.files IS ?4 AND v.folders IS ?5 AND v.mft IS ?6 AND v.volume=?7 AND v.extension=?8 THEN v.id END FROM node_records n LEFT JOIN snapshot_entries s ON s.side=0 AND s.node_id=n.id LEFT JOIN entry_values v ON v.id=s.value_id WHERE n.prefix_id=?9 AND n.basename_key=?10")?;
+        let mut entry = conn.prepare("INSERT INTO snapshot_entries(side,node_id,value_id,kind,size,allocated) VALUES(?1,?2,?3,?4,?5,?6)")?;
         let mut serialized = Vec::with_capacity(1024);
         let mut paths = PathBuffers::default();
         let mut categories = [[0i64; 3]; 8];
@@ -332,25 +382,33 @@ pub fn load(
                 .map_err(|e| ApiError::new("SERIALIZATION_ERROR", e.to_string()))?;
             let details = std::str::from_utf8(&serialized)
                 .map_err(|e| ApiError::new("SERIALIZATION_ERROR", e.to_string()))?;
-            let basename_key = if parent.is_none() {
-                key
-            } else {
-                key.rsplit('\\').next().unwrap_or(key)
+            let (canonical_prefix, basename_key) = canonical_parts(key);
+            let prefix_id = prefixes.intern(canonical_prefix)?;
+            let (raw_prefix, raw_suffix) = raw_parts(original);
+            let raw_prefix_id = prefixes.intern(raw_prefix)?;
+            let node_extension = crate::file_extensions::extension(basename_key);
+            let extension = if kind == "file" { node_extension } else { "" };
+            // One indexed lookup resolves both the node and exact immutable value.
+            let existing: Option<(i64, Option<i64>)> = if side == 0 { None } else {
+                matching.query_row((raw_prefix_id, raw_suffix, details, parsed[5], parsed[6], values[4], volume(key), extension, prefix_id, basename_key), |r| Ok((r.get(0)?, r.get(1)?))).optional()?
             };
-            let existing = if side == 0 { None } else { lookup.query_row([key], |r| r.get(0)).optional()? };
-            let node_id = if let Some(id) = existing {
+            let node_id = if let Some((id, _)) = existing {
                 id
             } else {
                 let parent_id = match parent {
                     None => None,
                     Some(path) => match parents.get(path) {
                         Some(id) => Some(*id),
-                        None => lookup.query_row([path], |r| r.get(0)).optional()?,
+                        None => {
+                            let (prefix, basename) = canonical_parts(path);
+                            let id = prefixes.intern(prefix)?;
+                            lookup.query_row((id, basename), |r| r.get(0)).optional()?
+                        },
                     },
                 };
-                if node.execute((key, parent, name, depth, basename_key, parent_id))? != 0 {
+                if node.execute((prefix_id, parent.filter(|_| parent_id.is_none()), name, depth, basename_key, parent_id, node_extension))? != 0 {
                     conn.last_insert_rowid()
-                } else { lookup.query_row([key], |r| r.get(0))? }
+                } else { lookup.query_row((prefix_id, basename_key), |r| r.get(0))? }
             };
             if kind == "directory" {
                 if parents.len() == 1024 {
@@ -358,7 +416,16 @@ pub fn load(
                 }
                 parents.insert(key.to_owned(), node_id);
             }
-            entry.execute((side, original, kind, size, allocated, details, parsed[5], parsed[6], values[4], volume(key), node_id, if kind == "file" { crate::file_extensions::extension(basename_key) } else { "" })).map_err(|e| {
+            // SQLite compares borrowed parameters without hashes or owned row copies.
+            let shared = existing.and_then(|(_, value_id)| value_id);
+            let value_id = match shared {
+                Some(id) => id,
+                None => {
+                    value.execute((raw_prefix_id, raw_suffix, details, parsed[5], parsed[6], values[4], volume(key), extension))?;
+                    conn.last_insert_rowid()
+                }
+            };
+            entry.execute((side, node_id, value_id, i64::from(kind == "directory"), size, allocated)).map_err(|e| {
                 if matches!(e, rusqlite::Error::SqliteFailure(ref x, _) if x.code == rusqlite::ErrorCode::ConstraintViolation) {
                     field_error(path, rec, COLUMNS[0], "重复或大小写规范化冲突路径")
                 } else { source_error(path, e.into()) }
@@ -377,7 +444,6 @@ pub fn load(
                 values[0] = crate::store::checked_add(values[0], size, "文件类别大小")?;
                 values[1] = crate::store::checked_add(values[1], allocated, "文件类别分配")?;
                 values[2] = crate::store::checked_add(values[2], 1, "文件类别数量")?;
-                let extension = crate::file_extensions::extension(basename_key);
                 if let Some(values) = extensions.get_mut(extension) {
                     values[0] = crate::store::checked_add(values[0], size, "扩展名大小")?;
                     values[1] = crate::store::checked_add(values[1], allocated, "扩展名分配")?;

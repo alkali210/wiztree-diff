@@ -50,6 +50,17 @@ export function OccupancyCharts({
   const [maxDepth, setMaxDepth] = useState(0);
   const [depthInput, setDepthInput] = useState(String(maxDepth));
   const key = JSON.stringify([comparisonId, metric, mode, maxDepth]);
+  const frameCache = useRef({
+    comparisonId,
+    maxDepth,
+    frames: new Map<string, FullTreemapData>(),
+  });
+  if (
+    frameCache.current.comparisonId !== comparisonId ||
+    frameCache.current.maxDepth !== maxDepth
+  ) {
+    frameCache.current = { comparisonId, maxDepth, frames: new Map() };
+  }
   const [frame, setFrame] = useState<{
       key: string;
       data: FullTreemapData;
@@ -77,19 +88,26 @@ export function OccupancyCharts({
       bounds?.key === key && bounds.nodeId === selectedId ? bounds.rect : null;
   useEffect(() => {
     let live = true;
-    setFrame(null);
+    const cache = frameCache.current;
+    const cached = cache.frames.get(key);
+    setFrame(cached ? { key, data: cached } : null);
     setError("");
     setHover(null);
     pointerSeq.current++;
     clickSeq.current++;
-    void api.getFullTreemap(comparisonId, metric, mode, maxDepth).then(
-      (result) => {
-        if (live) setFrame({ key, data: result });
-      },
-      (e) => {
-        if (live) setError(errorText(e));
-      },
-    );
+    if (!cached)
+      void api.getFullTreemap(comparisonId, metric, mode, maxDepth).then(
+        (result) => {
+          // Keep only the six metric/mode frames for this comparison and depth.
+          // An old response may finish after switching mode, but cannot enter a
+          // new comparison/depth cache or replace the currently displayed frame.
+          if (frameCache.current === cache) cache.frames.set(key, result);
+          if (live) setFrame({ key, data: result });
+        },
+        (e) => {
+          if (live) setError(errorText(e));
+        },
+      );
     return () => {
       live = false;
       clickSeq.current++;

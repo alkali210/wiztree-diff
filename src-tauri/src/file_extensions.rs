@@ -111,6 +111,7 @@ fn ensure_scope(conn: &Connection, side: i64, node: i64) -> Result<()> {
     conn.execute("INSERT INTO extension_totals SELECT ?1,?2,count(*),coalesce(sum(size),0),coalesce(sum(allocated),0),coalesce(sum(files),0)
         FROM extension_stats WHERE side=?1 AND node_id=?2", params![side, node]).map_err(aggregate_error)?;
     tx.commit()?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(())
 }
 
@@ -141,7 +142,7 @@ pub fn list_extensions(
         Some(id) => {
             let node = diff::node_number(id)?;
             let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM nodes WHERE id=?1)",
+                "SELECT EXISTS(SELECT 1 FROM node_records WHERE id=?1)",
                 [node],
                 |r| r.get(0),
             )?;
@@ -161,7 +162,7 @@ pub fn list_extensions(
     };
     if node != 0 {
         let file: Option<(String, i64, i64)> = conn.query_row(
-            "SELECT extension,size,allocated FROM entries WHERE side=?1 AND node_id=?2 AND kind='file'",
+            "SELECT n.extension,s.size,s.allocated FROM snapshot_entries s JOIN node_records n ON n.id=s.node_id WHERE s.side=?1 AND s.node_id=?2 AND s.kind=0",
             params![side_number, node],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;

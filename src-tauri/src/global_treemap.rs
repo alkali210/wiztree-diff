@@ -2,11 +2,16 @@
 //! owns hierarchy, aggregates, and layout; Rust retains no sibling/path/tree lists.
 use crate::{import::JobControl, store, types::*};
 use base64::Engine;
-use rusqlite::{params, Connection, OptionalExtension, Statement};
+use rusqlite::{blob::Blob, params, Connection, DatabaseName, OptionalExtension, Statement};
+use std::collections::{HashMap, VecDeque};
 
 pub const ATLAS_WIDTH: u32 = 4096;
 pub const ATLAS_HEIGHT: u32 = 1024;
-const SPATIAL_BLOCK: i64 = 256;
+// 144 records fit one 8 KiB SQLite leaf page without overflow-page slack.
+const SPATIAL_BLOCK: usize = 144;
+const GEOMETRY_BYTES: usize = 56;
+const LOCATOR_KEYS: i64 = 2048;
+const LOCATOR_CACHE: usize = 64;
 const DIRECTORY_HEADER: f64 = 64.0;
 const DIRECTORY_GUTTER: f64 = 8.0;
 const PALETTE: [[u8; 3]; 16] = [
@@ -62,33 +67,48 @@ pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
 }
 fn build(conn: &Connection, control: &JobControl) -> Result<()> {
     let transaction = conn.unchecked_transaction()?;
+    conn.execute_batch("CREATE TEMP TABLE treemap_palette(extension TEXT PRIMARY KEY,color INTEGER NOT NULL) WITHOUT ROWID;")?;
+    {
+        let mut scan = conn
+            .prepare("SELECT extension FROM extension_stats WHERE node_id=0 GROUP BY extension")?;
+        let mut insert = conn.prepare("INSERT INTO treemap_palette VALUES(?1,?2)")?;
+        let mut rows = scan.query([])?;
+        while let Some(row) = rows.next()? {
+            control.check()?;
+            let extension = store::root_text(row, 0)?;
+            let [r, g, b] = extension_color(extension);
+            let color = (r as u32) << 16 | (g as u32) << 8 | b as u32;
+            insert.execute(params![extension, color])?;
+        }
+    }
     // Ordinary files are their own leaves. Directory/file type changes and
     // sparse exports with children under an opposite-side file retain both
     // a container and an own-file leaf. Positive sibling keys stay unchanged.
-    conn.execute_batch("CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent_id);
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS nodes_parent ON node_records(parent_id);
         CREATE TABLE treemap_weights(
         key INTEGER PRIMARY KEY,node_id INTEGER NOT NULL,parent_id INTEGER NOT NULL,depth INTEGER NOT NULL,leaf INTEGER NOT NULL,
         sb INTEGER NOT NULL CHECK(typeof(sb)='integer'),sa INTEGER NOT NULL CHECK(typeof(sa)='integer'),
         ab INTEGER NOT NULL CHECK(typeof(ab)='integer'),aa INTEGER NOT NULL CHECK(typeof(aa)='integer'),
         size_value INTEGER NOT NULL CHECK(typeof(size_value)='integer'),allocated_value INTEGER NOT NULL CHECK(typeof(allocated_value)='integer'),
         before_file INTEGER NOT NULL,after_file INTEGER NOT NULL,
-        added INTEGER NOT NULL,removed INTEGER NOT NULL,type_changed INTEGER NOT NULL,modified INTEGER NOT NULL);
-        WITH RECURSIVE parents(id) AS MATERIALIZED (SELECT DISTINCT parent_id FROM nodes WHERE parent_id IS NOT NULL),
+        added INTEGER NOT NULL,removed INTEGER NOT NULL,type_changed INTEGER NOT NULL,modified INTEGER NOT NULL,color INTEGER NOT NULL);
+        WITH RECURSIVE parents(id) AS MATERIALIZED (SELECT DISTINCT parent_id FROM node_records WHERE parent_id IS NOT NULL),
         levels(id,level) AS (
-            SELECT n.id,1 FROM nodes n JOIN parents p ON p.id=n.id WHERE n.parent_id IS NULL
-            UNION ALL SELECT n.id,l.level+1 FROM levels l JOIN nodes n ON n.parent_id=l.id JOIN parents p ON p.id=n.id)
+            SELECT n.id,1 FROM node_records n JOIN parents p ON p.id=n.id WHERE n.parent_id IS NULL
+            UNION ALL SELECT n.id,l.level+1 FROM levels l JOIN node_records n ON n.parent_id=l.id JOIN parents p ON p.id=n.id)
         , own AS (SELECT n.id,coalesce(n.parent_id,0) parent_id,coalesce(l.level+1,1) level,
             CASE WHEN c.before_kind='directory' OR c.after_kind='directory' OR child.id IS NOT NULL THEN 0 ELSE 1 END leaf,
             CASE WHEN c.before_kind='file' THEN c.before_size ELSE 0 END sb,CASE WHEN c.after_kind='file' THEN c.after_size ELSE 0 END sa,
             CASE WHEN c.before_kind='file' THEN c.before_allocated ELSE 0 END ab,CASE WHEN c.after_kind='file' THEN c.after_allocated ELSE 0 END aa,
             coalesce(c.before_kind='file',0) bf,coalesce(c.after_kind='file',0) af,
             coalesce(c.after_kind='file' AND (c.before_kind IS NULL OR c.before_kind!='file'),0) added,
-            coalesce(c.status='removed',0) removed,coalesce(c.status='typeChanged',0) changed,coalesce(c.status='modified',0) modified
-            FROM nodes n NOT INDEXED CROSS JOIN comparison_nodes c ON c.node_id=n.id
-            LEFT JOIN levels l ON l.id=n.parent_id LEFT JOIN parents child ON child.id=n.id)
+            coalesce(c.status='removed',0) removed,coalesce(c.status='typeChanged',0) changed,coalesce(c.status='modified',0) modified,
+            CASE WHEN c.before_kind='file' OR c.after_kind='file' THEN p.color ELSE 0 END color
+            FROM node_records n NOT INDEXED CROSS JOIN comparison_nodes c ON c.node_id=n.id
+            LEFT JOIN levels l ON l.id=n.parent_id LEFT JOIN parents child ON child.id=n.id LEFT JOIN treemap_palette p ON p.extension=c.extension)
         INSERT INTO treemap_weights SELECT id,id,parent_id,level,leaf,
             sb*leaf,sa*leaf,ab*leaf,aa*leaf,(sa-sb)*leaf,(aa-ab)*leaf,
-            bf*leaf,af*leaf,added*leaf,removed*leaf,changed*leaf,modified*leaf FROM own;
+            bf*leaf,af*leaf,added*leaf,removed*leaf,changed*leaf,modified*leaf,color FROM own;
         CREATE INDEX treemap_depth ON treemap_weights(depth,key) WHERE leaf=0;
         INSERT INTO treemap_weights
         SELECT -c.node_id,c.node_id,c.node_id,w.depth+1,1,
@@ -98,20 +118,25 @@ fn build(conn: &Connection, control: &JobControl) -> Result<()> {
         (CASE WHEN c.after_kind='file' THEN c.after_allocated ELSE 0 END)-(CASE WHEN c.before_kind='file' THEN c.before_allocated ELSE 0 END),
         coalesce(c.before_kind='file',0),coalesce(c.after_kind='file',0),
         coalesce(c.after_kind='file' AND (c.before_kind IS NULL OR c.before_kind!='file'),0),coalesce(c.status='removed',0),
-        coalesce(c.status='typeChanged',0),coalesce(c.status='modified',0)
+        coalesce(c.status='typeChanged',0),coalesce(c.status='modified',0),p.color
         FROM treemap_weights w INDEXED BY treemap_depth CROSS JOIN comparison_nodes c ON c.node_id=w.node_id
+        JOIN treemap_palette p ON p.extension=c.extension
         WHERE w.leaf=0 AND (c.before_kind='file' OR c.after_kind='file');
+        DROP TABLE treemap_palette;
         CREATE INDEX treemap_parent ON treemap_weights(parent_id);
         CREATE TABLE treemap_rects(id INTEGER PRIMARY KEY,view INTEGER NOT NULL,key INTEGER NOT NULL,node_id INTEGER NOT NULL,leaf INTEGER NOT NULL,
             x REAL NOT NULL,y REAL NOT NULL,width REAL NOT NULL,height REAL NOT NULL,weight INTEGER NOT NULL,value INTEGER NOT NULL,
-            header_height REAL NOT NULL DEFAULT 0,
-            UNIQUE(view,key));
-        CREATE INDEX treemap_leaf_scan ON treemap_rects(view,id) WHERE leaf=1;
-        CREATE INDEX treemap_label_page ON treemap_rects(view,(width*height) DESC,node_id) WHERE leaf=1 AND width*4096>=96 AND height*1024>=22;
-        CREATE INDEX treemap_directory_labels ON treemap_rects(view,(width*height) DESC,node_id) WHERE header_height>0;
+            header_height REAL NOT NULL DEFAULT 0, UNIQUE(view,key));
+        CREATE TABLE treemap_reuse(id INTEGER PRIMARY KEY,view INTEGER NOT NULL,parent_id INTEGER NOT NULL,source_view INTEGER NOT NULL,
+            sx REAL NOT NULL,sy REAL NOT NULL,tx REAL NOT NULL,ty REAL NOT NULL,UNIQUE(view,parent_id));
+        CREATE TABLE treemap_blocks(id INTEGER PRIMARY KEY,view INTEGER NOT NULL,data BLOB,source INTEGER,start INTEGER,count INTEGER,reuse_id INTEGER);
+        CREATE INDEX treemap_block_view ON treemap_blocks(view,id);
+        CREATE TABLE treemap_key_pages(id INTEGER PRIMARY KEY,view INTEGER NOT NULL,page INTEGER NOT NULL,data BLOB NOT NULL,UNIQUE(view,page));
+        CREATE TABLE treemap_aliases(view INTEGER PRIMARY KEY,geometry INTEGER NOT NULL);
+        CREATE TABLE treemap_families(id INTEGER PRIMARY KEY,view INTEGER NOT NULL UNIQUE);
         CREATE VIRTUAL TABLE treemap_spatial USING rtree(id,x0,x1,y0,y1);
         CREATE TABLE treemap_frames(view INTEGER PRIMARY KEY,png BLOB NOT NULL,file_count INTEGER NOT NULL,visible_file_count INTEGER NOT NULL,
-            weight_total INTEGER NOT NULL,positive_total INTEGER NOT NULL,negative_total INTEGER NOT NULL,net_delta INTEGER NOT NULL,exported_total INTEGER NOT NULL,rendered_block_count INTEGER NOT NULL,added_file_count INTEGER NOT NULL);").map_err(store::aggregate_error)?;
+            weight_total INTEGER NOT NULL,positive_total INTEGER NOT NULL,negative_total INTEGER NOT NULL,net_delta INTEGER NOT NULL,exported_total INTEGER NOT NULL,rendered_block_count INTEGER NOT NULL,added_file_count INTEGER NOT NULL,labels TEXT NOT NULL,warnings TEXT NOT NULL);").map_err(store::aggregate_error)?;
     let depth: i64 = conn.query_row(
         "SELECT coalesce(max(depth),0)+1 FROM treemap_weights WHERE leaf=0",
         [],
@@ -122,27 +147,15 @@ fn build(conn: &Connection, control: &JobControl) -> Result<()> {
         control.check()?;
         propagate.execute([d]).map_err(store::aggregate_error)?;
     }
-    // The initial unlimited After map is complete before import is published.
-    // Other metrics/modes/depths are cached only when actually requested.
+    // Prepare all modes of the initial metric, not unvisited metric families.
     let mut pixels = vec![0u8; ATLAS_WIDTH as usize * ATLAS_HEIGHT as usize * 4];
-    generate(
-        conn,
-        control,
-        Metric::Size,
-        ChartMode::After,
-        0,
-        &mut pixels,
-    )?;
+    generate_family(conn, control, Metric::Size, 0, &mut pixels)?;
     transaction.commit()?;
     Ok(())
 }
 
 fn cache_view(metric: Metric, mode: ChartMode, max_depth: u32) -> i64 {
-    if max_depth == 3 {
-        view(metric, mode) as i64
-    } else {
-        (max_depth as i64 + 1) * 6 + view(metric, mode) as i64
-    }
+    max_depth as i64 * 6 + view(metric, mode) as i64
 }
 
 fn ensure_frame(conn: &Connection, metric: Metric, mode: ChartMode, max_depth: u32) -> Result<()> {
@@ -162,13 +175,64 @@ fn ensure_frame(conn: &Connection, metric: Metric, mode: ChartMode, max_depth: u
         .transpose()?;
     let conn = writer.as_ref().unwrap_or(conn);
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
-    conn.execute_batch("PRAGMA cache_size=-32768; PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-32768; PRAGMA mmap_size=0;")?;
+    conn.execute_batch("PRAGMA cache_size=-65536; PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-32768; PRAGMA mmap_size=536870912;")?;
     let transaction = conn.unchecked_transaction()?;
     let control = JobControl::default();
     let mut pixels = vec![0u8; ATLAS_WIDTH as usize * ATLAS_HEIGHT as usize * 4];
-    generate(conn, &control, metric, mode, max_depth, &mut pixels)?;
+    generate_family(conn, &control, metric, max_depth, &mut pixels)?;
     transaction.commit()?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(())
+}
+
+fn generate_family(
+    conn: &Connection,
+    control: &JobControl,
+    metric: Metric,
+    depth: u32,
+    pixels: &mut [u8],
+) -> Result<()> {
+    for mode in [ChartMode::Before, ChartMode::After, ChartMode::Delta] {
+        generate(conn, control, metric, mode, depth, pixels)?;
+    }
+    conn.execute_batch("DROP TABLE IF EXISTS temp.treemap_runs;")?;
+    let base = cache_view(metric, ChartMode::Before, depth);
+    conn.execute(
+        "INSERT OR IGNORE INTO treemap_families(view) VALUES(?1)",
+        [base],
+    )?;
+    let pinned = cache_view(metric, ChartMode::Before, 0);
+    // Keep the default family and two on-demand depths for each metric. Eviction
+    // only happens in the writer transaction, never during a mode switch.
+    let mut oldest=conn.prepare("SELECT view FROM treemap_families WHERE view%6=?1 AND view!=?2 ORDER BY id DESC LIMIT -1 OFFSET 2")?;
+    let mut rows = oldest.query(params![base % 6, pinned])?;
+    while let Some(row) = rows.next()? {
+        let old: i64 = row.get(0)?;
+        conn.execute("DELETE FROM treemap_spatial WHERE id IN (SELECT id FROM treemap_blocks WHERE view>=?1 AND view<?1+3)",[old])?;
+        for table in [
+            "treemap_rects",
+            "treemap_key_pages",
+            "treemap_blocks",
+            "treemap_reuse",
+            "treemap_aliases",
+            "treemap_frames",
+        ] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE view>=?1 AND view<?1+3"),
+                [old],
+            )?;
+        }
+        conn.execute("DELETE FROM treemap_families WHERE view=?1", [old])?;
+    }
+    Ok(())
+}
+
+fn geometry_view(conn: &Connection, v: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT geometry FROM treemap_aliases WHERE view=?1",
+        [v],
+        |r| r.get(0),
+    )?)
 }
 
 fn generate(
@@ -188,15 +252,20 @@ fn generate(
         return Ok(());
     }
     let totals = totals(conn, metric, mode)?;
-    if matches!(mode, ChartMode::Delta) {
-        generate(conn, control, metric, ChartMode::Before, max_depth, pixels)?;
-        let value = match metric {
-            Metric::Size => "size_value",
-            Metric::Allocated => "allocated_value",
-        };
-        // Preserve paint order too: subpixel coverage blending is order-sensitive.
-        conn.execute(&format!("INSERT INTO treemap_rects(view,key,node_id,leaf,x,y,width,height,weight,value,header_height) SELECT ?1,r.key,r.node_id,r.leaf,r.x,r.y,r.width,r.height,r.weight,w.{value},r.header_height FROM treemap_rects r JOIN treemap_weights w ON w.key=r.key WHERE r.view=?2 ORDER BY r.id"), params![v,cache_view(metric, ChartMode::Before,max_depth)])?;
-    } else if totals.weight > 0 {
+    let before = cache_view(metric, ChartMode::Before, max_depth);
+    // A Delta frame is a different rendering of the same immutable geometry.
+    let equal = matches!(mode, ChartMode::After) && conn.query_row(
+        &format!("SELECT NOT EXISTS(SELECT 1 FROM treemap_weights w JOIN comparison_nodes c ON c.node_id=w.node_id WHERE w.{}!=w.{} OR (w.leaf=0 AND coalesce(c.before_kind='directory',0)!=coalesce(c.after_kind='directory',0)))", COLUMNS[view(metric, ChartMode::Before)], COLUMNS[view(metric, mode)]), [], |r| r.get::<_, bool>(0))?;
+    let geometry = if matches!(mode, ChartMode::Delta) || equal {
+        geometry_view(conn, before)?
+    } else {
+        v
+    };
+    conn.execute(
+        "INSERT INTO treemap_aliases VALUES(?1,?2)",
+        params![v, geometry],
+    )?;
+    if geometry == v && totals.weight > 0 {
         let mut layout = Layout::new(
             conn,
             control,
@@ -243,8 +312,6 @@ fn generate(
                     w: row.get::<_, f64>(3)? * ATLAS_WIDTH as f64,
                     h: row.get::<_, f64>(4)? * ATLAS_HEIGHT as f64,
                 };
-                // Only readable directory blocks reserve decoration. Tiny/deep
-                // containers still traverse fully and retain every positive file.
                 if is_directory && content.w >= 256.0 && content.h >= 192.0 {
                     conn.execute(
                         "UPDATE treemap_rects SET header_height=?3 WHERE view=?1 AND key=?2",
@@ -265,35 +332,36 @@ fn generate(
                 }
             }
         }
+        layout.writer.finish()?;
+        index_geometry(conn, control, v)?;
     }
-    // Index bounded geometry blocks rather than every subpixel file separately.
-    // Rebuild the shared last block when another view appends to it; hit tests
-    // still check each candidate rectangle and its half-open title/file bounds.
-    conn.execute(&format!("INSERT OR REPLACE INTO treemap_spatial
-        SELECT id/{SPATIAL_BLOCK},min(x),max(x+width),min(y),max(y+CASE WHEN leaf=1 THEN height ELSE header_height END)
-        FROM treemap_rects WHERE id>=(SELECT min(id)/{SPATIAL_BLOCK}*{SPATIAL_BLOCK} FROM treemap_rects WHERE view=?1)
-        AND id<=(SELECT max(id) FROM treemap_rects WHERE view=?1) AND (leaf=1 OR header_height>0) GROUP BY id/{SPATIAL_BLOCK}"), [v])?;
-    paint(conn, control, v, mode, pixels)?;
-    let mut png = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut png, ATLAS_WIDTH, ATLAS_HEIGHT);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_compression(png::Compression::Fast);
-        encoder
-            .write_header()
-            .map_err(png_error)?
-            .write_image_data(pixels)
-            .map_err(png_error)?;
-    }
+    let png = if equal {
+        conn.query_row(
+            "SELECT png FROM treemap_frames WHERE view=?1",
+            [before],
+            |r| r.get::<_, Vec<u8>>(0),
+        )?
+    } else {
+        paint(conn, control, geometry, mode, pixels)?;
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, ATLAS_WIDTH, ATLAS_HEIGHT);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            encoder
+                .write_header()
+                .map_err(png_error)?
+                .write_image_data(pixels)
+                .map_err(png_error)?;
+        }
+        png
+    };
     control.check()?;
-    let rendered: i64 = conn.query_row(
-        "SELECT count(*) FROM treemap_rects WHERE view=?1 AND leaf=1",
-        [v],
-        |r| r.get(0),
-    )?;
+    let (labels, rendered) = frame_labels(conn, control, geometry, mode)?;
+    let warnings = frame_warnings(conn, metric, mode, totals.added)?;
     conn.execute(
-        "INSERT INTO treemap_frames VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        "INSERT INTO treemap_frames VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             v,
             png,
@@ -305,7 +373,9 @@ fn generate(
             totals.net,
             totals.exported,
             rendered,
-            totals.added
+            totals.added,
+            serde_json::to_string(&labels).map_err(json_error)?,
+            serde_json::to_string(&warnings).map_err(json_error)?
         ],
     )?;
     Ok(())
@@ -377,13 +447,383 @@ struct Key {
     weight: i64,
     key: i64,
 }
+// Each immutable record is key + four f64 bounds + i64 weight + flags/RGB.
+// Directory decoration is tiny mutable metadata, never a rewrite of file blocks.
+#[derive(Clone, Copy)]
+struct Geometry {
+    key: i64,
+    rect: BoxRect,
+    weight: i64,
+    leaf: bool,
+    header: f64,
+    color: [u8; 3],
+    marks: u8,
+}
+impl Geometry {
+    fn decode(data: &[u8]) -> Self {
+        let word = |n: usize| <[u8; 8]>::try_from(&data[n..n + 8]).unwrap();
+        Self {
+            key: i64::from_le_bytes(word(0)),
+            rect: BoxRect {
+                x: f64::from_le_bytes(word(8)),
+                y: f64::from_le_bytes(word(16)),
+                w: f64::from_le_bytes(word(24)),
+                h: f64::from_le_bytes(word(32)),
+            },
+            weight: i64::from_le_bytes(word(40)),
+            leaf: data[48] != 0,
+            header: 0.0,
+            color: [data[49], data[50], data[51]],
+            marks: data[52],
+        }
+    }
+    fn encode(self, data: &mut Vec<u8>) {
+        data.extend_from_slice(&self.key.to_le_bytes());
+        for n in [self.rect.x, self.rect.y, self.rect.w, self.rect.h] {
+            data.extend_from_slice(&n.to_le_bytes());
+        }
+        data.extend_from_slice(&self.weight.to_le_bytes());
+        data.extend_from_slice(&[
+            self.leaf as u8,
+            self.color[0],
+            self.color[1],
+            self.color[2],
+            self.marks,
+            0,
+            0,
+            0,
+        ]);
+    }
+    fn node(self) -> i64 {
+        self.key.abs()
+    }
+    fn bounds(self) -> TreemapRect {
+        TreemapRect {
+            x: self.rect.x,
+            y: self.rect.y,
+            width: self.rect.w,
+            height: self.rect.h,
+        }
+    }
+}
+// Dense key pages avoid an indexed SQL row and random B-tree insertion for
+// every rectangle. Only 64 SQLite blob handles are retained while building.
+struct LocatorWriter<'a> {
+    conn: &'a Connection,
+    view: i64,
+    pages: HashMap<i64, Blob<'a>>,
+    order: VecDeque<i64>,
+    lookup: Statement<'a>,
+    create: Statement<'a>,
+}
+impl<'a> LocatorWriter<'a> {
+    fn new(conn: &'a Connection, view: i64) -> Result<Self> {
+        Ok(Self {
+            conn,
+            view,
+            pages: HashMap::with_capacity(LOCATOR_CACHE),
+            order: VecDeque::with_capacity(LOCATOR_CACHE),
+            lookup: conn.prepare("SELECT id FROM treemap_key_pages WHERE view=?1 AND page=?2")?,
+            create: conn.prepare(
+                "INSERT INTO treemap_key_pages(view,page,data) VALUES(?1,?2,zeroblob(?3))",
+            )?,
+        })
+    }
+    fn put(&mut self, key: i64, block: i64, slot: usize) -> Result<()> {
+        let page = key.div_euclid(LOCATOR_KEYS);
+        let offset = key.rem_euclid(LOCATOR_KEYS) as usize * 8;
+        let location = (block as u64)
+            .checked_mul(SPATIAL_BLOCK as u64)
+            .and_then(|n| n.checked_add(slot as u64 + 1))
+            .ok_or_else(|| ApiError::new("AGGREGATE_OVERFLOW", "图形定位索引溢出"))?
+            .to_le_bytes();
+        if let Some(blob) = self.pages.get_mut(&page) {
+            blob.write_at(&location, offset)?;
+            return Ok(());
+        }
+        if self.pages.len() == LOCATOR_CACHE {
+            let oldest = self.order.pop_front().unwrap();
+            self.pages.remove(&oldest).unwrap().close()?;
+        }
+        let id = match self
+            .lookup
+            .query_row(params![self.view, page], |r| r.get(0))
+            .optional()?
+        {
+            Some(id) => id,
+            None => {
+                self.create
+                    .execute(params![self.view, page, LOCATOR_KEYS * 8])?;
+                self.conn.last_insert_rowid()
+            }
+        };
+        let mut blob =
+            self.conn
+                .blob_open(DatabaseName::Main, "treemap_key_pages", "data", id, false)?;
+        blob.write_at(&location, offset)?;
+        self.pages.insert(page, blob);
+        self.order.push_back(page);
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<()> {
+        for (_, blob) in self.pages.drain() {
+            blob.close()?;
+        }
+        self.order.clear();
+        Ok(())
+    }
+}
+struct BlockWriter<'a> {
+    view: i64,
+    id: i64,
+    data: Vec<u8>,
+    blocks: Statement<'a>,
+    keys: LocatorWriter<'a>,
+}
+impl<'a> BlockWriter<'a> {
+    fn new(conn: &'a Connection, view: i64) -> Result<Self> {
+        Ok(Self {
+            view,
+            id: conn.query_row(
+                "SELECT coalesce(max(id),0)+1 FROM treemap_blocks",
+                [],
+                |r| r.get(0),
+            )?,
+            data: Vec::with_capacity(SPATIAL_BLOCK * GEOMETRY_BYTES),
+            blocks: conn.prepare("INSERT INTO treemap_blocks(id,view,data) VALUES(?1,?2,?3)")?,
+            keys: LocatorWriter::new(conn, view)?,
+        })
+    }
+    fn push(&mut self, g: Geometry) -> Result<()> {
+        self.keys
+            .put(g.key, self.id, self.data.len() / GEOMETRY_BYTES)?;
+        g.encode(&mut self.data);
+        if self.data.len() == SPATIAL_BLOCK * GEOMETRY_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<()> {
+        if !self.data.is_empty() {
+            self.blocks
+                .execute(params![self.id, self.view, &self.data])?;
+            self.data.clear();
+            self.id += 1;
+        }
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<()> {
+        self.flush()?;
+        self.keys.finish()
+    }
+}
+fn decorate(g: &mut Geometry, directory: &mut Statement<'_>, view: i64) -> Result<()> {
+    if !g.leaf {
+        let (leaf, header): (bool, f64) =
+            directory.query_row(params![view, g.key], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        g.leaf = leaf;
+        g.header = header;
+    }
+    Ok(())
+}
+#[derive(Clone, Copy)]
+struct Transform {
+    sx: f64,
+    sy: f64,
+    tx: f64,
+    ty: f64,
+}
+impl Transform {
+    const IDENTITY: Self = Self {
+        sx: 1.0,
+        sy: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+    fn rect(self, r: BoxRect) -> BoxRect {
+        BoxRect {
+            x: r.x * self.sx + self.tx,
+            y: r.y * self.sy + self.ty,
+            w: r.w * self.sx,
+            h: r.h * self.sy,
+        }
+    }
+}
+// Alias blocks read just their bounded byte range through one reusable SQLite
+// blob handle; small directory runs never copy an entire shared source block.
+fn read_blocks(
+    conn: &Connection,
+    rows: &mut rusqlite::Rows<'_>,
+    mut visit: impl FnMut(i64, &[u8], Transform) -> Result<()>,
+) -> Result<()> {
+    let mut buffer = [0u8; SPATIAL_BLOCK * GEOMETRY_BYTES];
+    let mut source: Option<(i64, Blob<'_>)> = None;
+    while let Some(row) = rows.next()? {
+        let (data, transform) = match row.get_ref(1)? {
+            rusqlite::types::ValueRef::Blob(data) => (data, Transform::IDENTITY),
+            rusqlite::types::ValueRef::Null => {
+                let id: i64 = row.get(2)?;
+                let start: usize = row.get(3)?;
+                let count: usize = row.get(4)?;
+                match source.as_mut() {
+                    Some((previous, blob)) => {
+                        if *previous != id {
+                            blob.reopen(id)?;
+                            *previous = id;
+                        }
+                    }
+                    None => {
+                        source = Some((
+                            id,
+                            conn.blob_open(DatabaseName::Main, "treemap_blocks", "data", id, true)?,
+                        ))
+                    }
+                }
+                let data = &mut buffer[..count * GEOMETRY_BYTES];
+                source
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .read_at_exact(data, start * GEOMETRY_BYTES)?;
+                (
+                    &*data,
+                    Transform {
+                        sx: row.get(5)?,
+                        sy: row.get(6)?,
+                        tx: row.get(7)?,
+                        ty: row.get(8)?,
+                    },
+                )
+            }
+            _ => return Err(ApiError::new("CACHE_INVALID", "图形块损坏，请重新导入")),
+        };
+        visit(row.get(0)?, data, transform)?;
+    }
+    Ok(())
+}
+fn scan_geometry(
+    conn: &Connection,
+    control: &JobControl,
+    view: i64,
+    mut visit: impl FnMut(Geometry) -> Result<()>,
+) -> Result<()> {
+    let mut blocks=conn.prepare("SELECT b.id,b.data,b.source,b.start,b.count,r.sx,r.sy,r.tx,r.ty FROM treemap_blocks b LEFT JOIN treemap_reuse r ON r.id=b.reuse_id WHERE b.view=?1 ORDER BY b.id")?;
+    let mut directory =
+        conn.prepare("SELECT leaf,header_height FROM treemap_rects WHERE view=?1 AND key=?2")?;
+    let mut rows = blocks.query([view])?;
+    read_blocks(conn, &mut rows, |_, data, transform| {
+        control.check()?;
+        for record in data.chunks_exact(GEOMETRY_BYTES) {
+            let mut g = Geometry::decode(record);
+            g.rect = transform.rect(g.rect);
+            decorate(&mut g, &mut directory, view)?;
+            visit(g)?;
+        }
+        Ok(())
+    })
+}
+fn index_geometry(conn: &Connection, control: &JobControl, view: i64) -> Result<()> {
+    let mut blocks=conn.prepare("SELECT b.id,b.data,b.source,b.start,b.count,r.sx,r.sy,r.tx,r.ty FROM treemap_blocks b LEFT JOIN treemap_reuse r ON r.id=b.reuse_id WHERE b.view=?1 ORDER BY b.id")?;
+    let mut directory =
+        conn.prepare("SELECT leaf,header_height FROM treemap_rects WHERE view=?1 AND key=?2")?;
+    let mut insert = conn.prepare("INSERT INTO treemap_spatial VALUES(?1,?2,?3,?4,?5)")?;
+    let mut rows = blocks.query([view])?;
+    read_blocks(conn, &mut rows, |id, data, transform| {
+        control.check()?;
+        let mut bbox = [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for record in data.chunks_exact(GEOMETRY_BYTES) {
+            let mut g = Geometry::decode(record);
+            g.rect = transform.rect(g.rect);
+            decorate(&mut g, &mut directory, view)?;
+            if g.leaf || g.header > 0.0 {
+                bbox[0] = bbox[0].min(g.rect.x);
+                bbox[1] = bbox[1].max(g.rect.x + g.rect.w);
+                bbox[2] = bbox[2].min(g.rect.y);
+                bbox[3] = bbox[3].max(g.rect.y + if g.leaf { g.rect.h } else { g.header });
+            }
+        }
+        if bbox[0].is_finite() {
+            insert.execute(params![id, bbox[0], bbox[1], bbox[2], bbox[3]])?;
+        }
+        Ok(())
+    })
+}
+fn cached_geometry(conn: &Connection, view: i64, key: i64) -> Result<Option<Geometry>> {
+    if let Some(g) = local_geometry(conn, view, key)? {
+        return Ok(Some(g));
+    }
+    let reused:Option<(i64,bool,Transform)>=conn.query_row("SELECT r.source_view,w.leaf,r.sx,r.sy,r.tx,r.ty FROM treemap_weights w JOIN treemap_reuse r ON r.parent_id=w.parent_id AND r.view=?1 WHERE w.key=?2",params![view,key],|r|Ok((r.get(0)?,r.get(1)?,Transform{sx:r.get(2)?,sy:r.get(3)?,tx:r.get(4)?,ty:r.get(5)?}))).optional()?;
+    let Some((source, leaf, transform)) = reused else {
+        return Ok(None);
+    };
+    let Some(mut g) = local_geometry(conn, source, key)? else {
+        return Ok(None);
+    };
+    g.rect = transform.rect(g.rect);
+    g.leaf = leaf;
+    g.header = 0.0;
+    let mut directory =
+        conn.prepare("SELECT leaf,header_height FROM treemap_rects WHERE view=?1 AND key=?2")?;
+    decorate(&mut g, &mut directory, view)?;
+    Ok(Some(g))
+}
+fn local_geometry(conn: &Connection, view: i64, key: i64) -> Result<Option<Geometry>> {
+    let page = key.div_euclid(LOCATOR_KEYS);
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM treemap_key_pages WHERE view=?1 AND page=?2",
+            params![view, page],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else { return Ok(None) };
+    let mut location = [0u8; 8];
+    {
+        let blob = conn.blob_open(DatabaseName::Main, "treemap_key_pages", "data", id, true)?;
+        blob.read_at_exact(&mut location, key.rem_euclid(LOCATOR_KEYS) as usize * 8)?;
+    }
+    let location = u64::from_le_bytes(location);
+    if location == 0 {
+        return Ok(None);
+    }
+    let block = ((location - 1) / SPATIAL_BLOCK as u64) as i64;
+    let slot = ((location - 1) % SPATIAL_BLOCK as u64) as usize;
+    let mut query = conn.prepare("SELECT data FROM treemap_blocks WHERE id=?1")?;
+    let mut g = query.query_row([block], |r| {
+        let data = r.get_ref(0)?.as_blob().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
+        })?;
+        Ok(Geometry::decode(
+            &data[slot * GEOMETRY_BYTES..(slot + 1) * GEOMETRY_BYTES],
+        ))
+    })?;
+    let mut directory =
+        conn.prepare("SELECT leaf,header_height FROM treemap_rects WHERE view=?1 AND key=?2")?;
+    decorate(&mut g, &mut directory, view)?;
+    Ok(Some(g))
+}
 struct Layout<'a> {
     control: &'a JobControl,
     v: i64,
     scan: Statement<'a>,
     range: Statement<'a>,
+    equal_range: Statement<'a>,
     insert: Statement<'a>,
+    writer: BlockWriter<'a>,
     ticks: u64,
+    after: bool,
+    same: Statement<'a>,
+    old_content: Statement<'a>,
+    runs: Statement<'a>,
+    run: Statement<'a>,
+    copy: Statement<'a>,
+    reuse: Statement<'a>,
+    aliases: Statement<'a>,
 }
 impl<'a> Layout<'a> {
     fn new(
@@ -393,6 +833,16 @@ impl<'a> Layout<'a> {
         order: usize,
         col: &str,
     ) -> Result<Self> {
+        conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS treemap_runs(parent_id INTEGER PRIMARY KEY,first INTEGER,last INTEGER,start INTEGER,end INTEGER);")?;
+        let after = order % 3 == 1;
+        if !after {
+            conn.execute_batch("DELETE FROM temp.treemap_runs;")?;
+        }
+        let (before_col, after_col) = if order < 3 {
+            ("sb", "sa")
+        } else {
+            ("ab", "aa")
+        };
         let base = format!(
             "FROM treemap_weights INDEXED BY treemap_order_{order} WHERE parent_id=?1 AND {col}>0"
         );
@@ -402,9 +852,18 @@ impl<'a> Layout<'a> {
         ))?;
         Ok(Self {control,v,
             scan:conn.prepare(&format!("SELECT key,{col} {base} ORDER BY {col} DESC,key DESC"))?,
-            range:conn.prepare(&format!("SELECT key,node_id,leaf,{col},{value} {base} AND ({col},key)<=(?2,?3) AND ({col},key)>=(?4,?5) ORDER BY {col} DESC,key DESC"))?,
+            range:conn.prepare(&format!("SELECT key,node_id,leaf,{col},{value},color,added,removed,type_changed,modified {base} AND ({col},key)<=(?2,?3) AND ({col},key)>=(?4,?5) ORDER BY {col} DESC,key DESC"))?,
+            equal_range:conn.prepare(&format!("SELECT key,node_id,leaf,{col},{value},color,added,removed,type_changed,modified {base} AND {col}=?2 AND key<=?3 AND key>=?4 ORDER BY key DESC"))?,
             insert:conn.prepare("INSERT INTO treemap_rects(view,key,node_id,leaf,x,y,width,height,weight,value) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)")?,
-            ticks:0 })
+            writer:BlockWriter::new(conn,v)?,ticks:0,after,
+            same:conn.prepare(&format!("SELECT NOT EXISTS(SELECT 1 FROM treemap_weights INDEXED BY treemap_parent WHERE parent_id=?1 AND {before_col}!={after_col})"))?,
+            old_content:conn.prepare("SELECT x,y,width,height,header_height FROM treemap_rects WHERE view=?1 AND key=?2")?,
+            runs:conn.prepare("INSERT INTO temp.treemap_runs VALUES(?1,?2,?3,?4,?5)")?,
+            run:conn.prepare("SELECT first,last,start,end FROM temp.treemap_runs WHERE parent_id=?1")?,
+            copy:conn.prepare("SELECT id,data FROM treemap_blocks WHERE id>=?1 AND id<=?2 ORDER BY id")?,
+            reuse:conn.prepare("INSERT INTO treemap_reuse(view,parent_id,source_view,sx,sy,tx,ty) VALUES(?1,?2,?3,?4,?5,?6,?7) RETURNING id")?,
+            aliases:conn.prepare("INSERT INTO treemap_blocks(id,view,source,start,count,reuse_id) VALUES(?1,?2,?3,?4,?5,?6)")?,
+        })
     }
     fn tick(&mut self) -> Result<()> {
         self.ticks += 1;
@@ -415,6 +874,108 @@ impl<'a> Layout<'a> {
     }
     fn parent(&mut self, parent: i64, mut rect: BoxRect, mut remaining: i64) -> Result<()> {
         self.control.check()?;
+        if self.after && self.same.query_row([parent], |r| r.get::<_, bool>(0))? {
+            let old = if parent == 0 {
+                BoxRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: ATLAS_WIDTH as f64,
+                    h: ATLAS_HEIGHT as f64,
+                }
+            } else {
+                self.old_content
+                    .query_row(params![self.v - 1, parent], |r| {
+                        let header = r.get::<_, f64>(4)? * ATLAS_HEIGHT as f64;
+                        let mut old = BoxRect {
+                            x: r.get::<_, f64>(0)? * ATLAS_WIDTH as f64,
+                            y: r.get::<_, f64>(1)? * ATLAS_HEIGHT as f64,
+                            w: r.get::<_, f64>(2)? * ATLAS_WIDTH as f64,
+                            h: r.get::<_, f64>(3)? * ATLAS_HEIGHT as f64,
+                        };
+                        if header > 0.0 {
+                            old.x += DIRECTORY_GUTTER;
+                            old.y += header;
+                            old.w -= 2.0 * DIRECTORY_GUTTER;
+                            old.h -= header + DIRECTORY_GUTTER;
+                        }
+                        Ok(old)
+                    })?
+            };
+            let transform = Transform {
+                sx: rect.w / old.w,
+                sy: rect.h / old.h,
+                tx: (rect.x - old.x * (rect.w / old.w)) / ATLAS_WIDTH as f64,
+                ty: (rect.y - old.y * (rect.h / old.h)) / ATLAS_HEIGHT as f64,
+            };
+            let reuse: i64 = self.reuse.query_row(
+                params![
+                    self.v,
+                    parent,
+                    self.v - 1,
+                    transform.sx,
+                    transform.sy,
+                    transform.tx,
+                    transform.ty
+                ],
+                |r| r.get(0),
+            )?;
+            let (first, last, start, end): (i64, i64, usize, usize) =
+                self.run.query_row([parent], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?;
+            self.writer.flush()?;
+            let mut rows = self.copy.query(params![first, last])?;
+            while let Some(row) = rows.next()? {
+                self.control.check()?;
+                let source: i64 = row.get(0)?;
+                let data = row
+                    .get_ref(1)?
+                    .as_blob()
+                    .map_err(|e| ApiError::new("CACHE_INVALID", e.to_string()))?;
+                let lo = if source == first { start } else { 0 };
+                let hi = if source == last {
+                    end
+                } else {
+                    data.len() / GEOMETRY_BYTES
+                };
+                if hi == lo {
+                    continue;
+                }
+                self.aliases.execute(params![
+                    self.writer.id,
+                    self.v,
+                    source,
+                    lo,
+                    hi - lo,
+                    reuse
+                ])?;
+                self.writer.id += 1;
+                for record in
+                    data[lo * GEOMETRY_BYTES..hi * GEOMETRY_BYTES].chunks_exact(GEOMETRY_BYTES)
+                {
+                    let g = Geometry::decode(record);
+                    if g.leaf {
+                        continue;
+                    }
+                    let r = transform.rect(g.rect);
+                    self.insert.execute(params![
+                        self.v,
+                        g.key,
+                        g.node(),
+                        0,
+                        r.x,
+                        r.y,
+                        r.w,
+                        r.h,
+                        g.weight,
+                        g.weight
+                    ])?;
+                }
+            }
+            return Ok(());
+        }
+        let first = self.writer.id;
+        let slot = self.writer.data.len() / GEOMETRY_BYTES;
         // The scan and finalized-row requery retain only scalar row endpoints.
         let mut scan = self.scan.query([parent])?;
         let mut start: Option<Key> = None;
@@ -445,7 +1006,9 @@ impl<'a> Layout<'a> {
                     self.control,
                     self.v,
                     &mut self.range,
+                    &mut self.equal_range,
                     &mut self.insert,
+                    &mut self.writer,
                     parent,
                     start.unwrap(),
                     end,
@@ -473,7 +1036,9 @@ impl<'a> Layout<'a> {
                 self.control,
                 self.v,
                 &mut self.range,
+                &mut self.equal_range,
                 &mut self.insert,
+                &mut self.writer,
                 parent,
                 start,
                 end,
@@ -482,6 +1047,15 @@ impl<'a> Layout<'a> {
                 remaining,
                 &mut self.ticks,
             )?;
+        }
+        if !self.after {
+            self.runs.execute(params![
+                parent,
+                first,
+                self.writer.id,
+                slot,
+                self.writer.data.len() / GEOMETRY_BYTES
+            ])?;
         }
         Ok(())
     }
@@ -498,7 +1072,9 @@ fn place_row(
     control: &JobControl,
     v: i64,
     range: &mut Statement<'_>,
+    equal_range: &mut Statement<'_>,
     insert: &mut Statement<'_>,
+    writer: &mut BlockWriter<'_>,
     parent: i64,
     start: Key,
     end: Key,
@@ -516,13 +1092,19 @@ fn place_row(
     };
     let length = if vertical { r.h } else { r.w };
     let mut offset = 0.0;
-    let mut rows = range.query(params![
-        parent,
-        start.weight,
-        start.key,
-        end.weight,
-        end.key
-    ])?;
+    // Scalar equality exposes the final key range to SQLite when the endpoints
+    // have the same weight; a tuple range alone scans the entire equal tier.
+    let mut rows = if start.weight == end.weight {
+        equal_range.query(params![parent, start.weight, start.key, end.key])?
+    } else {
+        range.query(params![
+            parent,
+            start.weight,
+            start.key,
+            end.weight,
+            end.key
+        ])?
+    };
     while let Some(row) = rows.next()? {
         *ticks += 1;
         if *ticks % 512 == 0 {
@@ -553,7 +1135,30 @@ fn place_row(
         let y = b.y / ATLAS_HEIGHT as f64;
         let w = b.w / ATLAS_WIDTH as f64;
         let h = b.h / ATLAS_HEIGHT as f64;
-        insert.execute(params![v, key, node, leaf, x, y, w, h, weight, value])?;
+        if leaf == 0 {
+            insert.execute(params![v, key, node, leaf, x, y, w, h, weight, value])?;
+        }
+        let mut marks = 0u8;
+        for (col, bit) in [(6, 1), (7, 2), (8, 4), (9, 8)] {
+            if row.get::<_, i64>(col)? > 0 {
+                marks |= bit;
+            }
+        }
+        let color = if leaf == 0 {
+            extension_color("")
+        } else {
+            let c: u32 = row.get(5)?;
+            [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+        };
+        writer.push(Geometry {
+            key,
+            rect: BoxRect { x, y, w, h },
+            weight,
+            leaf: leaf != 0,
+            header: 0.0,
+            color,
+            marks,
+        })?;
         offset += segment;
     }
     // Exact integer subtraction preserves the residual of near-i64 weights.
@@ -575,139 +1180,160 @@ fn paint(
     mode: ChartMode,
     pixels: &mut [u8],
 ) -> Result<()> {
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.copy_from_slice(&[52, 55, 59, 255]);
-    }
-    let side = if matches!(mode, ChartMode::After) {
-        1
-    } else {
-        0
-    };
-    let mut query=conn.prepare("SELECT r.x,r.y,r.width,r.height,CASE WHEN r.key<0 OR (CASE WHEN ?2=0 THEN c.before_kind ELSE c.after_kind END)='file' THEN c.extension ELSE '' END,r.header_height FROM treemap_rects r INDEXED BY treemap_leaf_scan JOIN comparison_nodes c ON c.node_id=r.node_id WHERE r.view=?1 AND r.leaf=1 ORDER BY r.id")?;
-    let mut rows = query.query(params![v, side])?;
     let mut ticks = 0u64;
-    while let Some(row) = rows.next()? {
-        ticks += 1;
-        if ticks % 512 == 0 {
-            control.check()?;
+    if matches!(mode, ChartMode::Delta) {
+        let mut query = conn.prepare("SELECT png FROM treemap_frames WHERE view=?1")?;
+        let mut rows = query.query([v])?;
+        let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let png = row
+            .get_ref(0)?
+            .as_blob()
+            .map_err(|e| ApiError::new("CACHE_INVALID", e.to_string()))?;
+        let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+            .read_info()
+            .map_err(|e| ApiError::new("IMAGE_ERROR", e.to_string()))?;
+        reader
+            .next_frame(pixels)
+            .map_err(|e| ApiError::new("IMAGE_ERROR", e.to_string()))?;
+    } else {
+        for p in pixels.chunks_exact_mut(4) {
+            p.copy_from_slice(&[52, 55, 59, 255]);
         }
-        let mut x = row.get::<_, f64>(0)? * ATLAS_WIDTH as f64;
-        let mut y = row.get::<_, f64>(1)? * ATLAS_HEIGHT as f64;
-        let mut w = row.get::<_, f64>(2)? * ATLAS_WIDTH as f64;
-        let mut h = row.get::<_, f64>(3)? * ATLAS_HEIGHT as f64;
-        let header = row.get::<_, f64>(5)? * ATLAS_HEIGHT as f64;
-        if header > 0.0 {
-            x += DIRECTORY_GUTTER;
-            y += header;
-            w -= DIRECTORY_GUTTER * 2.0;
-            h -= header + DIRECTORY_GUTTER;
-        }
-        let color = extension_color(store::root_text(row, 4)?);
-        let x0 = x.floor().max(0.0) as u32;
-        let y0 = y.floor().max(0.0) as u32;
-        let x1 = (x + w).ceil().max(x0 as f64 + 1.0).min(ATLAS_WIDTH as f64) as u32;
-        let y1 = (y + h).ceil().max(y0 as f64 + 1.0).min(ATLAS_HEIGHT as f64) as u32;
-        for py in y0..y1 {
-            ticks += 1;
-            if ticks % 512 == 0 {
-                control.check()?;
+        scan_geometry(conn, control, v, |g| {
+            if !g.leaf {
+                return Ok(());
             }
-            let cy = ((y + h).min(py as f64 + 1.0) - y.max(py as f64))
-                .max(0.0)
-                .min(h);
-            for px in x0..x1 {
-                ticks += 1;
-                if ticks % 512 == 0 {
-                    control.check()?;
-                }
-                let cx = ((x + w).min(px as f64 + 1.0) - x.max(px as f64))
+            let mut x = g.rect.x * ATLAS_WIDTH as f64;
+            let mut y = g.rect.y * ATLAS_HEIGHT as f64;
+            let mut w = g.rect.w * ATLAS_WIDTH as f64;
+            let mut h = g.rect.h * ATLAS_HEIGHT as f64;
+            if g.header > 0.0 {
+                x += DIRECTORY_GUTTER;
+                y += g.header * ATLAS_HEIGHT as f64;
+                w -= DIRECTORY_GUTTER * 2.0;
+                h -= g.header * ATLAS_HEIGHT as f64 + DIRECTORY_GUTTER;
+            }
+            let x0 = x.floor().max(0.0) as u32;
+            let y0 = y.floor().max(0.0) as u32;
+            let x1 = (x + w).ceil().max(x0 as f64 + 1.0).min(ATLAS_WIDTH as f64) as u32;
+            let y1 = (y + h).ceil().max(y0 as f64 + 1.0).min(ATLAS_HEIGHT as f64) as u32;
+            for py in y0..y1 {
+                let cy = ((y + h).min(py as f64 + 1.0) - y.max(py as f64))
                     .max(0.0)
-                    .min(w);
-                let coverage = (cx * cy).clamp(0.0, 1.0);
-                let u = ((px as f64 + 0.5 - x) / w).clamp(0.0, 1.0);
-                let z = ((py as f64 + 0.5 - y) / h).clamp(0.0, 1.0);
-                let cushion = 0.74 + 0.26 * (4.0 * u * (1.0 - u) * 4.0 * z * (1.0 - z)).sqrt();
-                let edge =
-                    if w > 5.0 && h > 5.0 && (px == x0 || py == y0 || px + 1 == x1 || py + 1 == y1)
+                    .min(h);
+                for px in x0..x1 {
+                    ticks += 1;
+                    if ticks % 512 == 0 {
+                        control.check()?;
+                    }
+                    let cx = ((x + w).min(px as f64 + 1.0) - x.max(px as f64))
+                        .max(0.0)
+                        .min(w);
+                    let coverage = (cx * cy).clamp(0.0, 1.0);
+                    let u = ((px as f64 + 0.5 - x) / w).clamp(0.0, 1.0);
+                    let z = ((py as f64 + 0.5 - y) / h).clamp(0.0, 1.0);
+                    let cushion = 0.74 + 0.26 * (4.0 * u * (1.0 - u) * 4.0 * z * (1.0 - z)).sqrt();
+                    let edge = if w > 5.0
+                        && h > 5.0
+                        && (px == x0 || py == y0 || px + 1 == x1 || py + 1 == y1)
                     {
                         0.65
                     } else {
                         1.0
                     };
-                let i = ((py * ATLAS_WIDTH + px) * 4) as usize;
-                for c in 0..3 {
-                    pixels[i + c] = (pixels[i + c] as f64 * (1.0 - coverage)
-                        + color[c] as f64 * cushion * edge * coverage)
-                        .round() as u8;
+                    let i = ((py * ATLAS_WIDTH + px) * 4) as usize;
+                    for c in 0..3 {
+                        pixels[i + c] = (pixels[i + c] as f64 * (1.0 - coverage)
+                            + g.color[c] as f64 * cushion * edge * coverage)
+                            .round() as u8;
+                    }
                 }
             }
-        }
-    }
-    // Subtle directory boundaries are an overlay, never padding that discards files.
-    let mut query=conn.prepare("SELECT r.x,r.y,r.width,r.height FROM treemap_rects r JOIN comparison_nodes c ON c.node_id=r.node_id WHERE r.view=?1 AND r.leaf=0 AND c.expandable=1 AND r.width*4096>=8 AND r.height*1024>=8 ORDER BY r.id")?;
-    let mut rows = query.query([v as i64])?;
-    while let Some(row) = rows.next()? {
-        ticks += 1;
-        if ticks % 512 == 0 {
+            Ok(())
+        })?;
+        // Directory boundaries are decoration, never omitted leaf weight.
+        let mut query=conn.prepare("SELECT r.x,r.y,r.width,r.height FROM treemap_rects r JOIN comparison_nodes c ON c.node_id=r.node_id WHERE r.view=?1 AND r.leaf=0 AND c.expandable=1 AND r.width*4096>=8 AND r.height*1024>=8 ORDER BY r.id")?;
+        let mut rows = query.query([v])?;
+        while let Some(row) = rows.next()? {
             control.check()?;
-        }
-        let x = (row.get::<_, f64>(0)? * ATLAS_WIDTH as f64)
-            .floor()
-            .max(0.0) as u32;
-        let y = (row.get::<_, f64>(1)? * ATLAS_HEIGHT as f64)
-            .floor()
-            .max(0.0) as u32;
-        let ex = ((row.get::<_, f64>(0)? + row.get::<_, f64>(2)?) * ATLAS_WIDTH as f64)
-            .ceil()
-            .min(ATLAS_WIDTH as f64) as u32;
-        let ey = ((row.get::<_, f64>(1)? + row.get::<_, f64>(3)?) * ATLAS_HEIGHT as f64)
-            .ceil()
-            .min(ATLAS_HEIGHT as f64) as u32;
-        if ex > x && ey > y {
-            for px in x..ex {
-                darken(pixels, px, y);
-                darken(pixels, px, ey - 1);
-            }
-            for py in y..ey {
-                darken(pixels, x, py);
-                darken(pixels, ex - 1, py);
+            let r = BoxRect {
+                x: row.get(0)?,
+                y: row.get(1)?,
+                w: row.get(2)?,
+                h: row.get(3)?,
+            };
+            let (x, y, ex, ey) = pixel_bounds(r);
+            if ex > x && ey > y {
+                for px in x..ex {
+                    darken(pixels, px, y);
+                    darken(pixels, px, ey - 1);
+                }
+                for py in y..ey {
+                    darken(pixels, x, py);
+                    darken(pixels, ex - 1, py);
+                }
             }
         }
     }
     if matches!(mode, ChartMode::Delta) {
         let baseline = if v % 6 < 3 { "sb" } else { "ab" };
-        let mut query = conn.prepare(&format!("SELECT r.x,r.y,r.width,r.height,CASE WHEN r.leaf=1 THEN w.added ELSE EXISTS(SELECT 1 FROM treemap_weights child WHERE child.parent_id=w.key AND child.added>0 AND child.{baseline}=0) END,CASE WHEN r.leaf=1 THEN w.removed ELSE 0 END,CASE WHEN r.leaf=1 OR c.status='typeChanged' THEN w.type_changed ELSE 0 END,CASE WHEN r.leaf=1 THEN w.modified ELSE 0 END FROM treemap_rects r JOIN treemap_weights w ON w.key=r.key JOIN comparison_nodes c ON c.node_id=r.node_id WHERE r.view=?1 AND (w.added>0 OR c.status='typeChanged' OR (r.leaf=1 AND (w.removed>0 OR w.type_changed>0 OR w.modified>0))) ORDER BY r.leaf,r.id"))?;
+        let mut query=conn.prepare(&format!("SELECT r.x,r.y,r.width,r.height,EXISTS(SELECT 1 FROM treemap_weights child WHERE child.parent_id=w.key AND child.added>0 AND child.{baseline}=0),0,CASE WHEN c.status='typeChanged' THEN w.type_changed ELSE 0 END,0 FROM treemap_rects r JOIN treemap_weights w ON w.key=r.key JOIN comparison_nodes c ON c.node_id=r.node_id WHERE r.view=?1 AND r.leaf=0 AND (w.added>0 OR c.status='typeChanged') ORDER BY r.id"))?;
         let mut rows = query.query([v])?;
+        // Containers first, then every leaf in original deterministic paint order.
         while let Some(row) = rows.next()? {
             control.check()?;
-            let x = (row.get::<_, f64>(0)? * ATLAS_WIDTH as f64)
-                .floor()
-                .max(0.0) as u32;
-            let y = (row.get::<_, f64>(1)? * ATLAS_HEIGHT as f64)
-                .floor()
-                .max(0.0) as u32;
-            let ex = ((row.get::<_, f64>(0)? + row.get::<_, f64>(2)?) * ATLAS_WIDTH as f64)
-                .ceil()
-                .min(ATLAS_WIDTH as f64) as u32;
-            let ey = ((row.get::<_, f64>(1)? + row.get::<_, f64>(3)?) * ATLAS_HEIGHT as f64)
-                .ceil()
-                .min(ATLAS_HEIGHT as f64) as u32;
-            let mut inset = 0;
-            // Multiple descendant change kinds remain visible even when net growth cancels loss.
-            for (column, color, dashed) in [
-                (6, [148, 114, 204], false),
-                (7, [225, 183, 80], false),
-                (5, [218, 83, 97], true),
-                (4, [35, 148, 107], true),
-            ] {
-                if row.get::<_, i64>(column)? > 0 {
-                    border(pixels, x, y, ex, ey, inset, color, dashed);
-                    inset += 8;
+            let mut marks = 0;
+            for (col, bit) in [(4, 1), (5, 2), (6, 4), (7, 8)] {
+                if row.get::<_, i64>(col)? > 0 {
+                    marks |= bit;
                 }
             }
+            mark(
+                pixels,
+                BoxRect {
+                    x: row.get(0)?,
+                    y: row.get(1)?,
+                    w: row.get(2)?,
+                    h: row.get(3)?,
+                },
+                marks,
+            );
         }
+        scan_geometry(conn, control, v, |g| {
+            if g.leaf {
+                mark(pixels, g.rect, g.marks);
+            }
+            Ok(())
+        })?;
     }
     Ok(())
+}
+fn pixel_bounds(r: BoxRect) -> (u32, u32, u32, u32) {
+    (
+        (r.x * ATLAS_WIDTH as f64).floor().max(0.0) as u32,
+        (r.y * ATLAS_HEIGHT as f64).floor().max(0.0) as u32,
+        ((r.x + r.w) * ATLAS_WIDTH as f64)
+            .ceil()
+            .min(ATLAS_WIDTH as f64) as u32,
+        ((r.y + r.h) * ATLAS_HEIGHT as f64)
+            .ceil()
+            .min(ATLAS_HEIGHT as f64) as u32,
+    )
+}
+fn mark(pixels: &mut [u8], r: BoxRect, marks: u8) {
+    let (x, y, ex, ey) = pixel_bounds(r);
+    let mut inset = 0;
+    for (bit, color, dashed) in [
+        (4, [148, 114, 204], false),
+        (8, [225, 183, 80], false),
+        (2, [218, 83, 97], true),
+        (1, [35, 148, 107], true),
+    ] {
+        if marks & bit != 0 {
+            border(pixels, x, y, ex, ey, inset, color, dashed);
+            inset += 8;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -759,38 +1385,95 @@ fn darken(pixels: &mut [u8], x: u32, y: u32) {
     }
 }
 
-pub fn get_frame(
+fn json_error(e: serde_json::Error) -> ApiError {
+    ApiError::new("CACHE_ERROR", e.to_string())
+}
+fn frame_labels(
     conn: &Connection,
-    metric: Metric,
+    control: &JobControl,
+    v: i64,
     mode: ChartMode,
-    max_depth: u32,
-) -> Result<FullTreemapData> {
-    ensure_frame(conn, metric, mode, max_depth)?;
-    let v = cache_view(metric, mode, max_depth);
-    let (png,files,visible,weight,positive,negative,net,exported,rendered,added):(Vec<u8>,i64,i64,i64,i64,i64,i64,i64,i64,i64)=conn.query_row("SELECT png,file_count,visible_file_count,weight_total,positive_total,negative_total,net_delta,exported_total,rendered_block_count,added_file_count FROM treemap_frames WHERE view=?1",[v],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)))?;
-    let mut labels = Vec::with_capacity(320);
+) -> Result<(Vec<TreemapLabel>, i64)> {
+    if matches!(mode, ChartMode::Delta) {
+        let (labels, count): (String, i64) = conn.query_row(
+            "SELECT labels,rendered_block_count FROM treemap_frames WHERE view=?1",
+            [v],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        return Ok((serde_json::from_str(&labels).map_err(json_error)?, count));
+    }
     let side = if matches!(mode, ChartMode::After) {
         1
     } else {
         0
     };
-    // Directory title bars and file captions have independent bounded budgets.
-    for (kind, sql) in [
-        (NodeKind::Directory, "SELECT r.node_id,n.name,e.path,r.x,r.y,r.width,r.header_height,r.weight FROM treemap_rects r JOIN nodes n ON n.id=r.node_id JOIN entries e ON e.node_id=n.id AND e.side=?2 AND e.kind='directory' WHERE r.view=?1 AND r.header_height>0 ORDER BY r.width*r.height DESC,r.node_id LIMIT 256"),
-        (NodeKind::File, "SELECT r.node_id,n.name,e.path,r.x,r.y,r.width,r.height,r.weight FROM treemap_rects r JOIN nodes n ON n.id=r.node_id JOIN entries e ON e.node_id=n.id AND e.side=?2 AND e.kind='file' WHERE r.view=?1 AND r.leaf=1 AND r.width*4096>=96 AND r.height*1024>=22 ORDER BY r.width*r.height DESC,r.node_id LIMIT 64"),
-    ] {
-        let mut query = conn.prepare(sql)?;
-        let mut rows = query.query(params![v,side])?;
-        while let Some(r) = rows.next()? {
+    let mut directories = Vec::<Geometry>::with_capacity(257);
+    let mut files = Vec::<Geometry>::with_capacity(65);
+    let mut rendered = 0;
+    let mut kind = conn.prepare("SELECT kind FROM entries WHERE node_id=?1 AND side=?2")?;
+    scan_geometry(conn, control, v, |g| {
+        if g.leaf {
+            rendered += 1;
+        }
+        let expected = if g.header > 0.0 { "directory" } else { "file" };
+        let eligible =
+            g.header > 0.0 || (g.leaf && g.rect.w * 4096.0 >= 96.0 && g.rect.h * 1024.0 >= 22.0);
+        if eligible
+            && kind
+                .query_row(params![g.node(), side], |r| {
+                    Ok(store::root_text(r, 0)? == expected)
+                })
+                .optional()?
+                .unwrap_or(false)
+        {
+            let (list, limit) = if expected == "directory" {
+                (&mut directories, 256)
+            } else {
+                (&mut files, 64)
+            };
+            list.push(g);
+            list.sort_unstable_by(|a, b| {
+                (b.rect.w * b.rect.h)
+                    .total_cmp(&(a.rect.w * a.rect.h))
+                    .then_with(|| a.node().cmp(&b.node()))
+            });
+            list.truncate(limit);
+        }
+        Ok(())
+    })?;
+    let mut labels = Vec::with_capacity(directories.len() + files.len());
+    let mut meta=conn.prepare("SELECT n.name,e.path FROM nodes n JOIN entries e ON e.node_id=n.id AND e.side=?2 WHERE n.id=?1")?;
+    for (kind, list) in [(NodeKind::Directory, directories), (NodeKind::File, files)] {
+        for g in list {
+            let (name, path) = meta.query_row(params![g.node(), side], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
             labels.push(TreemapLabel {
-                node_id: format!("n{}", r.get::<_,i64>(0)?),
-                name: r.get(1)?, path: r.get(2)?, kind: kind.clone(),
-                weight: r.get::<_,i64>(7)?.to_string(),
-                x: r.get(3)?, y: r.get(4)?, width: r.get(5)?, height: r.get(6)?,
+                node_id: format!("n{}", g.node()),
+                name,
+                path,
+                kind: kind.clone(),
+                weight: g.weight.to_string(),
+                x: g.rect.x,
+                y: g.rect.y,
+                width: g.rect.w,
+                height: if matches!(kind, NodeKind::Directory) {
+                    g.header
+                } else {
+                    g.rect.h
+                },
             });
         }
     }
-    let mut warnings = vec!["全局实际文件汇总；目录标题和边距是结构装饰，不另计占用。零权重文件计入数量但不占面积。有限深度下，截断目录包含全部后代文件，选择隐藏文件会定位到可见祖先。".into()];
+    Ok((labels, rendered))
+}
+fn frame_warnings(
+    conn: &Connection,
+    metric: Metric,
+    mode: ChartMode,
+    added: i64,
+) -> Result<Vec<String>> {
+    let mut warnings=vec!["全局实际文件汇总；目录标题和边距是结构装饰，不另计占用。零权重文件计入数量但不占面积。有限深度下，截断目录包含全部后代文件，选择隐藏文件会定位到可见祖先。".into()];
     if matches!(mode, ChartMode::Delta) {
         let col = COLUMNS[view(metric, ChartMode::Before)];
         let unanchored: i64 = conn.query_row(
@@ -807,32 +1490,49 @@ pub fn get_frame(
         }
         if unanchored > 0 {
             warnings.push(format!("其中 {unanchored} 个新增文件没有之前占用的祖先，无法在基线图定位；请查看之后模式/目录树。以下最多列出 16 个路径："));
-            let mut query = conn.prepare(&format!("WITH RECURSIVE missing(key) AS (SELECT key FROM treemap_weights WHERE parent_id=0 AND {col}=0 AND added>0 UNION ALL SELECT w.key FROM treemap_weights w JOIN missing m ON w.parent_id=m.key WHERE w.added>0) SELECT e.path FROM missing m JOIN treemap_weights w ON w.key=m.key JOIN entries e ON e.node_id=w.node_id AND e.side=1 WHERE w.leaf=1 ORDER BY w.node_id LIMIT 16"))?;
+            let mut query=conn.prepare(&format!("WITH RECURSIVE missing(key) AS (SELECT key FROM treemap_weights WHERE parent_id=0 AND {col}=0 AND added>0 UNION ALL SELECT w.key FROM treemap_weights w JOIN missing m ON w.parent_id=m.key WHERE w.added>0) SELECT e.path FROM missing m JOIN treemap_weights w ON w.key=m.key JOIN entries e ON e.node_id=w.node_id AND e.side=1 WHERE w.leaf=1 ORDER BY w.node_id LIMIT 16"))?;
             let mut paths = query.query([])?;
             while let Some(row) = paths.next()? {
                 warnings.push(row.get(0)?);
             }
         }
     }
+    Ok(warnings)
+}
+pub fn get_frame(
+    conn: &Connection,
+    metric: Metric,
+    mode: ChartMode,
+    max_depth: u32,
+) -> Result<FullTreemapData> {
+    ensure_frame(conn, metric, mode, max_depth)?;
+    let v = cache_view(metric, mode, max_depth);
+    let mut query=conn.prepare("SELECT png,file_count,visible_file_count,weight_total,positive_total,negative_total,net_delta,exported_total,rendered_block_count,added_file_count,labels,warnings FROM treemap_frames WHERE view=?1")?;
+    let mut rows = query.query([v])?;
+    let row = rows.next()?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let png = row
+        .get_ref(0)?
+        .as_blob()
+        .map_err(|e| ApiError::new("CACHE_INVALID", e.to_string()))?;
+    let mut image_data_url = String::with_capacity(22 + png.len().div_ceil(3) * 4);
+    image_data_url.push_str("data:image/png;base64,");
+    base64::engine::general_purpose::STANDARD.encode_string(png, &mut image_data_url);
     Ok(FullTreemapData {
-        image_data_url: format!(
-            "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(png)
-        ),
+        image_data_url,
         atlas_width: ATLAS_WIDTH,
         atlas_height: ATLAS_HEIGHT,
-        file_count: files as u64,
-        visible_file_count: visible as u64,
-        rendered_block_count: rendered as u64,
+        file_count: row.get::<_, i64>(1)? as u64,
+        visible_file_count: row.get::<_, i64>(2)? as u64,
+        rendered_block_count: row.get::<_, i64>(8)? as u64,
         max_depth,
-        added_file_count: added as u64,
-        weight_total: weight.to_string(),
-        positive_total: positive.to_string(),
-        negative_total: negative.to_string(),
-        net_delta: net.to_string(),
-        exported_total: exported.to_string(),
-        labels,
-        warnings,
+        added_file_count: row.get::<_, i64>(9)? as u64,
+        weight_total: row.get::<_, i64>(3)?.to_string(),
+        positive_total: row.get::<_, i64>(4)?.to_string(),
+        negative_total: row.get::<_, i64>(5)?.to_string(),
+        net_delta: row.get::<_, i64>(6)?.to_string(),
+        exported_total: row.get::<_, i64>(7)?.to_string(),
+        labels: serde_json::from_str(store::root_text(row, 10)?).map_err(json_error)?,
+        warnings: serde_json::from_str(store::root_text(row, 11)?).map_err(json_error)?,
     })
 }
 
@@ -850,7 +1550,15 @@ pub fn get_bounds(
         return Err(ApiError::new("INVALID_NODE", "节点不存在或已过期"));
     }
     ensure_frame(conn, metric, mode, max_depth)?;
-    Ok(conn.query_row("WITH RECURSIVE ancestors(id,parent_id,d) AS (SELECT id,parent_id,0 FROM nodes WHERE id=?2 UNION ALL SELECT n.id,n.parent_id,a.d+1 FROM nodes n JOIN ancestors a ON n.id=a.parent_id) SELECT r.x,r.y,r.width,r.height FROM ancestors a JOIN treemap_rects r ON r.view=?1 AND r.key=a.id ORDER BY a.d LIMIT 1",params![cache_view(metric,mode,max_depth),n], |r| Ok(TreemapRect{x:r.get(0)?,y:r.get(1)?,width:r.get(2)?,height:r.get(3)?})).optional()?)
+    let v = geometry_view(conn, cache_view(metric, mode, max_depth))?;
+    let mut ancestors=conn.prepare("WITH RECURSIVE ancestors(id,parent_id,d) AS (SELECT id,parent_id,0 FROM nodes WHERE id=?1 UNION ALL SELECT n.id,n.parent_id,a.d+1 FROM nodes n JOIN ancestors a ON n.id=a.parent_id) SELECT id FROM ancestors ORDER BY d")?;
+    let mut rows = ancestors.query([n])?;
+    while let Some(row) = rows.next()? {
+        if let Some(g) = cached_geometry(conn, v, row.get(0)?)? {
+            return Ok(Some(g.bounds()));
+        }
+    }
+    Ok(None)
 }
 
 pub fn hit_test(
@@ -873,57 +1581,83 @@ pub fn hit_test(
     } else {
         0
     };
-    let mut query=conn.prepare(&format!("SELECT r.node_id,n.name,coalesce(e.path,n.path),coalesce(e.extension,''),r.weight,r.value,c.status,r.x,r.y,r.width,r.height,e.kind,w.leaf,w.added,w.removed,w.type_changed,w.modified,r.leaf FROM treemap_spatial s CROSS JOIN treemap_rects r NOT INDEXED JOIN nodes n ON n.id=r.node_id JOIN comparison_nodes c ON c.node_id=r.node_id JOIN treemap_weights w ON w.key=r.key LEFT JOIN entries e ON e.node_id=n.id AND e.side=?4 WHERE s.x0<=?2 AND s.x1>=?2 AND s.y0<=?3 AND s.y1>=?3 AND r.id>=s.id*{SPATIAL_BLOCK} AND r.id<(s.id+1)*{SPATIAL_BLOCK} AND r.view=?1 AND (r.leaf=1 OR r.header_height>0) AND r.x<=?2 AND r.y<=?3 AND (?2<r.x+r.width OR (?2=1.0 AND r.x+r.width>=1.0)) AND (?3<r.y+CASE WHEN r.leaf=1 THEN r.height ELSE r.header_height END OR (?3=1.0 AND r.y+CASE WHEN r.leaf=1 THEN r.height ELSE r.header_height END>=1.0)) ORDER BY r.node_id LIMIT 1"))?;
-    Ok(query
-        .query_row(
-            params![cache_view(metric, mode, max_depth), x, y, side],
-            |r| {
-                let collapsed = r.get::<_, i64>(12)? == 0 && r.get::<_, i64>(17)? == 1;
-                let is_directory = store::root_text(r, 11)? == "directory";
-                let status = store::root_text(r, 6)?;
-                let status = if is_directory {
-                    if r.get::<_, i64>(15)? > 0 {
-                        Status::TypeChanged
-                    } else if r.get::<_, i64>(16)? > 0 {
-                        Status::Modified
-                    } else if r.get::<_, i64>(14)? > 0 {
-                        Status::Removed
-                    } else if r.get::<_, i64>(13)? > 0 {
-                        Status::Added
-                    } else {
-                        Status::Unchanged
-                    }
+    let v = geometry_view(conn, cache_view(metric, mode, max_depth))?;
+    let mut blocks=conn.prepare("SELECT b.id,b.data,b.source,b.start,b.count,r.sx,r.sy,r.tx,r.ty FROM treemap_spatial s CROSS JOIN treemap_blocks b ON b.id=s.id LEFT JOIN treemap_reuse r ON r.id=b.reuse_id WHERE s.x0<=?2 AND s.x1>=?2 AND s.y0<=?3 AND s.y1>=?3 AND b.view=?1")?;
+    let mut directory =
+        conn.prepare("SELECT leaf,header_height FROM treemap_rects WHERE view=?1 AND key=?2")?;
+    let mut rows = blocks.query(params![v, x, y])?;
+    let mut selected: Option<Geometry> = None;
+    read_blocks(conn, &mut rows, |_, data, transform| {
+        for record in data.chunks_exact(GEOMETRY_BYTES) {
+            let mut g = Geometry::decode(record);
+            g.rect = transform.rect(g.rect);
+            decorate(&mut g, &mut directory, v)?;
+            let r = g.rect;
+            let height = if g.leaf { r.h } else { g.header };
+            if (g.leaf || g.header > 0.0)
+                && r.x <= x
+                && r.y <= y
+                && (x < r.x + r.w || (x == 1.0 && r.x + r.w >= 1.0))
+                && (y < r.y + height || (y == 1.0 && r.y + height >= 1.0))
+                && selected.map_or(true, |old| g.node() < old.node())
+            {
+                selected = Some(g);
+            }
+        }
+        Ok(())
+    })?;
+    let Some(g) = selected else { return Ok(None) };
+    let value = if matches!(mode, ChartMode::Delta) {
+        if matches!(metric, Metric::Size) {
+            "w.size_value+0*?4"
+        } else {
+            "w.allocated_value+0*?4"
+        }
+    } else {
+        "?4"
+    };
+    let mut query=conn.prepare(&format!("SELECT n.name,coalesce(ep.path||e.suffix,n.path),coalesce(e.extension,''),{value},c.status,coalesce(es.kind=1,0),w.leaf,w.added,w.removed,w.type_changed,w.modified FROM nodes n JOIN comparison_nodes c ON c.node_id=n.id JOIN treemap_weights w ON w.key=?1 LEFT JOIN snapshot_entries es ON es.node_id=n.id AND es.side=?3 LEFT JOIN entry_values e ON e.id=es.value_id LEFT JOIN path_prefixes ep ON ep.id=e.prefix_id WHERE n.id=?2"))?;
+    Ok(Some(query.query_row(
+        params![g.key, g.node(), side, g.weight],
+        |r| {
+            let is_directory = r.get::<_, bool>(5)?;
+            let status = if is_directory {
+                if r.get::<_, i64>(9)? > 0 {
+                    Status::TypeChanged
+                } else if r.get::<_, i64>(10)? > 0 {
+                    Status::Modified
+                } else if r.get::<_, i64>(8)? > 0 {
+                    Status::Removed
+                } else if r.get::<_, i64>(7)? > 0 {
+                    Status::Added
                 } else {
-                    match status {
-                        "added" => Status::Added,
-                        "removed" => Status::Removed,
-                        "modified" => Status::Modified,
-                        "typeChanged" => Status::TypeChanged,
-                        _ => Status::Unchanged,
-                    }
-                };
-                Ok(TreemapHit {
-                    node_id: format!("n{}", r.get::<_, i64>(0)?),
-                    name: r.get(1)?,
-                    path: r.get(2)?,
-                    extension: r.get(3)?,
-                    weight: r.get::<_, i64>(4)?.to_string(),
-                    value: r.get::<_, i64>(5)?.to_string(),
-                    status,
-                    kind: if is_directory {
-                        NodeKind::Directory
-                    } else {
-                        NodeKind::File
-                    },
-                    collapsed,
-                    rect: TreemapRect {
-                        x: r.get(7)?,
-                        y: r.get(8)?,
-                        width: r.get(9)?,
-                        height: r.get(10)?,
-                    },
-                })
-            },
-        )
-        .optional()?)
+                    Status::Unchanged
+                }
+            } else {
+                match store::root_text(r, 4)? {
+                    "added" => Status::Added,
+                    "removed" => Status::Removed,
+                    "modified" => Status::Modified,
+                    "typeChanged" => Status::TypeChanged,
+                    _ => Status::Unchanged,
+                }
+            };
+            Ok(TreemapHit {
+                node_id: format!("n{}", g.node()),
+                name: r.get(0)?,
+                path: r.get(1)?,
+                extension: r.get(2)?,
+                weight: g.weight.to_string(),
+                value: r.get::<_, i64>(3)?.to_string(),
+                status,
+                kind: if is_directory {
+                    NodeKind::Directory
+                } else {
+                    NodeKind::File
+                },
+                collapsed: r.get::<_, i64>(6)? == 0 && g.leaf,
+                rect: g.bounds(),
+            })
+        },
+    )?))
 }
