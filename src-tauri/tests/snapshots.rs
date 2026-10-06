@@ -165,40 +165,94 @@ fn prefix_interning_survives_eviction_and_resolves_out_of_order_actual_parents()
     conn.execute_batch(store::SCHEMA).unwrap();
     let mut text = "文件名称,大小,分配\n".to_owned();
     for i in 0..4101 {
-        text.push_str(&format!("C:/Root\\Dir{i}/File.TxT,1,2\nC:/Root\\Dir{i}/,1,2\n"));
+        text.push_str(&format!(
+            "C:/Root\\Dir{i}/File.TxT,1,2\nC:/Root\\Dir{i}/,1,2\n"
+        ));
     }
     text.push_str("C:/Root/,4101,8202\n");
     let csv = source(&dir, "prefixes.csv", &text);
     let mut before = import::load(&conn, &csv, 0, &JobControl::default(), &mut |_| {}).unwrap();
     let mut after = import::load(&conn, &csv, 1, &JobControl::default(), &mut |_| {}).unwrap();
     for side in [0, 1] {
-        let mut query = conn.prepare("SELECT path FROM entries WHERE side=?1 ORDER BY node_id").unwrap();
+        let mut query = conn
+            .prepare("SELECT path FROM entries WHERE side=?1 ORDER BY node_id")
+            .unwrap();
         let mut rows = query.query([side]).unwrap();
-        for original in text.lines().skip(1).map(|line| line.split(',').next().unwrap()) {
-            assert_eq!(rows.next().unwrap().unwrap().get::<_, String>(0).unwrap(), original);
+        for original in text
+            .lines()
+            .skip(1)
+            .map(|line| line.split(',').next().unwrap())
+        {
+            assert_eq!(
+                rows.next().unwrap().unwrap().get::<_, String>(0).unwrap(),
+                original
+            );
         }
         assert!(rows.next().unwrap().is_none());
     }
-    assert_eq!(conn.query_row("SELECT count(*) FROM entry_values", [], |r| r.get::<_, i64>(0)).unwrap(), 8203);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM entry_values", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        8203
+    );
     store::finish_import(&conn, &mut before, &mut after, &JobControl::default()).unwrap();
     assert_eq!((before.root_count, after.root_count), (1, 1));
     assert_eq!((&*before.size, &*after.allocated), ("4101", "8202"));
     let root = id(&conn, "C:/Root/");
-    assert_eq!(conn.query_row("SELECT count(*) FROM node_records WHERE parent_id=?1", [root[1..].parse::<i64>().unwrap()], |r| r.get::<_, i64>(0)).unwrap(), 4101);
-    assert_eq!(conn.query_row("SELECT count(*) FROM node_records WHERE parent_path IS NOT NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-    assert_eq!(conn.query_row("SELECT count(*) FROM nodes", [], |r| r.get::<_, i64>(0)).unwrap(), 8203);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM node_records WHERE parent_id=?1",
+            [root[1..].parse::<i64>().unwrap()],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        4101
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM node_records WHERE parent_path IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM nodes", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        8203
+    );
 }
 
 #[test]
 fn prefix_views_preserve_roots_unc_and_mixed_separators_without_inventing_nodes() {
-    let originals = ["C:/", "//Server\\Share/", "//Server\\Share/MiXeD\\File.TXT", "//Server\\Share/MiXeD/", "relative\\FiLe", "plain"];
-    let text = format!("文件名称,大小,分配\n{}", originals.iter().map(|path| format!("{path},0,0\n")).collect::<String>());
+    let originals = [
+        "C:/",
+        "//Server\\Share/",
+        "//Server\\Share/MiXeD\\File.TXT",
+        "//Server\\Share/MiXeD/",
+        "relative\\FiLe",
+        "plain",
+    ];
+    let text = format!(
+        "文件名称,大小,分配\n{}",
+        originals
+            .iter()
+            .map(|path| format!("{path},0,0\n"))
+            .collect::<String>()
+    );
     let (_dir, conn, _) = import_one(&text).unwrap();
-    let mut statement = conn.prepare("SELECT n.path,e.path FROM nodes n JOIN entries e ON e.node_id=n.id ORDER BY n.id").unwrap();
+    let mut statement = conn
+        .prepare("SELECT n.path,e.path FROM nodes n JOIN entries e ON e.node_id=n.id ORDER BY n.id")
+        .unwrap();
     let mut rows = statement.query([]).unwrap();
     for original in originals {
         let row = rows.next().unwrap().unwrap();
-        assert_eq!(row.get::<_, String>(0).unwrap(), import::normalize(original).0);
+        assert_eq!(
+            row.get::<_, String>(0).unwrap(),
+            import::normalize(original).0
+        );
         assert_eq!(row.get::<_, String>(1).unwrap(), original);
     }
     assert!(rows.next().unwrap().is_none());
@@ -216,7 +270,10 @@ fn identical_snapshots_share_values_across_batches_without_changing_path_totals(
     let csv = source(&dir, "identical.csv", &text);
     for side in [0, 1] {
         let summary = import::load(&conn, &csv, side, &JobControl::default(), &mut |_| {}).unwrap();
-        assert_eq!((summary.rows, summary.files, summary.folders), (10_006, 10_005, 1));
+        assert_eq!(
+            (summary.rows, summary.files, summary.folders),
+            (10_006, 10_005, 1)
+        );
     }
     let counts: (i64, i64, i64) = conn.query_row(
         "SELECT (SELECT count(*) FROM entry_values),(SELECT count(*) FROM snapshot_entries),(SELECT count(*) FROM snapshot_entries b JOIN snapshot_entries a ON a.node_id=b.node_id AND a.value_id=b.value_id WHERE b.side=0 AND a.side=1)", [],
@@ -228,37 +285,111 @@ fn identical_snapshots_share_values_across_batches_without_changing_path_totals(
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     ).unwrap();
     assert_eq!(totals, (20_010, 40_020, 20_010));
-    assert_eq!(conn.query_row("SELECT count(*) FROM nodes WHERE parent_id IS NOT NULL AND parent_path IS NOT NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM nodes WHERE parent_id IS NOT NULL AND parent_path IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
     assert_eq!(fs::read_to_string(csv).unwrap(), text);
 }
 
 #[test]
 fn sharing_compares_every_detail_and_preserves_original_path_spelling_and_kind() {
     let header = import::COLUMNS.join(",");
-    let base = ["C:/Root/File.TXT", "1", "2", "modified", "00009", "0", "3", "184467440737095516160", "0", "accessed", "created", "4", "5", "6", "7", "8", "9"];
+    let base = [
+        "C:/Root/File.TXT",
+        "1",
+        "2",
+        "modified",
+        "00009",
+        "0",
+        "3",
+        "184467440737095516160",
+        "0",
+        "accessed",
+        "created",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+    ];
     for (column, replacement) in [
-        (0, "c:\\root\\FILE.txt"), (0, "C:/Root/File.TXT/"),
-        (1, "10"), (2, "20"), (3, "other"), (4, "9"),
-        (5, "1"), (6, "4"), (7, "184467440737095516161"),
-        (8, "1"), (9, "other"), (10, "other"), (11, "40"),
-        (12, "50"), (13, "60"), (14, "70"), (15, "80"), (16, "90"),
-        (3, ""), (5, ""), (7, ""),
+        (0, "c:\\root\\FILE.txt"),
+        (0, "C:/Root/File.TXT/"),
+        (1, "10"),
+        (2, "20"),
+        (3, "other"),
+        (4, "9"),
+        (5, "1"),
+        (6, "4"),
+        (7, "184467440737095516161"),
+        (8, "1"),
+        (9, "other"),
+        (10, "other"),
+        (11, "40"),
+        (12, "50"),
+        (13, "60"),
+        (14, "70"),
+        (15, "80"),
+        (16, "90"),
+        (3, ""),
+        (5, ""),
+        (7, ""),
     ] {
         let dir = TempDir::new().unwrap();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(store::SCHEMA).unwrap();
-        let before = source(&dir, "before.csv", &format!("{header}\n{}\n", base.join(",")));
+        let before = source(
+            &dir,
+            "before.csv",
+            &format!("{header}\n{}\n", base.join(",")),
+        );
         let mut changed = base;
         changed[column] = replacement;
-        let after = source(&dir, "after.csv", &format!("{header}\n{}\n", changed.join(",")));
+        let after = source(
+            &dir,
+            "after.csv",
+            &format!("{header}\n{}\n", changed.join(",")),
+        );
         import::load(&conn, &before, 0, &JobControl::default(), &mut |_| {}).unwrap();
         import::load(&conn, &after, 1, &JobControl::default(), &mut |_| {}).unwrap();
-        assert_eq!(conn.query_row("SELECT count(*) FROM nodes", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM nodes", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
         let expected_cold_values = if column == 1 || column == 2 { 1 } else { 2 };
-        assert_eq!(conn.query_row("SELECT count(*) FROM entry_values", [], |r| r.get::<_, i64>(0)).unwrap(), expected_cold_values, "column {column}: {replacement}");
-        let bytes: (i64, i64) = conn.query_row("SELECT size,allocated FROM entries WHERE side=1", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(bytes, (changed[1].parse::<i64>().unwrap(), changed[2].parse::<i64>().unwrap()));
-        assert_eq!(conn.query_row("SELECT path FROM entries WHERE side=1", [], |r| r.get::<_, String>(0)).unwrap(), changed[0]);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM entry_values", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            expected_cold_values,
+            "column {column}: {replacement}"
+        );
+        let bytes: (i64, i64) = conn
+            .query_row("SELECT size,allocated FROM entries WHERE side=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            bytes,
+            (
+                changed[1].parse::<i64>().unwrap(),
+                changed[2].parse::<i64>().unwrap()
+            )
+        );
+        assert_eq!(
+            conn.query_row("SELECT path FROM entries WHERE side=1", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            changed[0]
+        );
     }
 }
 
@@ -268,14 +399,33 @@ fn shared_values_keep_side_specific_hardlinks_and_canonical_numeric_details() {
         "文件名称,大小,分配,文件,MFTRECNO\nC:\\r\\,2,4,2,1\nC:\\r\\one.txt,1,2,0000,000184467440737095516160\nC:\\r\\two.txt,1,2,0,184467440737095516160\n",
         "文件名称,大小,分配,文件,MFTRECNO\nC:\\r\\,1,2,1,1\nC:\\r\\one.txt,0001,0002,0,184467440737095516160\n",
     );
-    assert_eq!(conn.query_row("SELECT count(*) FROM entry_values", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM entry_values", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
     let one = diff::get_details(&conn, &id(&conn, "C:\\r\\one.txt")).unwrap();
     assert_eq!(one.before.as_ref().unwrap().hardlink_count, 2);
     assert_eq!(one.after.as_ref().unwrap().hardlink_count, 1);
-    assert_eq!(one.before.unwrap().mft.as_deref(), Some("184467440737095516160"));
+    assert_eq!(
+        one.before.unwrap().mft.as_deref(),
+        Some("184467440737095516160")
+    );
     let summaries = store::get_summary(&conn).unwrap();
-    assert_eq!((&*summaries.before.size, &*summaries.after.size), ("2", "1"));
-    assert_eq!(conn.query_row("SELECT count(*) FROM nodes WHERE parent_path IS NOT NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(
+        (&*summaries.before.size, &*summaries.after.size),
+        ("2", "1")
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM nodes WHERE parent_path IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -636,12 +786,23 @@ fn compact_hot_fields_preserve_precise_side_bytes_while_sharing_cold_metadata() 
         "文件名称,大小,分配,MFTRECNO\nC:\\Big.TXT,9007199254740993,9223372036854775806,184467440737095516160\n",
         "文件名称,大小,分配,MFTRECNO\nC:\\Big.TXT,9007199254740994,9223372036854775807,184467440737095516160\n",
     );
-    assert_eq!(conn.query_row("SELECT count(*) FROM entry_values", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM entry_values", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
     let details = diff::get_details(&conn, &id(&conn, "C:\\Big.TXT")).unwrap();
-    assert_eq!((&*details.size_delta, &*details.allocated_delta), ("1", "1"));
+    assert_eq!(
+        (&*details.size_delta, &*details.allocated_delta),
+        ("1", "1")
+    );
     assert_eq!(details.before.as_ref().unwrap().size, "9007199254740993");
     assert_eq!(details.after.as_ref().unwrap().size, "9007199254740994");
-    assert_eq!(details.after.as_ref().unwrap().allocated, "9223372036854775807");
+    assert_eq!(
+        details.after.as_ref().unwrap().allocated,
+        "9223372036854775807"
+    );
     for entry in [details.before.unwrap(), details.after.unwrap()] {
         assert_eq!(entry.kind, "file");
         assert_eq!(entry.path, "C:\\Big.TXT");
@@ -660,7 +821,10 @@ fn ranked_tree_pages_preserve_binary_unicode_order_and_validate_ranked_cursors()
         let name = format!("{}-{i:04}.TxT", stems[i % stems.len()]);
         for parent in ["left", "right"] {
             before.push_str(&format!("C:\\r\\{parent}\\{name},1,1\n"));
-            after.push_str(&format!("C:\\r\\{parent}\\{name},{},1\n", if parent == "left" && i % 2 == 0 { 2 } else { 1 }));
+            after.push_str(&format!(
+                "C:\\r\\{parent}\\{name},{},1\n",
+                if parent == "left" && i % 2 == 0 { 2 } else { 1 }
+            ));
         }
     }
     let (_dir, conn) = comparison(&before, &after);
@@ -668,19 +832,40 @@ fn ranked_tree_pages_preserve_binary_unicode_order_and_validate_ranked_cursors()
     let parent = left[1..].parse::<i64>().unwrap();
     for changes in [false, true] {
         let mut expected_query = conn.prepare("SELECT n.id,n.name FROM node_records n JOIN comparison_nodes c ON c.node_id=n.id WHERE n.parent_id=?1 AND (?2=0 OR c.has_changes=1) ORDER BY n.basename_key COLLATE BINARY,n.id").unwrap();
-        let expected = expected_query.query_map((parent, changes), |r| Ok((format!("n{}", r.get::<_, i64>(0)?), r.get::<_, String>(1)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        let expected = expected_query
+            .query_map((parent, changes), |r| {
+                Ok((format!("n{}", r.get::<_, i64>(0)?), r.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         let mut actual = Vec::new();
         let mut cursor = None;
         loop {
-            let page = diff::list_children(&conn, "test", Some(&left), changes, cursor.as_deref()).unwrap();
+            let page = diff::list_children(&conn, "test", Some(&left), changes, cursor.as_deref())
+                .unwrap();
             if cursor.is_none() {
-                let mut corrupt: serde_json::Value = serde_json::from_str(page.next_cursor.as_deref().unwrap()).unwrap();
+                let mut corrupt: serde_json::Value =
+                    serde_json::from_str(page.next_cursor.as_deref().unwrap()).unwrap();
                 corrupt["rank"] = 0.into();
-                assert_eq!(diff::list_children(&conn, "test", Some(&left), changes, Some(&corrupt.to_string())).unwrap_err().code, "INVALID_CURSOR");
+                assert_eq!(
+                    diff::list_children(
+                        &conn,
+                        "test",
+                        Some(&left),
+                        changes,
+                        Some(&corrupt.to_string())
+                    )
+                    .unwrap_err()
+                    .code,
+                    "INVALID_CURSOR"
+                );
             }
             actual.extend(page.rows.into_iter().map(|r| (r.node_id, r.name)));
             cursor = page.next_cursor;
-            if cursor.is_none() { break; }
+            if cursor.is_none() {
+                break;
+            }
         }
         assert_eq!(actual, expected);
     }
@@ -986,14 +1171,7 @@ fn missing_intermediate_roots_remain_real_roots_without_fabricated_children() {
                 .is_none());
         }
         let delta = global_treemap::get_frame(&conn, metric, ChartMode::Delta, 0).unwrap();
-        assert_eq!(
-            delta.weight_total,
-            if matches!(metric, Metric::Size) {
-                "10"
-            } else {
-                "20"
-            }
-        );
+        assert_eq!(delta.weight_total, "1");
         assert_eq!(delta.net_delta, "1");
     }
 }
@@ -1108,34 +1286,23 @@ fn paged_direct_children_and_complete_global_leaves_respect_exact_edges() {
     }
 }
 #[test]
-fn root_file_warning_limits_examples_and_baseline_does_not_sum_absolute_delta() {
-    let mut csv = "文件名称,大小,分配\n".to_owned();
-    for i in 0..7 {
-        csv.push_str(&format!("C:\\orphan{i},0,0\n"));
-    }
-    let (_dir, conn) = comparison(&csv, &csv);
-    let summary = store::get_summary(&conn).unwrap();
-    for warning in summary.warnings {
-        assert!(warning.contains("7 个文件"));
-        assert_eq!(warning.matches("C:\\orphan").count(), 5);
-    }
+fn absolute_delta_total_preserves_values_beyond_signed_sqlite_integer() {
     let dir = TempDir::new().unwrap();
     let b=source(&dir,"before.csv","文件名称,大小,分配\nC:\\x\\,9223372036854775807,0\nC:\\x\\a,9223372036854775807,0\nC:\\x\\b,0,0\n");
     let a=source(&dir,"after.csv","文件名称,大小,分配\nC:\\x\\,9223372036854775807,0\nC:\\x\\a,0,0\nC:\\x\\b,9223372036854775807,0\n");
     let db = dir.path().join("overflow.sqlite");
     store::build_comparison(&b, &a, &db, "overflow", &JobControl::default(), &mut |_| {}).unwrap();
     let conn = store::open_reader(&db).unwrap();
-    // Separate positive/negative totals each fit i64. Their absolute sum need
-    // not fit: Delta occupies exactly the Before baseline, not change area.
+    // Each signed side fits i64; their gross change is exactly twice i64::MAX.
     for depth in [1, 3, 0] {
         let frame =
             global_treemap::get_frame(&conn, Metric::Size, ChartMode::Delta, depth).unwrap();
-        assert_eq!(frame.weight_total, i64::MAX.to_string());
+        assert_eq!(frame.weight_total, (2u64 * i64::MAX as u64).to_string());
         assert_eq!(frame.positive_total, i64::MAX.to_string());
         assert_eq!(frame.negative_total, i64::MAX.to_string());
         assert_eq!(frame.net_delta, "0");
-        assert_eq!(frame.visible_file_count, 1);
-        assert_eq!(frame.rendered_block_count, 1);
+        assert_eq!(frame.visible_file_count, 2);
+        assert_eq!(frame.rendered_block_count, if depth == 1 { 1 } else { 2 });
     }
 }
 #[test]

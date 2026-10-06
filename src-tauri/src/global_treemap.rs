@@ -51,8 +51,77 @@ fn view(metric: Metric, mode: ChartMode) -> usize {
             ChartMode::Delta => 2,
         }
 }
-const COLUMNS: [&str; 6] = ["sb", "sa", "sb", "ab", "aa", "ab"];
+const COLUMNS: [&str; 6] = ["sb", "sa", "ds", "ab", "aa", "da"];
 
+// Change mass can be before_total + after_total, beyond signed SQLite INTEGER.
+// Fixed-width big-endian blobs retain exact unsigned ordering and need no heap
+// allocation in the scalar/aggregate callbacks. Only layout math uses f64.
+struct UnsignedWeight([u8; 8]);
+impl rusqlite::ToSql for UnsignedWeight {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::Borrowed(
+            rusqlite::types::ValueRef::Blob(&self.0),
+        ))
+    }
+}
+fn sql_weight(value: rusqlite::types::ValueRef<'_>) -> rusqlite::Result<u64> {
+    match value {
+        rusqlite::types::ValueRef::Integer(n) if n >= 0 => Ok(n as u64),
+        rusqlite::types::ValueRef::Blob(bytes) if bytes.len() == 8 => {
+            Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+        }
+        _ => Err(rusqlite::Error::InvalidFunctionParameterType(
+            0,
+            value.data_type(),
+        )),
+    }
+}
+fn row_weight(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
+    sql_weight(row.get_ref(column)?)
+}
+fn weight_sum(a: u64, b: u64) -> Result<u64> {
+    a.checked_add(b)
+        .ok_or_else(|| ApiError::new("AGGREGATE_OVERFLOW", "变化总量超出 u64 范围"))
+}
+struct SumChangeWeight;
+impl rusqlite::functions::Aggregate<u64, UnsignedWeight> for SumChangeWeight {
+    fn init(&self, _: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<u64> {
+        Ok(0)
+    }
+    fn step(
+        &self,
+        ctx: &mut rusqlite::functions::Context<'_>,
+        sum: &mut u64,
+    ) -> rusqlite::Result<()> {
+        *sum = sum
+            .checked_add(sql_weight(ctx.get_raw(0))?)
+            .ok_or_else(|| {
+                rusqlite::Error::UserFunctionError(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "变化总量超出 u64 范围",
+                )))
+            })?;
+        Ok(())
+    }
+    fn finalize(
+        &self,
+        _: &mut rusqlite::functions::Context<'_>,
+        sum: Option<u64>,
+    ) -> rusqlite::Result<UnsignedWeight> {
+        Ok(UnsignedWeight(sum.unwrap_or(0).to_be_bytes()))
+    }
+}
+fn register_change_weights(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_scalar_function("change_weight", 1, flags, |ctx| {
+        Ok(UnsignedWeight(
+            ctx.get::<i64>(0)?.unsigned_abs().to_be_bytes(),
+        ))
+    })?;
+    conn.create_aggregate_function("sum_change_weight", 1, flags, SumChangeWeight)?;
+    Ok(())
+}
 pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
     control.check()?;
     *control
@@ -66,6 +135,7 @@ pub fn materialize(conn: &Connection, control: &JobControl) -> Result<()> {
     result
 }
 fn build(conn: &Connection, control: &JobControl) -> Result<()> {
+    register_change_weights(conn)?;
     let transaction = conn.unchecked_transaction()?;
     conn.execute_batch("CREATE TEMP TABLE treemap_palette(extension TEXT PRIMARY KEY,color INTEGER NOT NULL) WITHOUT ROWID;")?;
     {
@@ -91,7 +161,8 @@ fn build(conn: &Connection, control: &JobControl) -> Result<()> {
         ab INTEGER NOT NULL CHECK(typeof(ab)='integer'),aa INTEGER NOT NULL CHECK(typeof(aa)='integer'),
         size_value INTEGER NOT NULL CHECK(typeof(size_value)='integer'),allocated_value INTEGER NOT NULL CHECK(typeof(allocated_value)='integer'),
         before_file INTEGER NOT NULL,after_file INTEGER NOT NULL,
-        added INTEGER NOT NULL,removed INTEGER NOT NULL,type_changed INTEGER NOT NULL,modified INTEGER NOT NULL,color INTEGER NOT NULL);
+        added INTEGER NOT NULL,removed INTEGER NOT NULL,type_changed INTEGER NOT NULL,modified INTEGER NOT NULL,color INTEGER NOT NULL,
+        ds BLOB NOT NULL DEFAULT x'0000000000000000' CHECK(length(ds)=8),da BLOB NOT NULL DEFAULT x'0000000000000000' CHECK(length(da)=8));
         WITH RECURSIVE parents(id) AS MATERIALIZED (SELECT DISTINCT parent_id FROM node_records WHERE parent_id IS NOT NULL),
         levels(id,level) AS (
             SELECT n.id,1 FROM node_records n JOIN parents p ON p.id=n.id WHERE n.parent_id IS NULL
@@ -106,11 +177,11 @@ fn build(conn: &Connection, control: &JobControl) -> Result<()> {
             CASE WHEN c.before_kind='file' OR c.after_kind='file' THEN p.color ELSE 0 END color
             FROM node_records n NOT INDEXED CROSS JOIN comparison_nodes c ON c.node_id=n.id
             LEFT JOIN levels l ON l.id=n.parent_id LEFT JOIN parents child ON child.id=n.id LEFT JOIN treemap_palette p ON p.extension=c.extension)
-        INSERT INTO treemap_weights SELECT id,id,parent_id,level,leaf,
+        INSERT INTO treemap_weights(key,node_id,parent_id,depth,leaf,sb,sa,ab,aa,size_value,allocated_value,before_file,after_file,added,removed,type_changed,modified,color) SELECT id,id,parent_id,level,leaf,
             sb*leaf,sa*leaf,ab*leaf,aa*leaf,(sa-sb)*leaf,(aa-ab)*leaf,
             bf*leaf,af*leaf,added*leaf,removed*leaf,changed*leaf,modified*leaf,color FROM own;
         CREATE INDEX treemap_depth ON treemap_weights(depth,key) WHERE leaf=0;
-        INSERT INTO treemap_weights
+        INSERT INTO treemap_weights(key,node_id,parent_id,depth,leaf,sb,sa,ab,aa,size_value,allocated_value,before_file,after_file,added,removed,type_changed,modified,color)
         SELECT -c.node_id,c.node_id,c.node_id,w.depth+1,1,
         CASE WHEN c.before_kind='file' THEN c.before_size ELSE 0 END,CASE WHEN c.after_kind='file' THEN c.after_size ELSE 0 END,
         CASE WHEN c.before_kind='file' THEN c.before_allocated ELSE 0 END,CASE WHEN c.after_kind='file' THEN c.after_allocated ELSE 0 END,
@@ -122,10 +193,11 @@ fn build(conn: &Connection, control: &JobControl) -> Result<()> {
         FROM treemap_weights w INDEXED BY treemap_depth CROSS JOIN comparison_nodes c ON c.node_id=w.node_id
         JOIN treemap_palette p ON p.extension=c.extension
         WHERE w.leaf=0 AND (c.before_kind='file' OR c.after_kind='file');
+        UPDATE treemap_weights SET ds=change_weight(size_value),da=change_weight(allocated_value) WHERE leaf=1;
         DROP TABLE treemap_palette;
         CREATE INDEX treemap_parent ON treemap_weights(parent_id);
         CREATE TABLE treemap_rects(id INTEGER PRIMARY KEY,view INTEGER NOT NULL,key INTEGER NOT NULL,node_id INTEGER NOT NULL,leaf INTEGER NOT NULL,
-            x REAL NOT NULL,y REAL NOT NULL,width REAL NOT NULL,height REAL NOT NULL,weight INTEGER NOT NULL,value INTEGER NOT NULL,
+            x REAL NOT NULL,y REAL NOT NULL,width REAL NOT NULL,height REAL NOT NULL,weight BLOB NOT NULL,value INTEGER NOT NULL,
             header_height REAL NOT NULL DEFAULT 0, UNIQUE(view,key));
         CREATE TABLE treemap_reuse(id INTEGER PRIMARY KEY,view INTEGER NOT NULL,parent_id INTEGER NOT NULL,source_view INTEGER NOT NULL,
             sx REAL NOT NULL,sy REAL NOT NULL,tx REAL NOT NULL,ty REAL NOT NULL,UNIQUE(view,parent_id));
@@ -136,13 +208,13 @@ fn build(conn: &Connection, control: &JobControl) -> Result<()> {
         CREATE TABLE treemap_families(id INTEGER PRIMARY KEY,view INTEGER NOT NULL UNIQUE);
         CREATE VIRTUAL TABLE treemap_spatial USING rtree(id,x0,x1,y0,y1);
         CREATE TABLE treemap_frames(view INTEGER PRIMARY KEY,png BLOB NOT NULL,file_count INTEGER NOT NULL,visible_file_count INTEGER NOT NULL,
-            weight_total INTEGER NOT NULL,positive_total INTEGER NOT NULL,negative_total INTEGER NOT NULL,net_delta INTEGER NOT NULL,exported_total INTEGER NOT NULL,rendered_block_count INTEGER NOT NULL,added_file_count INTEGER NOT NULL,labels TEXT NOT NULL,warnings TEXT NOT NULL);").map_err(store::aggregate_error)?;
+            weight_total TEXT NOT NULL,positive_total INTEGER NOT NULL,negative_total INTEGER NOT NULL,net_delta INTEGER NOT NULL,exported_total INTEGER NOT NULL,rendered_block_count INTEGER NOT NULL,added_file_count INTEGER NOT NULL,labels TEXT NOT NULL,warnings TEXT NOT NULL);").map_err(store::aggregate_error)?;
     let depth: i64 = conn.query_row(
         "SELECT coalesce(max(depth),0)+1 FROM treemap_weights WHERE leaf=0",
         [],
         |r| r.get(0),
     )?;
-    let mut propagate = conn.prepare("UPDATE treemap_weights SET (sb,sa,ab,aa,size_value,allocated_value,before_file,after_file,added,removed,type_changed,modified)=(SELECT coalesce(sum(c.sb),0),coalesce(sum(c.sa),0),coalesce(sum(c.ab),0),coalesce(sum(c.aa),0),coalesce(sum(c.size_value),0),coalesce(sum(c.allocated_value),0),coalesce(sum(c.before_file),0),coalesce(sum(c.after_file),0),coalesce(sum(c.added),0),coalesce(sum(c.removed),0),coalesce(sum(c.type_changed),0),coalesce(sum(c.modified),0) FROM treemap_weights c INDEXED BY treemap_parent WHERE c.parent_id=treemap_weights.key) WHERE depth=?1 AND leaf=0")?;
+    let mut propagate=conn.prepare("UPDATE treemap_weights SET (sb,sa,ab,aa,ds,da,size_value,allocated_value,before_file,after_file,added,removed,type_changed,modified)=(SELECT coalesce(sum(c.sb),0),coalesce(sum(c.sa),0),coalesce(sum(c.ab),0),coalesce(sum(c.aa),0),sum_change_weight(c.ds),sum_change_weight(c.da),coalesce(sum(c.size_value),0),coalesce(sum(c.allocated_value),0),coalesce(sum(c.before_file),0),coalesce(sum(c.after_file),0),coalesce(sum(c.added),0),coalesce(sum(c.removed),0),coalesce(sum(c.type_changed),0),coalesce(sum(c.modified),0) FROM treemap_weights c INDEXED BY treemap_parent WHERE c.parent_id=treemap_weights.key) WHERE depth=?1 AND leaf=0")?;
     for d in (1..depth).rev() {
         control.check()?;
         propagate.execute([d]).map_err(store::aggregate_error)?;
@@ -176,6 +248,7 @@ fn ensure_frame(conn: &Connection, metric: Metric, mode: ChartMode, max_depth: u
     let conn = writer.as_ref().unwrap_or(conn);
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
     conn.execute_batch("PRAGMA cache_size=-65536; PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-32768; PRAGMA mmap_size=536870912;")?;
+    register_change_weights(conn)?;
     let transaction = conn.unchecked_transaction()?;
     let control = JobControl::default();
     let mut pixels = vec![0u8; ATLAS_WIDTH as usize * ATLAS_HEIGHT as usize * 4];
@@ -253,10 +326,9 @@ fn generate(
     }
     let totals = totals(conn, metric, mode)?;
     let before = cache_view(metric, ChartMode::Before, max_depth);
-    // A Delta frame is a different rendering of the same immutable geometry.
     let equal = matches!(mode, ChartMode::After) && conn.query_row(
         &format!("SELECT NOT EXISTS(SELECT 1 FROM treemap_weights w JOIN comparison_nodes c ON c.node_id=w.node_id WHERE w.{}!=w.{} OR (w.leaf=0 AND coalesce(c.before_kind='directory',0)!=coalesce(c.after_kind='directory',0)))", COLUMNS[view(metric, ChartMode::Before)], COLUMNS[view(metric, mode)]), [], |r| r.get::<_, bool>(0))?;
-    let geometry = if matches!(mode, ChartMode::Delta) || equal {
+    let geometry = if equal {
         geometry_view(conn, before)?
     } else {
         v
@@ -293,7 +365,12 @@ fn generate(
         } else {
             1
         };
-        let mut parents = conn.prepare("SELECT w.key,r.x,r.y,r.width,r.height,r.weight,coalesce(CASE WHEN ?3=0 THEN c.before_kind ELSE c.after_kind END='directory',0) FROM treemap_weights w INDEXED BY treemap_depth JOIN treemap_rects r ON r.view=?1 AND r.key=w.key JOIN comparison_nodes c ON c.node_id=w.node_id WHERE w.depth=?2 AND w.leaf=0 ORDER BY w.key")?;
+        let side = if matches!(mode, ChartMode::Delta) {
+            2
+        } else {
+            side
+        };
+        let mut parents=conn.prepare("SELECT w.key,r.x,r.y,r.width,r.height,r.weight,CASE WHEN ?3=2 THEN c.expandable ELSE coalesce(CASE WHEN ?3=0 THEN c.before_kind ELSE c.after_kind END='directory',0) END FROM treemap_weights w INDEXED BY treemap_depth JOIN treemap_rects r ON r.view=?1 AND r.key=w.key JOIN comparison_nodes c ON c.node_id=w.node_id WHERE w.depth=?2 AND w.leaf=0 ORDER BY w.key")?;
         let end = if max_depth == 0 {
             depth
         } else {
@@ -328,7 +405,7 @@ fn generate(
                         params![v, key],
                     )?;
                 } else {
-                    layout.parent(key, content, row.get(5)?)?;
+                    layout.parent(key, content, row_weight(row, 5)?)?;
                 }
             }
         }
@@ -359,7 +436,7 @@ fn generate(
     };
     control.check()?;
     let (labels, rendered) = frame_labels(conn, control, geometry, mode)?;
-    let warnings = frame_warnings(conn, metric, mode, totals.added)?;
+    let warnings = frame_warnings(mode);
     conn.execute(
         "INSERT INTO treemap_frames VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
@@ -367,7 +444,7 @@ fn generate(
             png,
             totals.files,
             totals.visible,
-            totals.weight,
+            totals.weight.to_string(),
             totals.positive,
             totals.negative,
             totals.net,
@@ -386,7 +463,7 @@ fn png_error(e: png::EncodingError) -> ApiError {
 struct Totals {
     files: i64,
     visible: i64,
-    weight: i64,
+    weight: u64,
     positive: i64,
     negative: i64,
     net: i64,
@@ -404,18 +481,23 @@ fn totals(conn: &Connection, metric: Metric, mode: ChartMode) -> Result<Totals> 
         ChartMode::After => "sum(after_file)",
         ChartMode::Delta => "count(*)",
     };
-    let visible = if matches!(mode, ChartMode::Delta) {
-        "added>0 OR removed>0 OR type_changed>0 OR modified>0"
+    let weight_sum = if matches!(mode, ChartMode::Delta) {
+        format!("sum_change_weight({})", COLUMNS[v])
     } else {
-        "1"
+        format!("coalesce(sum({}),0)", COLUMNS[v])
     };
-    let sql = format!("SELECT coalesce({files},0),coalesce(sum({w}>0 AND ({visible})),0),coalesce(sum({w}),0),coalesce(sum(CASE WHEN {value}>0 THEN {value} ELSE 0 END),0),coalesce(sum(CASE WHEN {value}<0 THEN -{value} ELSE 0 END),0),coalesce(sum({value}),0),coalesce(sum(added),0) FROM treemap_weights WHERE leaf=1", w=COLUMNS[v]);
+    let zero = if matches!(mode, ChartMode::Delta) {
+        "x'0000000000000000'"
+    } else {
+        "0"
+    };
+    let sql=format!("SELECT coalesce({files},0),coalesce(sum({w}>{zero}),0),{weight_sum},coalesce(sum(CASE WHEN {value}>0 THEN {value} ELSE 0 END),0),coalesce(sum(CASE WHEN {value}<0 THEN -{value} ELSE 0 END),0),coalesce(sum({value}),0),coalesce(sum(added),0) FROM treemap_weights WHERE leaf=1",w=COLUMNS[v]);
     let mut t = conn
         .query_row(&sql, [], |r| {
             Ok(Totals {
                 files: r.get(0)?,
                 visible: r.get(1)?,
-                weight: r.get(2)?,
+                weight: row_weight(r, 2)?,
                 positive: r.get(3)?,
                 negative: r.get(4)?,
                 net: r.get(5)?,
@@ -449,16 +531,16 @@ struct BoxRect {
 }
 #[derive(Clone, Copy)]
 struct Key {
-    weight: i64,
+    weight: u64,
     key: i64,
 }
-// Each immutable record is key + four f64 bounds + i64 weight + flags/RGB.
+// Each immutable record is key + four f64 bounds + u64 weight + flags/RGB.
 // Directory decoration is tiny mutable metadata, never a rewrite of file blocks.
 #[derive(Clone, Copy)]
 struct Geometry {
     key: i64,
     rect: BoxRect,
-    weight: i64,
+    weight: u64,
     leaf: bool,
     header: f64,
     color: [u8; 3],
@@ -475,7 +557,7 @@ impl Geometry {
                 w: f64::from_le_bytes(word(24)),
                 h: f64::from_le_bytes(word(32)),
             },
-            weight: i64::from_le_bytes(word(40)),
+            weight: u64::from_le_bytes(word(40)),
             leaf: data[48] != 0,
             header: 0.0,
             color: [data[49], data[50], data[51]],
@@ -851,13 +933,18 @@ impl<'a> Layout<'a> {
         } else {
             ("ab", "aa")
         };
-        let base = format!(
-            "FROM treemap_weights INDEXED BY treemap_order_{order} WHERE parent_id=?1 AND {col}>0"
-        );
-        let value = col;
-        conn.execute_batch(&format!(
-            "CREATE INDEX IF NOT EXISTS treemap_order_{order} ON treemap_weights(parent_id,{col} DESC,key DESC) WHERE {col}>0"
-        ))?;
+        let zero = if order % 3 == 2 {
+            "x'0000000000000000'"
+        } else {
+            "0"
+        };
+        let base=format!("FROM treemap_weights INDEXED BY treemap_order_{order} WHERE parent_id=?1 AND {col}>{zero}");
+        let value = match order {
+            2 => "size_value",
+            5 => "allocated_value",
+            _ => col,
+        };
+        conn.execute_batch(&format!("CREATE INDEX IF NOT EXISTS treemap_order_{order} ON treemap_weights(parent_id,{col} DESC,key DESC) WHERE {col}>{zero}"))?;
         Ok(Self {control,v,
             scan:conn.prepare(&format!("SELECT key,{col} {base} ORDER BY {col} DESC,key DESC"))?,
             range:conn.prepare(&format!("SELECT key,node_id,leaf,{col},{value},color,added,removed,type_changed,modified {base} AND ({col},key)<=(?2,?3) AND ({col},key)>=(?4,?5) ORDER BY {col} DESC,key DESC"))?,
@@ -880,7 +967,7 @@ impl<'a> Layout<'a> {
         }
         Ok(())
     }
-    fn parent(&mut self, parent: i64, mut rect: BoxRect, mut remaining: i64) -> Result<()> {
+    fn parent(&mut self, parent: i64, mut rect: BoxRect, mut remaining: u64) -> Result<()> {
         self.control.check()?;
         if self.after && self.same.query_row([parent], |r| r.get::<_, bool>(0))? {
             let old = if parent == 0 {
@@ -975,8 +1062,8 @@ impl<'a> Layout<'a> {
                         r.y,
                         r.w,
                         r.h,
-                        g.weight,
-                        g.weight
+                        UnsignedWeight(g.weight.to_be_bytes()),
+                        g.weight as i64
                     ])?;
                 }
             }
@@ -988,9 +1075,9 @@ impl<'a> Layout<'a> {
         let mut scan = self.scan.query([parent])?;
         let mut start: Option<Key> = None;
         let mut end = Key { weight: 0, key: 0 };
-        let mut sum = 0i64;
-        let mut min = 0i64;
-        let mut max = 0i64;
+        let mut sum = 0u64;
+        let mut min = 0u64;
+        let mut max = 0u64;
         while let Some(row) = scan.next()? {
             self.ticks += 1;
             if self.ticks % 512 == 0 {
@@ -998,9 +1085,9 @@ impl<'a> Layout<'a> {
             }
             let next = Key {
                 key: row.get(0)?,
-                weight: row.get(1)?,
+                weight: row_weight(row, 1)?,
             };
-            let candidate = store::checked_add(sum, next.weight, "treemap row")?;
+            let candidate = weight_sum(sum, next.weight)?;
             if start.is_some()
                 && worst(
                     candidate,
@@ -1034,7 +1121,7 @@ impl<'a> Layout<'a> {
                 min = next.weight;
                 max = next.weight;
             }
-            sum = store::checked_add(sum, next.weight, "treemap row")?;
+            sum = weight_sum(sum, next.weight)?;
             min = min.min(next.weight);
             max = max.max(next.weight);
             end = next;
@@ -1068,7 +1155,7 @@ impl<'a> Layout<'a> {
         Ok(())
     }
 }
-fn worst(sum: i64, min: i64, max: i64, r: BoxRect, remaining: i64) -> f64 {
+fn worst(sum: u64, min: u64, max: u64, r: BoxRect, remaining: u64) -> f64 {
     let scale = r.w * r.h / remaining as f64;
     let short = r.w.min(r.h);
     let area = sum as f64 * scale;
@@ -1086,9 +1173,9 @@ fn place_row(
     parent: i64,
     start: Key,
     end: Key,
-    sum: i64,
+    sum: u64,
     r: &mut BoxRect,
-    remaining: i64,
+    remaining: u64,
     ticks: &mut u64,
 ) -> Result<()> {
     let vertical = r.w >= r.h;
@@ -1102,16 +1189,16 @@ fn place_row(
     let mut offset = 0.0;
     // Scalar equality exposes the final key range to SQLite when the endpoints
     // have the same weight; a tuple range alone scans the entire equal tier.
+    let first = UnsignedWeight(start.weight.to_be_bytes());
+    let last = UnsignedWeight(end.weight.to_be_bytes());
+    let first_integer = start.weight as i64;
+    let last_integer = end.weight as i64;
+    let first_param: &dyn rusqlite::ToSql = if v % 3 == 2 { &first } else { &first_integer };
+    let last_param: &dyn rusqlite::ToSql = if v % 3 == 2 { &last } else { &last_integer };
     let mut rows = if start.weight == end.weight {
-        equal_range.query(params![parent, start.weight, start.key, end.key])?
+        equal_range.query(params![parent, first_param, start.key, end.key])?
     } else {
-        range.query(params![
-            parent,
-            start.weight,
-            start.key,
-            end.weight,
-            end.key
-        ])?
+        range.query(params![parent, first_param, start.key, last_param, end.key])?
     };
     while let Some(row) = rows.next()? {
         *ticks += 1;
@@ -1121,7 +1208,7 @@ fn place_row(
         let key: i64 = row.get(0)?;
         let node: i64 = row.get(1)?;
         let leaf: i64 = row.get(2)?;
-        let weight: i64 = row.get(3)?;
+        let weight = row_weight(row, 3)?;
         let value: i64 = row.get(4)?;
         let segment = length * (weight as f64 / sum as f64);
         let b = if vertical {
@@ -1144,12 +1231,30 @@ fn place_row(
         let w = b.w / ATLAS_WIDTH as f64;
         let h = b.h / ATLAS_HEIGHT as f64;
         if leaf == 0 {
-            insert.execute(params![v, key, node, leaf, x, y, w, h, weight, value])?;
+            insert.execute(params![
+                v,
+                key,
+                node,
+                leaf,
+                x,
+                y,
+                w,
+                h,
+                UnsignedWeight(weight.to_be_bytes()),
+                value
+            ])?;
         }
         let mut marks = 0u8;
         for (col, bit) in [(6, 1), (7, 2), (8, 4), (9, 8)] {
             if row.get::<_, i64>(col)? > 0 {
                 marks |= bit;
+            }
+        }
+        if v % 3 == 2 {
+            if value > 0 {
+                marks |= 16;
+            } else if value < 0 {
+                marks |= 32;
             }
         }
         let color = if leaf == 0 {
@@ -1272,33 +1377,8 @@ fn paint(
         }
     }
     if matches!(mode, ChartMode::Delta) {
-        let baseline = if v % 6 < 3 { "sb" } else { "ab" };
-        let mut query=conn.prepare(&format!("SELECT r.x,r.y,r.width,r.height,EXISTS(SELECT 1 FROM treemap_weights child WHERE child.parent_id=w.key AND child.added>0 AND child.{baseline}=0),0,CASE WHEN c.status='typeChanged' THEN w.type_changed ELSE 0 END,0 FROM treemap_rects r JOIN treemap_weights w ON w.key=r.key JOIN comparison_nodes c ON c.node_id=r.node_id WHERE r.view=?1 AND r.leaf=0 AND (w.added>0 OR c.status='typeChanged') ORDER BY r.id"))?;
-        let mut rows = query.query([v])?;
-        // Containers first, then every leaf in original deterministic paint order.
-        while let Some(row) = rows.next()? {
-            control.check()?;
-            let mut marks = 0;
-            for (col, bit) in [(4, 1), (5, 2), (6, 4), (7, 8)] {
-                if row.get::<_, i64>(col)? > 0 {
-                    marks |= bit;
-                }
-            }
-            mark(
-                pixels,
-                BoxRect {
-                    x: row.get(0)?,
-                    y: row.get(1)?,
-                    w: row.get(2)?,
-                    h: row.get(3)?,
-                },
-                marks,
-            );
-        }
         scan_geometry(conn, control, v, |g| {
-            if g.leaf {
-                mark(pixels, g.rect, g.marks);
-            }
+            mark(pixels, g.rect, g.marks);
             Ok(())
         })?;
     }
@@ -1321,7 +1401,17 @@ fn mark(pixels: &mut [u8], r: BoxRect, marks: u8) {
     let mut inset = 0;
     for (bit, color, dashed) in [
         (4, [148, 114, 204], false),
-        (8, [225, 183, 80], false),
+        (
+            8,
+            if marks & 16 != 0 {
+                [35, 148, 107]
+            } else if marks & 32 != 0 {
+                [218, 83, 97]
+            } else {
+                [225, 183, 80]
+            },
+            false,
+        ),
         (2, [218, 83, 97], true),
         (1, [35, 148, 107], true),
     ] {
@@ -1351,7 +1441,7 @@ fn border(
     let ex = ex - inset;
     let ey = ey - inset;
     // Six atlas pixels survive the normal ~4x downscale. Small tiles
-    // retain most extension fill; no global status-colour area replaces the baseline.
+    // retain most extension fill beneath change-direction and status markers.
     let thickness = 6.min(((ex - x).min(ey - y) / 6).max(1));
     for layer in 0..thickness {
         for px in x..ex {
@@ -1384,21 +1474,29 @@ fn darken(pixels: &mut [u8], x: u32, y: u32) {
 fn json_error(e: serde_json::Error) -> ApiError {
     ApiError::new("CACHE_ERROR", e.to_string())
 }
+fn metadata_side(conn: &Connection, key: i64, mode: ChartMode) -> Result<i64> {
+    match mode {
+        ChartMode::Before=>Ok(0),ChartMode::After=>Ok(1),
+        ChartMode::Delta=>Ok(conn.query_row("SELECT CASE WHEN ?2<0 THEN after_kind='file' ELSE after_kind IS NOT NULL END FROM comparison_nodes WHERE node_id=?1",params![key.abs(),key],|r|r.get::<_,Option<i64>>(0))?.unwrap_or(0)),
+    }
+}
 fn frame_labels(
     conn: &Connection,
     control: &JobControl,
     v: i64,
     mode: ChartMode,
 ) -> Result<(Vec<TreemapLabel>, i64)> {
-    let side = if matches!(mode, ChartMode::After) {
-        1
-    } else {
+    let side = if matches!(mode, ChartMode::Delta) {
+        2
+    } else if matches!(mode, ChartMode::Before) {
         0
+    } else {
+        1
     };
     let mut directories = Vec::<Geometry>::with_capacity(257);
     let mut files = Vec::<Geometry>::with_capacity(65);
     let mut rendered = 0;
-    let mut kind = conn.prepare("SELECT kind FROM entries WHERE node_id=?1 AND side=?2")?;
+    let mut kind=conn.prepare("SELECT CASE WHEN ?2=2 THEN CASE WHEN c.expandable=1 THEN 'directory' ELSE 'file' END ELSE (SELECT kind FROM entries WHERE node_id=?1 AND side=?2) END FROM comparison_nodes c WHERE c.node_id=?1")?;
     scan_geometry(conn, control, v, |g| {
         if !g.visible(mode) {
             return Ok(());
@@ -1436,6 +1534,7 @@ fn frame_labels(
     let mut meta=conn.prepare("SELECT n.name,e.path FROM nodes n JOIN entries e ON e.node_id=n.id AND e.side=?2 WHERE n.id=?1")?;
     for (kind, list) in [(NodeKind::Directory, directories), (NodeKind::File, files)] {
         for g in list {
+            let side = metadata_side(conn, g.key, mode)?;
             let (name, path) = meta.query_row(params![g.node(), side], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?;
@@ -1458,37 +1557,12 @@ fn frame_labels(
     }
     Ok((labels, rendered))
 }
-fn frame_warnings(
-    conn: &Connection,
-    metric: Metric,
-    mode: ChartMode,
-    added: i64,
-) -> Result<Vec<String>> {
+fn frame_warnings(mode: ChartMode) -> Vec<String> {
     let mut warnings=vec!["全局实际文件汇总；目录标题和边距是结构装饰，不另计占用。零权重文件计入数量但不占面积。有限深度下，截断目录包含全部后代文件，选择隐藏文件会定位到可见祖先。".into()];
     if matches!(mode, ChartMode::Delta) {
-        let col = COLUMNS[view(metric, ChartMode::Before)];
-        let unanchored: i64 = conn.query_row(
-            &format!(
-                "SELECT coalesce(sum(added),0) FROM treemap_weights WHERE parent_id=0 AND {col}=0"
-            ),
-            [],
-            |r| r.get(0),
-        )?;
-        if added > 0 {
-            warnings.push(format!(
-                "新增文件 {added} 个：使用最近可见之前祖先的虚线框提示，不分配新增面积。"
-            ));
-        }
-        if unanchored > 0 {
-            warnings.push(format!("其中 {unanchored} 个新增文件没有之前占用的祖先，无法在基线图定位；请查看之后模式/目录树。以下最多列出 16 个路径："));
-            let mut query=conn.prepare(&format!("WITH RECURSIVE missing(key) AS (SELECT key FROM treemap_weights WHERE parent_id=0 AND {col}=0 AND added>0 UNION ALL SELECT w.key FROM treemap_weights w JOIN missing m ON w.parent_id=m.key WHERE w.added>0) SELECT e.path FROM missing m JOIN treemap_weights w ON w.key=m.key JOIN entries e ON e.node_id=w.node_id AND e.side=1 WHERE w.leaf=1 ORDER BY w.node_id LIMIT 16"))?;
-            let mut paths = query.query([])?;
-            while let Some(row) = paths.next()? {
-                warnings.push(row.get(0)?);
-            }
-        }
+        warnings.push("差异块按所选指标的增减绝对值重排并铺满全图；新增与删除均有独立面积，目录面积为后代绝对变化之和，净值为零不代表没有变化。所选指标变化为零的项目不占面积。".into());
     }
-    Ok(warnings)
+    warnings
 }
 pub fn get_frame(
     conn: &Connection,
@@ -1517,7 +1591,7 @@ pub fn get_frame(
         rendered_block_count: row.get::<_, i64>(8)? as u64,
         max_depth,
         added_file_count: row.get::<_, i64>(9)? as u64,
-        weight_total: row.get::<_, i64>(3)?.to_string(),
+        weight_total: row.get(3)?,
         positive_total: row.get::<_, i64>(4)?.to_string(),
         negative_total: row.get::<_, i64>(5)?.to_string(),
         net_delta: row.get::<_, i64>(6)?.to_string(),
@@ -1541,7 +1615,18 @@ pub fn get_bounds(
         return Err(ApiError::new("INVALID_NODE", "节点不存在或已过期"));
     }
     ensure_frame(conn, metric, mode, max_depth)?;
-    if matches!(mode,ChartMode::Delta) && !conn.query_row("SELECT added>0 OR removed>0 OR type_changed>0 OR modified>0 FROM treemap_weights WHERE key=?1",[n],|r|r.get::<_,bool>(0))? {return Ok(None);}
+    if matches!(mode, ChartMode::Delta)
+        && !conn.query_row(
+            &format!(
+                "SELECT {}>x'0000000000000000' FROM treemap_weights WHERE key=?1",
+                COLUMNS[view(metric, mode)]
+            ),
+            [n],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        return Ok(None);
+    }
     let v = geometry_view(conn, cache_view(metric, mode, max_depth))?;
     let mut ancestors=conn.prepare("WITH RECURSIVE ancestors(id,parent_id,d) AS (SELECT id,parent_id,0 FROM nodes WHERE id=?1 UNION ALL SELECT n.id,n.parent_id,a.d+1 FROM nodes n JOIN ancestors a ON n.id=a.parent_id) SELECT id FROM ancestors ORDER BY d")?;
     let mut rows = ancestors.query([n])?;
@@ -1570,11 +1655,6 @@ pub fn hit_test(
         ));
     }
     ensure_frame(conn, metric, mode, max_depth)?;
-    let side = if matches!(mode, ChartMode::After) {
-        1
-    } else {
-        0
-    };
     let v = geometry_view(conn, cache_view(metric, mode, max_depth))?;
     let mut blocks=conn.prepare("SELECT b.id,b.data,b.source,b.start,b.count,r.sx,r.sy,r.tx,r.ty FROM treemap_spatial s CROSS JOIN treemap_blocks b ON b.id=s.id LEFT JOIN treemap_reuse r ON r.id=b.reuse_id WHERE s.x0<=?2 AND s.x1>=?2 AND s.y0<=?3 AND s.y1>=?3 AND b.view=?1")?;
     let mut directory =
@@ -1604,6 +1684,7 @@ pub fn hit_test(
         Ok(())
     })?;
     let Some(g) = selected else { return Ok(None) };
+    let side = metadata_side(conn, g.key, mode)?;
     let value = if matches!(mode, ChartMode::Delta) {
         if matches!(metric, Metric::Size) {
             "w.size_value+0*?4"
@@ -1615,9 +1696,22 @@ pub fn hit_test(
     };
     let mut query=conn.prepare(&format!("SELECT n.name,coalesce(ep.path||e.suffix,n.path),coalesce(e.extension,''),{value},c.status,coalesce(es.kind=1,0),w.leaf,w.added,w.removed,w.type_changed,w.modified FROM nodes n JOIN comparison_nodes c ON c.node_id=n.id JOIN treemap_weights w ON w.key=?1 LEFT JOIN snapshot_entries es ON es.node_id=n.id AND es.side=?3 LEFT JOIN entry_values e ON e.id=es.value_id LEFT JOIN path_prefixes ep ON ep.id=e.prefix_id WHERE n.id=?2"))?;
     Ok(Some(query.query_row(
-        params![g.key, g.node(), side, g.weight],
+        params![
+            g.key,
+            g.node(),
+            side,
+            if matches!(mode, ChartMode::Delta) {
+                0i64
+            } else {
+                g.weight as i64
+            }
+        ],
         |r| {
-            let is_directory = r.get::<_, bool>(5)?;
+            let is_directory = if matches!(mode, ChartMode::Delta) {
+                g.key > 0 && r.get::<_, i64>(6)? == 0
+            } else {
+                r.get::<_, bool>(5)?
+            };
             let status = if is_directory {
                 if r.get::<_, i64>(9)? > 0 {
                     Status::TypeChanged

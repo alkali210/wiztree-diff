@@ -344,7 +344,7 @@ export function OccupancyCharts({
           {BigInt(data.weightTotal) === 0n && (
             <div className="canvas-empty">
               {mode === "delta"
-                ? "之前无非零占用；新增项目见之后视图"
+                ? "所选指标无非零变化"
                 : "无非零占用"}
             </div>
           )}
@@ -374,7 +374,7 @@ export function OccupancyCharts({
                   ? signed(shownHover.hit.value)
                   : bytes(shownHover.hit.value)}
                 {mode === "delta" && (
-                  <> · 之前 {bytes(shownHover.hit.weight)}</>
+                  <> · 绝对变化 {bytes(shownHover.hit.weight)}</>
                 )}
               </span>
               <small>
@@ -397,15 +397,15 @@ export function OccupancyCharts({
             {maxDepth === 0 ? "无限制" : maxDepth}
           </span>
           <span title={data.weightTotal + " B"}>
-            {mode === "delta" ? "之前文件路径合计" : "文件路径合计"}{" "}
+            {mode === "delta" ? "绝对变化合计" : "文件路径合计"}{" "}
             {bytes(data.weightTotal)}
           </span>
           {mode === "delta" && (
             <>
-              <span className="scope-note">之前布局 · 仅差异块</span>
+              <span className="scope-note">按变化量重排 · 仅差异块</span>
               {data.addedFileCount > 0 && (
-                <span title="新增文件没有之前面积；通过祖先边框提示，完整新增项目可在之后视图或目录树查看">
-                  新增 {data.addedFileCount.toLocaleString()} 文件（见之后视图）
+                <span title="新增文件按所选指标的增长量分配面积">
+                  新增 {data.addedFileCount.toLocaleString()} 文件
                 </span>
               )}
               <span className="positive">
