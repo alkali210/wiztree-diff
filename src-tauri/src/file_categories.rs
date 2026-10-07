@@ -1,5 +1,7 @@
-use crate::{store, types::*};
-use rusqlite::{params, Connection};
+use crate::{
+    store::{self, Comparison},
+    types::*,
+};
 
 pub const CATEGORIES: [&str; 8] = [
     "code",
@@ -75,51 +77,30 @@ pub fn category(name: &str) -> &'static str {
     "other"
 }
 
-/// Persist the fixed-size counters collected while parsing this snapshot.
-pub(crate) fn save_import(conn: &Connection, side: i64, categories: &[[i64; 3]; 8]) -> Result<()> {
-    let mut insert = conn.prepare("INSERT INTO file_category_stats VALUES(?1,?2,?3,?4,?5)")?;
-    for (index, v) in categories.iter().enumerate() {
-        insert.execute(params![side, CATEGORIES[index], v[0], v[1], v[2]])?;
-    }
-    Ok(())
-}
-
-fn value(v: [i64; 3]) -> TypeValue {
+fn value(v: [u64; 3]) -> TypeValue {
     TypeValue {
         size: v[0].to_string(),
         allocated: v[1].to_string(),
-        files: v[2] as u64,
+        files: v[2],
     }
 }
 
-pub fn get_file_categories(conn: &Connection) -> Result<FileCategoriesData> {
-    let mut items: Vec<_> = CATEGORIES
+pub fn get_file_categories(comparison: &Comparison) -> Result<FileCategoriesData> {
+    let items = CATEGORIES
         .iter()
-        .map(|c| FileCategoryItem {
-            category: (*c).into(),
-            before: value([0; 3]),
-            after: value([0; 3]),
+        .enumerate()
+        .map(|(index, category)| FileCategoryItem {
+            category: (*category).into(),
+            before: value(comparison.categories[0][index]),
+            after: value(comparison.categories[1][index]),
         })
         .collect();
-    let mut totals = [[0i64; 3]; 2];
-    let mut stmt =
-        conn.prepare("SELECT side,category,size,allocated,files FROM file_category_stats")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let side: usize = row.get(0)?;
-        let category = store::root_text(row, 1)?;
-        let index = CATEGORIES
-            .iter()
-            .position(|c| *c == category)
-            .ok_or_else(|| ApiError::new("CACHE_INVALID", "无效文件类别"))?;
-        let v = [row.get(2)?, row.get(3)?, row.get(4)?];
-        for i in 0..3 {
-            totals[side][i] = store::checked_add(totals[side][i], v[i], "文件类别汇总")?;
-        }
-        if side == 0 {
-            items[index].before = value(v);
-        } else {
-            items[index].after = value(v);
+    let mut totals = [[0u64; 3]; 2];
+    for (side, categories) in comparison.categories.iter().enumerate() {
+        for values in categories {
+            for (total, value) in totals[side].iter_mut().zip(values) {
+                *total = store::checked_add(*total, *value, "文件类别汇总")?;
+            }
         }
     }
     Ok(FileCategoriesData {

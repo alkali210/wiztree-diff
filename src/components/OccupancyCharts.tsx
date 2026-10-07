@@ -8,6 +8,15 @@ import type {
   TreemapHit,
   TreemapRect,
 } from "../types";
+interface LayoutLease {
+  data: FullTreemapData;
+  released: boolean;
+}
+function release(lease: LayoutLease | null) {
+  if (!lease || lease.released) return;
+  lease.released = true;
+  void api.releaseTreemap(lease.data.comparisonId, lease.data.layoutId).catch(() => {});
+}
 interface Props {
   comparisonId: string;
   metric: Metric;
@@ -49,98 +58,103 @@ export function OccupancyCharts({
 }: Props) {
   const [maxDepth, setMaxDepth] = useState(0);
   const [depthInput, setDepthInput] = useState(String(maxDepth));
-  const key = JSON.stringify([comparisonId, metric, mode, maxDepth]);
-  const frameCache = useRef({
-    comparisonId,
-    maxDepth,
-    frames: new Map<string, FullTreemapData>(),
-  });
-  if (
-    frameCache.current.comparisonId !== comparisonId ||
-    frameCache.current.maxDepth !== maxDepth
-  ) {
-    frameCache.current = { comparisonId, maxDepth, frames: new Map() };
-  }
-  const [frame, setFrame] = useState<{
-      key: string;
-      data: FullTreemapData;
-    } | null>(null),
+  const [retry, setRetry] = useState(0);
+  const key = JSON.stringify([comparisonId, metric, mode, maxDepth, retry]);
+  const epoch = useRef({ key, value: 0 });
+  if (epoch.current.key !== key) epoch.current = { key, value: epoch.current.value + 1 };
+  const [frame, setFrame] = useState<{ key: string; lease: LayoutLease } | null>(null),
+    [drawnId, setDrawnId] = useState<string | null>(null),
     [error, setError] = useState(""),
-    [retry, setRetry] = useState(0),
     [bounds, setBounds] = useState<{
-      key: string;
+      layoutId: string;
       nodeId: string;
       rect: TreemapRect | null;
     } | null>(null),
     [hover, setHover] = useState<{
-      key: string;
+      layoutId: string;
       hit: TreemapHit;
       x: number;
       y: number;
     } | null>(null);
   const canvas = useRef<HTMLCanvasElement>(null),
-    image = useRef<HTMLImageElement | null>(null),
+    displayed = useRef<LayoutLease | null>(null),
+    cancellation = useRef<Promise<void>>(Promise.resolve()),
+    mounted = useRef(false),
     pointerSeq = useRef(0),
     clickSeq = useRef(0),
     pending = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const data = frame?.key === key ? frame.data : null,
-    highlight =
-      bounds?.key === key && bounds.nodeId === selectedId ? bounds.rect : null;
+  const lease = frame?.key === key ? frame.lease : null;
+  const data = lease?.data ?? null;
+  const interactive = !!lease && !lease.released && drawnId === data?.layoutId;
+  const highlight = bounds?.layoutId === data?.layoutId && bounds?.nodeId === selectedId
+    ? bounds.rect : null;
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      release(displayed.current);
+      displayed.current = null;
+    };
+  }, []);
   useEffect(() => {
     let live = true;
-    const cache = frameCache.current;
-    const cached = cache.frames.get(key);
-    setFrame(cached ? { key, data: cached } : null);
+    let candidate: LayoutLease | null = null;
+    const token = epoch.current.value;
     setError("");
     setHover(null);
     pointerSeq.current++;
     clickSeq.current++;
-    if (!cached)
-      void api.getFullTreemap(comparisonId, metric, mode, maxDepth).then(
-        (result) => {
-          // Keep only the six metric/mode frames for this comparison and depth.
-          // An old response may finish after switching mode, but cannot enter a
-          // new comparison/depth cache or replace the currently displayed frame.
-          if (frameCache.current === cache) cache.frames.set(key, result);
-          if (live) setFrame({ key, data: result });
-        },
-        (e) => {
-          if (live) setError(errorText(e));
-        },
-      );
+    void (async () => {
+      await cancellation.current;
+      if (!live || epoch.current.value !== token) return;
+      try {
+        const result = await api.getFullTreemap(comparisonId, metric, mode, maxDepth);
+        candidate = { data: result, released: false };
+        if (!live || epoch.current.value !== token || result.comparisonId !== comparisonId) {
+          release(candidate);
+          return;
+        }
+        setFrame({ key, lease: candidate });
+      } catch (e) {
+        if (live && epoch.current.value === token) setError(errorText(e));
+      }
+    })();
     return () => {
       live = false;
       clickSeq.current++;
       pointerSeq.current++;
       if (pending.current) clearTimeout(pending.current);
+      if (candidate !== displayed.current) release(candidate);
+      cancellation.current = cancellation.current.then(() =>
+        api.releaseTreemap(comparisonId, "").catch(() => {}),
+      );
     };
   }, [comparisonId, metric, mode, maxDepth, retry]);
   useEffect(() => {
     let live = true;
+    const token = epoch.current.value;
     setBounds(null);
-    if (selectedId)
-      void api
-        .getTreemapBounds(comparisonId, metric, mode, selectedId, maxDepth)
-        .then(
-          (rect) => {
-            if (live) setBounds({ key, nodeId: selectedId, rect });
-          },
-          (e) => {
-            if (live) setError(errorText(e));
-          },
-        );
-    return () => {
-      live = false;
-    };
-  }, [comparisonId, metric, mode, maxDepth, selectedId]);
+    if (selectedId && data && interactive)
+      void api.getTreemapBounds(data.comparisonId, data.layoutId, selectedId).then(
+        (rect) => {
+          if (live && epoch.current.value === token)
+            setBounds({ layoutId: data.layoutId, nodeId: selectedId, rect });
+        },
+        (e) => {
+          if (live && epoch.current.value === token) setError(errorText(e));
+        },
+      );
+    return () => { live = false; };
+  }, [data, interactive, selectedId]);
   useEffect(() => {
-    if (!data) return;
-    const element = canvas.current!;
+    const element = canvas.current;
+    if (!data || !lease || lease.released || !element) return;
     let live = true;
+    const token = epoch.current.value;
     const bitmap = new Image();
-    image.current = bitmap;
     const draw = () => {
-      if (!live || !bitmap.complete || !bitmap.naturalWidth) return;
+      if (!live || epoch.current.value !== token || lease.released ||
+          !bitmap.complete || !bitmap.naturalWidth) return;
       const b = element.getBoundingClientRect(),
         dpr = window.devicePixelRatio || 1;
       element.width = Math.round(b.width * dpr);
@@ -188,10 +202,19 @@ export function OccupancyCharts({
           Math.max(0, highlight.height * b.height - 2),
         );
       }
+      if (displayed.current !== lease) {
+        const previous = displayed.current;
+        displayed.current = lease;
+        release(previous);
+        setDrawnId(data.layoutId);
+      }
     };
     bitmap.onload = draw;
     bitmap.onerror = () => {
-      if (live) setError("占用图图像无法读取");
+      if (live && epoch.current.value === token) {
+        release(lease);
+        setError("占用图图像无法读取");
+      }
     };
     bitmap.src = data.imageDataUrl;
     const observer = new ResizeObserver(draw);
@@ -202,9 +225,8 @@ export function OccupancyCharts({
       observer.disconnect();
       bitmap.onload = null;
       bitmap.onerror = null;
-      image.current = null;
     };
-  }, [data, highlight]);
+  }, [data, lease, highlight]);
   function point(event: React.MouseEvent<HTMLCanvasElement>) {
     const b = event.currentTarget.getBoundingClientRect();
     return {
@@ -215,38 +237,32 @@ export function OccupancyCharts({
     };
   }
   function move(event: React.MouseEvent<HTMLCanvasElement>) {
-    const p = point(event),
-      seq = ++pointerSeq.current;
+    if (!data || !lease || !interactive) return;
+    const p = point(event), seq = ++pointerSeq.current, token = epoch.current.value;
+    const valid = () => mounted.current && epoch.current.value === token &&
+      seq === pointerSeq.current && displayed.current === lease && !lease.released;
     if (pending.current) clearTimeout(pending.current);
     pending.current = setTimeout(() => {
-      void api
-        .hitTestTreemap(comparisonId, metric, mode, p.x, p.y, maxDepth)
-        .then(
-          (hit) => {
-            if (seq === pointerSeq.current)
-              setHover(hit ? { key, hit, x: p.px, y: p.py } : null);
-          },
-          (e) => {
-            if (seq === pointerSeq.current) setError(errorText(e));
-          },
-        );
+      if (!valid()) return;
+      void api.hitTestTreemap(data.comparisonId, data.layoutId, p.x, p.y).then(
+        (hit) => {
+          if (valid()) setHover(hit ? { layoutId: data.layoutId, hit, x: p.px, y: p.py } : null);
+        },
+        (e) => { if (valid()) setError(errorText(e)); },
+      );
     }, 65);
   }
   function click(event: React.MouseEvent<HTMLCanvasElement>) {
-    const p = point(event),
-      seq = ++clickSeq.current;
-    void api
-      .hitTestTreemap(comparisonId, metric, mode, p.x, p.y, maxDepth)
-      .then(
-        (hit) => {
-          if (seq === clickSeq.current && hit) onSelect(hit.nodeId);
-        },
-        (e) => {
-          if (seq === clickSeq.current) setError(errorText(e));
-        },
-      );
+    if (!data || !lease || !interactive) return;
+    const p = point(event), seq = ++clickSeq.current, token = epoch.current.value;
+    const valid = () => mounted.current && epoch.current.value === token &&
+      seq === clickSeq.current && displayed.current === lease && !lease.released;
+    void api.hitTestTreemap(data.comparisonId, data.layoutId, p.x, p.y).then(
+      (hit) => { if (valid() && hit) onSelect(hit.nodeId); },
+      (e) => { if (valid()) setError(errorText(e)); },
+    );
   }
-  const shownHover = hover?.key === key ? hover : null;
+  const shownHover = interactive && hover?.layoutId === data?.layoutId ? hover : null;
   return (
     <section className="charts-panel">
       <header className="charts-heading">
@@ -332,6 +348,8 @@ export function OccupancyCharts({
             data-chart-mode={mode}
             data-map-scope="all-files"
             data-max-depth={maxDepth}
+            data-layout-id={interactive ? data.layoutId : undefined}
+            aria-busy={!interactive}
             aria-label="全部文件层级占用图"
             onMouseMove={move}
             onMouseLeave={() => {

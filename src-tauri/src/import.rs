@@ -1,20 +1,14 @@
 use crate::types::*;
-use rusqlite::{Connection, InterruptHandle, OptionalExtension};
 use std::{
-    collections::HashMap,
     fs::File,
     io::{self, Read},
     path::Path,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex,
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 #[derive(Default)]
 pub struct JobControl {
     pub cancelled: AtomicBool,
-    pub interrupt: Mutex<Option<InterruptHandle>>,
 }
 impl JobControl {
     pub fn new() -> Self {
@@ -22,11 +16,6 @@ impl JobControl {
     }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        if let Ok(handle) = self.interrupt.lock() {
-            if let Some(handle) = handle.as_ref() {
-                handle.interrupt();
-            }
-        }
     }
     pub fn check(&self) -> Result<()> {
         if self.cancelled.load(Ordering::Relaxed) {
@@ -176,45 +165,28 @@ fn raw_parts(path: &str) -> (&str, &str) {
     }
 }
 
-struct Prefixes<'a> {
-    conn: &'a Connection,
-    insert: rusqlite::Statement<'a>,
-    lookup: rusqlite::Statement<'a>,
-    ids: HashMap<String, i64>,
-}
-impl<'a> Prefixes<'a> {
-    fn new(conn: &'a Connection) -> Result<Self> {
-        Ok(Self {
-            conn,
-            insert: conn.prepare("INSERT INTO path_prefixes(path) VALUES(?1) ON CONFLICT(path) DO NOTHING")?,
-            lookup: conn.prepare("SELECT id FROM path_prefixes WHERE path=?1")?,
-            ids: HashMap::with_capacity(4096),
-        })
-    }
-    fn intern(&mut self, path: &str) -> Result<i64> {
-        if let Some(id) = self.ids.get(path) {
-            return Ok(*id);
-        }
-        let id = if self.insert.execute([path])? != 0 {
-            self.conn.last_insert_rowid()
-        } else {
-            self.lookup.query_row([path], |r| r.get(0))?
-        };
-        if self.ids.len() == 4096 {
-            self.ids.clear();
-        }
-        self.ids.insert(path.to_owned(), id);
-        Ok(id)
-    }
+pub struct ParsedRow<'a> {
+    pub original: &'a str,
+    pub key: &'a str,
+    pub parent: Option<&'a str>,
+    pub name: &'a str,
+    pub depth: u32,
+    pub kind: NodeKind,
+    pub size: u64,
+    pub allocated: u64,
+    pub values: [Option<&'a str>; 14],
+    pub record: u64,
 }
 
+/// Parse with reusable buffers; the consumer must not retain references to a CSV record.
 pub fn load(
-    conn: &Connection,
     path: &Path,
-    side: i64,
+    side: usize,
     control: &JobControl,
     progress: &mut dyn FnMut(Progress),
+    mut consume: impl FnMut(ParsedRow<'_>) -> Result<()>,
 ) -> Result<SourceSummary> {
+    control.check()?;
     let initial = std::fs::metadata(path).map_err(|e| source_error(path, e.into()))?;
     let file = File::open(path).map_err(|e| source_error(path, e.into()))?;
     let mut reader = csv::ReaderBuilder::new()
@@ -227,289 +199,200 @@ pub fn load(
     let mut header_width = None;
     let mut description = None;
     let (mut rows, mut files, mut folders) = (0u64, 0u64, 0u64);
-    control.check()?;
-    conn.execute_batch("BEGIN")?;
-    let result = (|| {
-        let mut prefixes = Prefixes::new(conn)?;
-        let mut node = conn.prepare("INSERT INTO node_records(prefix_id,parent_path,name,depth,basename_key,parent_id,extension) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(prefix_id,basename_key) DO NOTHING")?;
-        let mut lookup = conn.prepare("SELECT id FROM node_records WHERE prefix_id=?1 AND basename_key=?2")?;
-        let mut value = conn.prepare("INSERT INTO entry_values(prefix_id,suffix,details,files,folders,mft,volume,extension) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?;
-        let mut matching = conn.prepare("SELECT n.id,CASE WHEN v.prefix_id=?1 AND v.suffix=?2 AND v.details=?3 AND v.files IS ?4 AND v.folders IS ?5 AND v.mft IS ?6 AND v.volume=?7 AND v.extension=?8 THEN v.id END FROM node_records n LEFT JOIN snapshot_entries s ON s.side=0 AND s.node_id=n.id LEFT JOIN entry_values v ON v.id=s.value_id WHERE n.prefix_id=?9 AND n.basename_key=?10")?;
-        let mut entry = conn.prepare("INSERT INTO snapshot_entries(side,node_id,value_id,kind,size,allocated) VALUES(?1,?2,?3,?4,?5,?6)")?;
-        let mut serialized = Vec::with_capacity(1024);
-        let mut paths = PathBuffers::default();
-        let mut categories = [[0i64; 3]; 8];
-        let mut extensions = HashMap::<String, [i64; 3]>::with_capacity(4096);
-        let mut parents = HashMap::<String, i64>::with_capacity(1024);
-        loop {
-            let present = reader.read_record(&mut record).map_err(|e| {
-                let mut error = source_error(
-                    path,
-                    ApiError::new("CSV_ERROR", format!("{e}；请导出 UTF-8 CSV")),
+    let mut paths = PathBuffers::default();
+    loop {
+        let present = reader.read_record(&mut record).map_err(|e| {
+            let mut error = source_error(
+                path,
+                ApiError::new("CSV_ERROR", format!("{e}；请导出 UTF-8 CSV")),
+            );
+            error.record = Some(match e.kind() {
+                csv::ErrorKind::Io(io) => io
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<LexicalError>())
+                    .map_or(reader.position().record() + 1, |e| e.record),
+                _ => e
+                    .position()
+                    .map_or(reader.position().record() + 1, |p| p.record() + 1),
+            });
+            error.column = Some("CSV".into());
+            error
+        })?;
+        if !present {
+            break;
+        }
+        let rec = record
+            .position()
+            .map_or(reader.position().record(), |p| p.record() + 1);
+        if header_width.is_none() {
+            if record
+                .iter()
+                .any(|s| s.trim_start_matches('\u{feff}') == COLUMNS[0])
+            {
+                for (i, column) in COLUMNS.iter().enumerate() {
+                    let mut matches = record
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.trim_start_matches('\u{feff}') == *column);
+                    positions[i] = matches.next().map(|(p, _)| p);
+                    if matches.next().is_some() {
+                        return Err(field_error(path, rec, column, "重复表头"));
+                    }
+                }
+                for i in 0..3 {
+                    if positions[i].is_none() {
+                        return Err(source_error(
+                            path,
+                            ApiError::new(
+                                "UNSUPPORTED_HEADER",
+                                format!("缺少 {}；请按样本选项导出 UTF-8 WizTree CSV", COLUMNS[i]),
+                            ),
+                        ));
+                    }
+                }
+                header_width = Some(record.len());
+            } else if description.is_none() {
+                description = Some(
+                    record
+                        .iter()
+                        .collect::<Vec<_>>()
+                        .join(",")
+                        .trim_start_matches('\u{feff}')
+                        .to_owned(),
                 );
-                error.record = Some(match e.kind() {
-                    csv::ErrorKind::Io(io) => io
-                        .get_ref()
-                        .and_then(|e| e.downcast_ref::<LexicalError>())
-                        .map_or(reader.position().record() + 1, |e| e.record),
-                    _ => e
-                        .position()
-                        .map_or(reader.position().record() + 1, |p| p.record() + 1),
-                });
-                error.column = Some("CSV".into());
-                error
-            })?;
-            if !present {
-                break;
+            } else {
+                return Err(source_error(
+                    path,
+                    ApiError::new("UNSUPPORTED_HEADER", "请按样本选项导出 UTF-8 WizTree CSV"),
+                ));
             }
-            let rec = record
-                .position()
-                .map_or(reader.position().record(), |p| p.record() + 1);
-            if header_width.is_none() {
-                if record
-                    .iter()
-                    .any(|s| s.trim_start_matches('\u{feff}') == COLUMNS[0])
-                {
-                    for (i, column) in COLUMNS.iter().enumerate() {
-                        let mut matches = record
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, s)| s.trim_start_matches('\u{feff}') == *column);
-                        positions[i] = matches.next().map(|(p, _)| p);
-                        if matches.next().is_some() {
-                            return Err(field_error(path, rec, column, "重复表头"));
-                        }
-                    }
-                    for i in 0..3 {
-                        if positions[i].is_none() {
-                            return Err(source_error(
-                                path,
-                                ApiError::new(
-                                    "UNSUPPORTED_HEADER",
-                                    format!(
-                                        "缺少 {}；请按样本选项导出 UTF-8 WizTree CSV",
-                                        COLUMNS[i]
-                                    ),
-                                ),
-                            ));
-                        }
-                    }
-                    header_width = Some(record.len());
-                } else if description.is_none() {
-                    description = Some(
-                        record
-                            .iter()
-                            .collect::<Vec<_>>()
-                            .join(",")
-                            .trim_start_matches('\u{feff}')
-                            .to_owned(),
-                    );
-                } else {
-                    return Err(source_error(
-                        path,
-                        ApiError::new("UNSUPPORTED_HEADER", "请按样本选项导出 UTF-8 WizTree CSV"),
-                    ));
+            continue;
+        }
+        if record.len() > header_width.unwrap() {
+            return Err(field_error(path, rec, "CSV", "记录包含无表头列"));
+        }
+        let get = |i: usize| {
+            positions[i]
+                .and_then(|p| record.get(p))
+                .filter(|v| !v.is_empty())
+        };
+        let number = |i: usize, required: bool| -> Result<Option<u64>> {
+            match get(i) {
+                None if required => Err(field_error(path, rec, COLUMNS[i], "缺少必需值")),
+                None => Ok(None),
+                Some(v) if !v.bytes().all(|b| b.is_ascii_digit()) => {
+                    Err(field_error(path, rec, COLUMNS[i], "必须是非负十进制整数"))
                 }
-                continue;
+                Some(v) => v
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|v| *v <= i64::MAX as u64)
+                    .map(Some)
+                    .ok_or_else(|| field_error(path, rec, COLUMNS[i], "数值超出 i64 范围")),
             }
-            if record.len() > header_width.unwrap() {
-                return Err(field_error(path, rec, "CSV", "记录包含无表头列"));
-            }
-            let get = |i: usize| {
-                positions[i]
-                    .and_then(|p| record.get(p))
-                    .filter(|v| !v.is_empty())
-            };
-            let number = |i: usize, required: bool| -> Result<Option<i64>> {
-                match get(i) {
-                    None if required => Err(field_error(path, rec, COLUMNS[i], "缺少必需值")),
-                    None => Ok(None),
-                    Some(v) if !v.bytes().all(|b| b.is_ascii_digit()) => {
-                        Err(field_error(path, rec, COLUMNS[i], "必须是非负十进制整数"))
-                    }
-                    Some(v) => v
-                        .parse()
-                        .map(Some)
-                        .map_err(|_| field_error(path, rec, COLUMNS[i], "数值超出 i64 范围")),
-                }
-            };
-            let original = get(0).ok_or_else(|| field_error(path, rec, COLUMNS[0], "路径为空"))?;
-            let (key, parent, name, depth, kind) = paths.normalize(original);
-            if key.is_empty() {
-                return Err(field_error(path, rec, COLUMNS[0], "路径为空"));
-            }
-            let size = number(1, true)?.unwrap();
-            let allocated = number(2, true)?.unwrap();
-            let mut values: [Option<&str>; 14] = [None; 14];
-            let mut parsed = [None; 17];
-            for i in 3..17 {
-                let value = if i == 7 || i == 8 {
-                    get(i)
-                        .map(|v| {
-                            if !v.bytes().all(|b| b.is_ascii_digit()) {
-                                return Err(field_error(
-                                    path,
-                                    rec,
-                                    COLUMNS[i],
-                                    "必须是非负十进制整数",
-                                ));
-                            }
-                            let normalized = v.trim_start_matches('0');
-                            Ok(if normalized.is_empty() {
-                                "0"
-                            } else {
-                                normalized
-                            })
-                        })
-                        .transpose()?
-                } else if [5, 6, 11, 12, 13, 14, 15, 16].contains(&i) {
-                    parsed[i] = number(i, false)?;
-                    get(i).map(|v| {
-                        let normalized = v.trim_start_matches('0');
-                        if normalized.is_empty() {
-                            "0"
-                        } else {
-                            normalized
+        };
+        let original = get(0).ok_or_else(|| field_error(path, rec, COLUMNS[0], "路径为空"))?;
+        let (key, parent, name, depth, kind) = paths.normalize(original);
+        if key.is_empty() {
+            return Err(field_error(path, rec, COLUMNS[0], "路径为空"));
+        }
+        let size = number(1, true)?.unwrap();
+        let allocated = number(2, true)?.unwrap();
+        let mut values = [None; 14];
+        for i in 3..17 {
+            values[i - 3] = if i == 7 || i == 8 {
+                get(i)
+                    .map(|v| {
+                        if !v.bytes().all(|b| b.is_ascii_digit()) {
+                            return Err(field_error(path, rec, COLUMNS[i], "必须是非负十进制整数"));
                         }
+                        let value = v.trim_start_matches('0');
+                        Ok(if value.is_empty() { "0" } else { value })
                     })
-                } else {
-                    get(i)
-                };
-                values[i - 3] = value;
-            }
-            serialized.clear();
-            serde_json::to_writer(&mut serialized, &values)
-                .map_err(|e| ApiError::new("SERIALIZATION_ERROR", e.to_string()))?;
-            let details = std::str::from_utf8(&serialized)
-                .map_err(|e| ApiError::new("SERIALIZATION_ERROR", e.to_string()))?;
-            let (canonical_prefix, basename_key) = canonical_parts(key);
-            let prefix_id = prefixes.intern(canonical_prefix)?;
-            let (raw_prefix, raw_suffix) = raw_parts(original);
-            let raw_prefix_id = prefixes.intern(raw_prefix)?;
-            let node_extension = crate::file_extensions::extension(basename_key);
-            let extension = if kind == "file" { node_extension } else { "" };
-            // One indexed lookup resolves both the node and exact immutable value.
-            let existing: Option<(i64, Option<i64>)> = if side == 0 { None } else {
-                matching.query_row((raw_prefix_id, raw_suffix, details, parsed[5], parsed[6], values[4], volume(key), extension, prefix_id, basename_key), |r| Ok((r.get(0)?, r.get(1)?))).optional()?
-            };
-            let node_id = if let Some((id, _)) = existing {
-                id
-            } else {
-                let parent_id = match parent {
-                    None => None,
-                    Some(path) => match parents.get(path) {
-                        Some(id) => Some(*id),
-                        None => {
-                            let (prefix, basename) = canonical_parts(path);
-                            let id = prefixes.intern(prefix)?;
-                            lookup.query_row((id, basename), |r| r.get(0)).optional()?
-                        },
-                    },
-                };
-                if node.execute((prefix_id, parent.filter(|_| parent_id.is_none()), name, depth, basename_key, parent_id, node_extension))? != 0 {
-                    conn.last_insert_rowid()
-                } else { lookup.query_row((prefix_id, basename_key), |r| r.get(0))? }
-            };
-            if kind == "directory" {
-                if parents.len() == 1024 {
-                    parents.clear();
-                }
-                parents.insert(key.to_owned(), node_id);
-            }
-            // SQLite compares borrowed parameters without hashes or owned row copies.
-            let shared = existing.and_then(|(_, value_id)| value_id);
-            let value_id = match shared {
-                Some(id) => id,
-                None => {
-                    value.execute((raw_prefix_id, raw_suffix, details, parsed[5], parsed[6], values[4], volume(key), extension))?;
-                    conn.last_insert_rowid()
-                }
-            };
-            entry.execute((side, node_id, value_id, i64::from(kind == "directory"), size, allocated)).map_err(|e| {
-                if matches!(e, rusqlite::Error::SqliteFailure(ref x, _) if x.code == rusqlite::ErrorCode::ConstraintViolation) {
-                    field_error(path, rec, COLUMNS[0], "重复或大小写规范化冲突路径")
-                } else { source_error(path, e.into()) }
-            })?;
-            rows += 1;
-            if kind == "directory" {
-                folders += 1;
-            } else {
-                files += 1;
-                let classification = crate::file_categories::category(name);
-                let index = crate::file_categories::CATEGORIES
-                    .iter()
-                    .position(|c| *c == classification)
-                    .unwrap();
-                let values = &mut categories[index];
-                values[0] = crate::store::checked_add(values[0], size, "文件类别大小")?;
-                values[1] = crate::store::checked_add(values[1], allocated, "文件类别分配")?;
-                values[2] = crate::store::checked_add(values[2], 1, "文件类别数量")?;
-                if let Some(values) = extensions.get_mut(extension) {
-                    values[0] = crate::store::checked_add(values[0], size, "扩展名大小")?;
-                    values[1] = crate::store::checked_add(values[1], allocated, "扩展名分配")?;
-                    values[2] = crate::store::checked_add(values[2], 1, "扩展名数量")?;
-                } else {
-                    if extensions.len() == 4096 {
-                        crate::file_extensions::save_import(conn, side, &mut extensions)?;
-                        extensions.clear();
+                    .transpose()?
+            } else if [5, 6, 11, 12, 13, 14, 15, 16].contains(&i) {
+                number(i, false)?;
+                get(i).map(|v| {
+                    let v = v.trim_start_matches('0');
+                    if v.is_empty() {
+                        "0"
+                    } else {
+                        v
                     }
-                    extensions.insert(extension.to_owned(), [size, allocated, 1]);
-                }
-            }
-            if rows % 1000 == 0 {
-                control.check()?;
-                progress(Progress {
-                    phase: if side == 0 { "before" } else { "after" }.into(),
-                    bytes_read: reader.position().byte(),
-                    total_bytes: initial.len(),
-                    rows,
-                });
-            }
-            if rows % 10000 == 0 {
-                crate::file_extensions::save_import(conn, side, &mut extensions)?;
-                conn.execute_batch("COMMIT; BEGIN")?;
-            }
+                })
+            } else {
+                get(i)
+            };
         }
-        control.check()?;
-        if rows == 0 {
-            return Err(source_error(
-                path,
-                ApiError::new("EMPTY_SNAPSHOT", "CSV 没有数据记录"),
-            ));
-        }
-        let current = std::fs::metadata(path).map_err(|e| source_error(path, e.into()))?;
-        if initial.len() != current.len() || initial.modified()? != current.modified()? {
-            return Err(source_error(
-                path,
-                ApiError::new("SOURCE_CHANGED", "导入期间源文件发生变化"),
-            ));
-        }
-        crate::file_extensions::save_import(conn, side, &mut extensions)?;
-        crate::file_categories::save_import(conn, side, &categories)?;
-        conn.execute_batch("COMMIT")?;
-        progress(Progress {
-            phase: if side == 0 { "before" } else { "after" }.into(),
-            bytes_read: initial.len(),
-            total_bytes: initial.len(),
-            rows,
-        });
-        Ok(SourceSummary {
-            path: path.display().to_string(),
-            description,
-            rows,
-            files,
-            folders,
-            roots: Vec::new(),
-            root_count: 0,
-            roots_truncated: false,
-            size: "0".into(),
-            allocated: "0".into(),
+        consume(ParsedRow {
+            original,
+            key,
+            parent,
+            name,
+            depth: depth as u32,
+            kind: if kind == "file" {
+                NodeKind::File
+            } else {
+                NodeKind::Directory
+            },
+            size,
+            allocated,
+            values,
+            record: rec,
         })
-    })();
-    if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK");
+        .map_err(|mut e| {
+            e.source = Some(path.display().to_string());
+            e.record.get_or_insert(rec);
+            e
+        })?;
+        rows += 1;
+        if kind == "directory" {
+            folders += 1;
+        } else {
+            files += 1;
+        }
+        if rows % 1000 == 0 {
+            control.check()?;
+            progress(Progress {
+                phase: if side == 0 { "before" } else { "after" }.into(),
+                bytes_read: reader.position().byte(),
+                total_bytes: initial.len(),
+                rows,
+            });
+        }
     }
-    result
+    control.check()?;
+    if rows == 0 {
+        return Err(source_error(
+            path,
+            ApiError::new("EMPTY_SNAPSHOT", "CSV 没有数据记录"),
+        ));
+    }
+    let current = std::fs::metadata(path).map_err(|e| source_error(path, e.into()))?;
+    if initial.len() != current.len() || initial.modified()? != current.modified()? {
+        return Err(source_error(
+            path,
+            ApiError::new("SOURCE_CHANGED", "导入期间源文件发生变化"),
+        ));
+    }
+    progress(Progress {
+        phase: if side == 0 { "before" } else { "after" }.into(),
+        bytes_read: initial.len(),
+        total_bytes: initial.len(),
+        rows,
+    });
+    Ok(SourceSummary {
+        path: path.display().to_string(),
+        description,
+        rows,
+        files,
+        folders,
+        roots: Vec::new(),
+        root_count: 0,
+        roots_truncated: false,
+        size: "0".into(),
+        allocated: "0".into(),
+    })
 }
 fn source_error(path: &Path, mut error: ApiError) -> ApiError {
     error.source = Some(path.display().to_string());

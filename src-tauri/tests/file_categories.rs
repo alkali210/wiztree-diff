@@ -1,29 +1,20 @@
-use rusqlite::Connection;
 use wiztree_diff_lib::{
     file_categories::{self, CATEGORIES},
     file_extensions,
-    import::{self, JobControl},
-    store,
+    import::JobControl,
+    store::{self, Comparison},
     types::{Metric, SnapshotSide},
 };
 
-fn build(before: &str, after: &str) -> (tempfile::TempDir, Connection) {
+fn build(before: &str, after: &str) -> (tempfile::TempDir, Comparison) {
     let dir = tempfile::tempdir().unwrap();
     let b = dir.path().join("before.csv");
     let a = dir.path().join("after.csv");
-    let db = dir.path().join("comparison.sqlite");
     std::fs::write(&b, before).unwrap();
     std::fs::write(&a, after).unwrap();
-    store::build_comparison(
-        &b,
-        &a,
-        &db,
-        "categories",
-        &JobControl::default(),
-        &mut |_| {},
-    )
-    .unwrap();
-    (dir, Connection::open(db).unwrap())
+    let comparison =
+        store::build_comparison(&b, &a, "categories", &JobControl::default(), &mut |_| {}).unwrap();
+    (dir, comparison)
 }
 
 #[test]
@@ -161,19 +152,25 @@ fn category_aggregation_checks_overflow_and_cancellation() {
         "文件名称,大小,分配\nC:\\first.txt,9223372036854775807,0\nC:\\second.txt,1,0\n",
     )
     .unwrap();
-    let c = Connection::open_in_memory().unwrap();
-    c.execute_batch(store::SCHEMA).unwrap();
     assert_eq!(
-        import::load(&c, &path, 0, &JobControl::default(), &mut |_| {})
-            .unwrap_err()
-            .code,
+        store::build_comparison(
+            &path,
+            &path,
+            "overflow",
+            &JobControl::default(),
+            &mut |_| {}
+        )
+        .err()
+        .unwrap()
+        .code,
         "AGGREGATE_OVERFLOW"
     );
     let control = JobControl::default();
     control.cancel();
     assert_eq!(
-        import::load(&c, &path, 0, &control, &mut |_| {})
-            .unwrap_err()
+        store::build_comparison(&path, &path, "cancelled", &control, &mut |_| {})
+            .err()
+            .unwrap()
             .code,
         "CANCELLED"
     );

@@ -1,44 +1,29 @@
-use rusqlite::Connection;
 use wiztree_diff_lib::{
     diff, file_extensions,
     import::{self, JobControl},
-    store,
+    store::{self, Comparison},
     types::{Metric, SnapshotSide, Status},
 };
-fn build(b: &str, a: &str) -> (tempfile::TempDir, Connection) {
+fn build(b: &str, a: &str) -> (tempfile::TempDir, Comparison) {
     let dir = tempfile::TempDir::new().unwrap();
     let before = dir.path().join("b.csv");
     let after = dir.path().join("a.csv");
     std::fs::write(&before, b).unwrap();
     std::fs::write(&after, a).unwrap();
-    let db = dir.path().join("d.sqlite");
-    store::build_comparison(
-        &before,
-        &after,
-        &db,
-        "test",
-        &JobControl::default(),
-        &mut |_| {},
-    )
-    .unwrap();
-    let conn = store::open_reader(&db).unwrap();
-    (dir, conn)
+    let comparison =
+        store::build_comparison(&before, &after, "test", &JobControl::default(), &mut |_| {})
+            .unwrap();
+    (dir, comparison)
 }
-fn id(c: &Connection, p: &str) -> String {
+fn id(c: &Comparison, p: &str) -> String {
     let key = import::normalize(p).0;
-    let parts = import::canonical_parts(&key);
-    format!(
-        "n{}",
-        c.query_row(
-            "SELECT n.id FROM path_prefixes p JOIN node_records n ON n.prefix_id=p.id WHERE p.path=?1 AND n.basename_key=?2",
-            parts,
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap()
-    )
+    let node = (1..=c.nodes.len() as u32)
+        .find(|&id| c.canonical_path(id) == key)
+        .unwrap();
+    format!("n{node}")
 }
 fn page(
-    c: &Connection,
+    c: &Comparison,
     parent: Option<&str>,
     side: SnapshotSide,
 ) -> wiztree_diff_lib::types::ExtensionPage {
@@ -287,15 +272,15 @@ fn totals_overflow_and_cancel_do_not_publish_partial_statistics() {
         let d = tempfile::TempDir::new().unwrap();
         let p = d.path().join("input.csv");
         std::fs::write(&p, csv).unwrap();
-        let c = Connection::open_in_memory().unwrap();
-        c.execute_batch(store::SCHEMA).unwrap();
-        let result = import::load(&c, &p, 0, &JobControl::default(), &mut |_| {})
-            .and_then(|_| file_extensions::materialize(&c, &JobControl::default()));
-        assert_eq!(result.unwrap_err().code, "AGGREGATE_OVERFLOW");
+        let result = store::build_comparison(&p, &p, "test", &JobControl::default(), &mut |_| {});
+        assert_eq!(result.err().unwrap().code, "AGGREGATE_OVERFLOW");
         let control = JobControl::default();
         control.cancel();
         assert_eq!(
-            file_extensions::materialize(&c, &control).unwrap_err().code,
+            store::build_comparison(&p, &p, "test", &control, &mut |_| {})
+                .err()
+                .unwrap()
+                .code,
             "CANCELLED"
         );
     }
@@ -318,7 +303,7 @@ fn a_file_scope_never_inherits_descendants_from_the_directory_side() {
 }
 
 #[test]
-fn global_and_directory_extension_totals_survive_bounded_cache_eviction() {
+fn global_and_directory_totals_preserve_large_extension_cardinality() {
     let mut csv = String::from("文件名称,大小,分配\nC:\\root\\,0,0\n");
     for i in 0..8201 {
         csv.push_str(&format!("C:\\root\\a.type{i},3,4\n"));
@@ -352,6 +337,59 @@ fn global_and_directory_extension_totals_survive_bounded_cache_eviction() {
         );
     }
 }
+#[test]
+fn directory_cursor_remains_exact_after_byte_bounded_scope_eviction() {
+    let suffix = "x".repeat(4096);
+    let mut csv = "文件名称,大小,分配\nC:\\root\\,0,0\n".to_owned();
+    for directory in 0..10 {
+        csv.push_str(&format!("C:\\root\\d{directory}\\,0,0\n"));
+        for i in 0..450 {
+            csv.push_str(&format!(
+                "C:\\root\\d{directory}\\f.e{i:04}{suffix},{},{}\n",
+                i % 3,
+                i % 5
+            ));
+        }
+    }
+    let (_dir, c) = build(&csv, &csv);
+    let first_id = id(&c, "C:\\root\\d0\\");
+    let first = page(&c, Some(&first_id), SnapshotSide::After);
+    let cursor = first.next_cursor.as_deref().unwrap();
+    let expected = file_extensions::list_extensions(
+        &c,
+        "test",
+        Some(&first_id),
+        SnapshotSide::After,
+        Metric::Size,
+        Some(cursor),
+    )
+    .unwrap();
+    // Ten requested scopes each own more than 1.8 MiB of extension text, exceeding the 16 MiB budget.
+    for directory in 1..10 {
+        let node = id(&c, &format!("C:\\root\\d{directory}\\"));
+        assert_eq!(
+            page(&c, Some(&node), SnapshotSide::After).total_extensions,
+            450
+        );
+    }
+    let resumed = file_extensions::list_extensions(
+        &c,
+        "test",
+        Some(&first_id),
+        SnapshotSide::After,
+        Metric::Size,
+        Some(cursor),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&resumed).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(page(&c, Some(&first_id), SnapshotSide::After)).unwrap(),
+        serde_json::to_value(&first).unwrap()
+    );
+}
 
 #[test]
 fn global_totals_include_the_tail_of_a_multi_batch_import() {
@@ -365,16 +403,15 @@ fn global_totals_include_the_tail_of_a_multi_batch_import() {
         writeln!(csv, r"C:\root\file_{size}.bin,{size},16").unwrap();
     }
     csv.flush().unwrap();
-    let c = Connection::open_in_memory().unwrap();
-    c.execute_batch(store::SCHEMA).unwrap();
-    import::load(&c, &path, 0, &JobControl::default(), &mut |_| {}).unwrap();
-    file_extensions::materialize(&c, &JobControl::default()).unwrap();
-    let totals: (i64, i64, i64) = c
-        .query_row(
-            "SELECT size,allocated,files FROM extension_totals WHERE side=0 AND node_id=0",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(totals, (50_015_001, 160_016, 10_001));
+    let c =
+        store::build_comparison(&path, &path, "test", &JobControl::default(), &mut |_| {}).unwrap();
+    let totals = page(&c, None, SnapshotSide::Before).total;
+    assert_eq!(
+        (
+            totals.size.as_str(),
+            totals.allocated.as_str(),
+            totals.files
+        ),
+        ("50015001", "160016", 10_001)
+    );
 }

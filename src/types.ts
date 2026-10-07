@@ -102,7 +102,7 @@ export interface ComparisonSummary {
 export interface JobSummary {
   jobId: string;
   state: "running" | "ready" | "cancelled" | "failed";
-  phase: "before" | "after" | "indexing" | "comparing";
+  phase: "before" | "after" | "finalizing";
   bytesRead: string;
   totalBytes: string;
   rows: number;
@@ -141,6 +141,8 @@ export interface TreemapLabel extends TreemapRect {
   weight: string;
 }
 export interface FullTreemapData {
+  layoutId: string;
+  comparisonId: string;
   imageDataUrl: string;
   atlasWidth: number;
   atlasHeight: number;

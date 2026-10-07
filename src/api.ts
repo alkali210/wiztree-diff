@@ -20,7 +20,8 @@ export const api = {
   cancelComparison: (jobId: string) =>
     invoke<void>("cancel_comparison", { jobId }),
   getJob: (jobId: string) => invoke<JobSummary>("get_job", { jobId }),
-  getComparison: () => invoke<ComparisonSummary | null>("get_comparison"),
+  getComparison: (comparisonId: string) =>
+    invoke<ComparisonSummary>("get_comparison", { comparisonId }),
   listRoots: (
     comparisonId: string,
     side: SnapshotSide,
@@ -70,32 +71,13 @@ export const api = {
     }),
   hitTestTreemap: (
     comparisonId: string,
-    metric: Metric,
-    mode: ChartMode,
+    layoutId: string,
     x: number,
     y: number,
-    maxDepth: number,
   ) =>
-    invoke<TreemapHit | null>("hit_test_treemap", {
-      comparisonId,
-      metric,
-      mode,
-      x,
-      y,
-      maxDepth,
-    }),
-  getTreemapBounds: (
-    comparisonId: string,
-    metric: Metric,
-    mode: ChartMode,
-    nodeId: string,
-    maxDepth: number,
-  ) =>
-    invoke<TreemapRect | null>("get_treemap_bounds", {
-      comparisonId,
-      metric,
-      mode,
-      nodeId,
-      maxDepth,
-    }),
+    invoke<TreemapHit | null>("hit_test_treemap", { comparisonId, layoutId, x, y }),
+  getTreemapBounds: (comparisonId: string, layoutId: string, nodeId: string) =>
+    invoke<TreemapRect | null>("get_treemap_bounds", { comparisonId, layoutId, nodeId }),
+  releaseTreemap: (comparisonId: string, layoutId: string) =>
+    invoke<void>("release_treemap", { comparisonId, layoutId }),
 };

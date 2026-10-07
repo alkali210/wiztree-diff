@@ -41,25 +41,27 @@ export default function App() {
   const [rootReview, setRootReview] = useState<SnapshotSide | null>(null);
   const [comparison, setComparison] = useState<ComparisonSummary | null>(null),
     [error, setError] = useState(""),
-    [loading, setLoading] = useState(true),
+    [loading, setLoading] = useState(false),
     [confirmed, setConfirmed] = useState<string | null>(null),
     [selected, setSelected] = useState<string | null>(null),
     [changesOnly, setChangesOnly] = useState(false),
     [path, setPath] = useState<Breadcrumb[]>([]);
   const generation = useRef(0),
-    tree = useRef<TreeHandle>(null);
+    tree = useRef<TreeHandle>(null),
+    requestedComparison = useRef<string | null>(null);
   const [reveal, setReveal] = useState<{
     comparisonId: string;
     path: Breadcrumb[];
     nodeId: string;
   } | null>(null);
-  const refresh = useCallback(() => {
+  const refresh = useCallback((comparisonId: string) => {
+    requestedComparison.current = comparisonId;
     const token = ++generation.current;
     setLoading(true);
     setRootReview(null);
     setError("");
     void api
-      .getComparison()
+      .getComparison(comparisonId)
       .then(
         (c) => {
           if (token !== generation.current) return;
@@ -79,11 +81,10 @@ export default function App() {
       });
   }, []);
   useEffect(() => {
-    refresh();
     return () => {
       generation.current++;
     };
-  }, [refresh]);
+  }, []);
   useEffect(() => {
     let live = true;
     setSelectedName("");
@@ -109,15 +110,18 @@ export default function App() {
     (!comparison.warnings.length || confirmed === comparison.comparisonId);
   return (
     <main>
-      <ImportPanel onReady={refresh} comparison={comparison} />
+      <ImportPanel onReady={refresh} />
       {error && (
         <div className="error app-error">
-          {error} <button onClick={refresh}>重新读取对比</button>
+          {error}{" "}
+          <button onClick={() => {
+            if (requestedComparison.current) refresh(requestedComparison.current);
+          }}>重新读取对比</button>
         </div>
       )}
       {!comparison && (
         <div className="empty">
-          {loading ? "正在恢复本地索引…" : "选择两份 WizTree CSV 开始比较"}
+          {loading ? "正在读取比较结果…" : "选择两份 WizTree CSV 开始比较"}
         </div>
       )}
       {comparison && (

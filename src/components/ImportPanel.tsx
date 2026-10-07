@@ -4,13 +4,9 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { api } from "../api";
 import { bytes, errorText } from "../format";
-import type { ComparisonSummary, JobSummary } from "../types";
-export function ImportPanel({
-  onReady,
-  comparison,
-}: {
-  onReady: () => void;
-  comparison: ComparisonSummary | null;
+import type { JobSummary } from "../types";
+export function ImportPanel({ onReady }: {
+  onReady: (comparisonId: string) => void;
 }) {
   const [paths, setPaths] = useState(["", ""]);
   const [job, setJob] = useState<JobSummary | null>(null);
@@ -25,9 +21,6 @@ export function ImportPanel({
     dispose = useRef<(() => void) | null>(null),
     ready = useRef(onReady);
   ready.current = onReady;
-  useEffect(() => {
-    if (comparison) setPaths([comparison.before.path, comparison.after.path]);
-  }, [comparison]);
   useEffect(
     () => () => {
       generation.current++;
@@ -124,7 +117,8 @@ export function ImportPanel({
         finished = true;
         cleanup();
         setBusy(false);
-        if (j.state === "ready") ready.current();
+        busyRef.current = false;
+        if (j.state === "ready" && j.comparisonId) ready.current(j.comparisonId);
         if (j.error) setError(errorText(j.error));
       }
     };
@@ -231,8 +225,7 @@ export function ImportPanel({
               {
                 before: "导入之前",
                 after: "导入之后",
-                indexing: "建立索引",
-                comparing: "计算差异",
+                finalizing: "完成删除、层级与汇总",
               }[job.phase]
             }{" "}
             ·{" "}

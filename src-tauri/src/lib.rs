@@ -1,7 +1,7 @@
 pub mod commands;
 pub mod diff;
-pub mod file_extensions;
 pub mod file_categories;
+pub mod file_extensions;
 pub mod global_treemap;
 pub mod import;
 pub mod store;
@@ -23,6 +23,7 @@ pub fn run() {
             commands::get_full_treemap,
             commands::hit_test_treemap,
             commands::get_treemap_bounds,
+            commands::release_treemap,
             commands::get_file_categories
         ])
         .run(tauri::generate_context!())

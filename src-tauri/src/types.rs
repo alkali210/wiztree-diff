@@ -22,18 +22,13 @@ impl ApiError {
         }
     }
 }
-impl From<rusqlite::Error> for ApiError {
-    fn from(e: rusqlite::Error) -> Self {
-        Self::new("DATABASE_ERROR", e.to_string())
-    }
-}
 impl From<std::io::Error> for ApiError {
     fn from(e: std::io::Error) -> Self {
         Self::new("IO_ERROR", e.to_string())
     }
 }
 pub type Result<T> = std::result::Result<T, ApiError>;
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Status {
     Added,
@@ -42,13 +37,13 @@ pub enum Status {
     Unchanged,
     TypeChanged,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum Metric {
     Size,
     Allocated,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum ChartMode {
     Before,
@@ -128,7 +123,7 @@ pub struct Root {
     pub size: String,
     pub allocated: String,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum SnapshotSide {
     Before,
@@ -240,6 +235,8 @@ pub struct TreemapLabel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FullTreemapData {
+    pub layout_id: String,
+    pub comparison_id: String,
     pub image_data_url: String,
     pub atlas_width: u32,
     pub atlas_height: u32,
@@ -256,7 +253,7 @@ pub struct FullTreemapData {
     pub labels: Vec<TreemapLabel>,
     pub warnings: Vec<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum NodeKind {
     File,

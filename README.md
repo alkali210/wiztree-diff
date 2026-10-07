@@ -1,13 +1,13 @@
 # WizTree Diff
 
-Windows 本地 WizTree CSV 快照对比工具，使用 Tauri 2、React/TypeScript 和 SQLite。
+Windows 本地 WizTree CSV 快照对比工具，使用 Tauri 2、React/TypeScript 和 Rust 内存数据结构。
 
 ## 功能概述
 
 - 对比新增、删除、大小变化及文件/目录替换，支持目录树过滤与原始字段详情。
-- 全局层级 treemap 展示目录结构；差异模式以“之前”为底图，用边框提示变化。
+- 全局层级 treemap 展示目录结构；差异按文件路径增减绝对值独立布局，按需计算当前视图。
 - 左侧按文件大类统计，主面板按实际扩展名统计；支持逻辑大小与分配大小。
-- CSV 拖放导入、后台处理、取消任务和本地索引恢复。
+- CSV 拖放导入、后台处理和取消任务；不保存比较缓存，重启后每次手动导入。
 
 ## 使用
 
@@ -36,5 +36,5 @@ pnpm tauri build --bundles nsis
 
 - [使用说明](docs/usage.md)
 - [输入、比较与统计口径](docs/data-model.md)
-- [开发、缓存与源码包](docs/development.md)
+- [开发、运行时内存与源码包](docs/development.md)
 - [项目协作约定](AGENTS.md)
