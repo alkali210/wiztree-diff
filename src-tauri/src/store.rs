@@ -384,6 +384,7 @@ impl Builder {
                         folders: StatusCounts::default(),
                     },
                     warnings: Vec::new(),
+                    order_warning: None,
                 },
                 nodes: Vec::new(),
                 entries: [Vec::new(), Vec::new()],
@@ -1050,6 +1051,10 @@ pub fn build_comparison(
         import::load(before, 0, control, progress, |row| builder.add(0, row))?;
     builder.data.summary.after =
         import::load(after, 1, control, progress, |row| builder.add(1, row))?;
+    builder.data.summary.order_warning = import::snapshot_order_warning(
+        builder.data.summary.before.description.as_deref(),
+        builder.data.summary.after.description.as_deref(),
+    );
     progress(Progress {
         phase: "finalizing".into(),
         bytes_read: 0,

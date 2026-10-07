@@ -166,12 +166,20 @@ pub struct Counts {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SnapshotOrderWarning {
+    pub before_time: String,
+    pub after_time: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ComparisonSummary {
     pub comparison_id: String,
     pub before: SourceSummary,
     pub after: SourceSummary,
     pub statuses: Counts,
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_warning: Option<SnapshotOrderWarning>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

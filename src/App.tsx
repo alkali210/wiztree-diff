@@ -111,6 +111,14 @@ export default function App() {
   return (
     <main>
       <ImportPanel onReady={refresh} />
+      {comparison?.orderWarning && (
+        <div className="warning" role="status">
+          当前比较的“之前” CSV 导出时间比“之后”更新（之前：
+          {comparison.orderWarning.beforeTime}；之后：
+          {comparison.orderWarning.afterTime}）。请确认是否选反；可交换两侧后重新比较。
+          结果仍按您选择的顺序显示。
+        </div>
+      )}
       {error && (
         <div className="error app-error">
           {error}{" "}

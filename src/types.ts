@@ -92,12 +92,17 @@ export interface SourceSummary {
   size: string;
   allocated: string;
 }
+export interface SnapshotOrderWarning {
+  beforeTime: string;
+  afterTime: string;
+}
 export interface ComparisonSummary {
   comparisonId: string;
   before: SourceSummary;
   after: SourceSummary;
   statuses: Record<"files" | "folders", Record<Status, number>>;
   warnings: string[];
+  orderWarning?: SnapshotOrderWarning;
 }
 export interface JobSummary {
   jobId: string;
