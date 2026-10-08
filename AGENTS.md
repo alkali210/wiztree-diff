@@ -39,6 +39,5 @@ pnpm tauri build --bundles nsis
 ## 文档与交付
 
 - 更新受影响的文档和 CHANGELOG；详细内容分类放入 `docs/`，避免不断扩充 README。
-- 源码包使用根目录 `wiztree-diff-source.zip`，仅包含源码、正式测试、构建所需配置/锁文件/图标和必要文档。
 - 排除 `verification/`、截图、`csv-example/`、`.tmp/`、Git 元数据、`node_modules/`、`dist/`、`src-tauri/target/`、`src-tauri/gen/`、数据库和临时记录。
 - 打包后核对条目、解压并验证构建；删除自己的临时验证目录，不改动用户 CSV 或与任务无关的文件。

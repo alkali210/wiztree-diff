@@ -19,6 +19,7 @@ import { OccupancyCharts } from "./components/OccupancyCharts";
 import { RootList } from "./components/RootList";
 import { FileTypePanel } from "./components/FileTypePanel";
 import { CategoryPanel } from "./components/CategoryPanel";
+import { SplitPane } from "./components/SplitPane";
 import "./App.css";
 const statuses: Status[] = [
   "added",
@@ -219,90 +220,110 @@ export default function App() {
                 />
               )}
             </aside>
-            <div className="center-pane">
-              {rootReview && (
-                <RootList
-                  key={`${comparison.comparisonId}:${rootReview}`}
-                  comparisonId={comparison.comparisonId}
-                  side={rootReview}
-                  totalRoots={comparison[rootReview].rootCount}
-                  truncated={comparison[rootReview].rootsTruncated}
-                  canNavigate={Boolean(allowed) && !loading}
-                  onClose={() => setRootReview(null)}
-                  onSelect={(root) => {
-                    if (!allowed || loading) return;
-                    setRootReview(null);
-                    if (root.kind === "file") setSelected(root.nodeId);
-                    else if (changesOnly) {
-                      setReveal({
-                        comparisonId: comparison.comparisonId,
-                        path: [],
-                        nodeId: root.nodeId,
-                      });
-                      setChangesOnly(false);
-                    } else tree.current?.navigate(root.nodeId, true);
-                  }}
+            <SplitPane
+              axis="vertical"
+              label="调整目录树与占用图高度"
+              defaultRatio={0.34}
+              minFirst={180}
+              minSecond={200}
+              first={
+                <SplitPane
+                  axis="horizontal"
+                  label="调整目录树与扩展名宽度"
+                  defaultRatio={0.25}
+                  minFirst={300}
+                  minSecond={250}
+                  first={
+                    <div className="center-pane">
+                      {rootReview && (
+                        <RootList
+                          key={`${comparison.comparisonId}:${rootReview}`}
+                          comparisonId={comparison.comparisonId}
+                          side={rootReview}
+                          totalRoots={comparison[rootReview].rootCount}
+                          truncated={comparison[rootReview].rootsTruncated}
+                          canNavigate={Boolean(allowed) && !loading}
+                          onClose={() => setRootReview(null)}
+                          onSelect={(root) => {
+                            if (!allowed || loading) return;
+                            setRootReview(null);
+                            if (root.kind === "file") setSelected(root.nodeId);
+                            else if (changesOnly) {
+                              setReveal({
+                                comparisonId: comparison.comparisonId,
+                                path: [],
+                                nodeId: root.nodeId,
+                              });
+                              setChangesOnly(false);
+                            } else tree.current?.navigate(root.nodeId, true);
+                          }}
+                        />
+                      )}
+                      {!allowed ? (
+                        <section className="scope-warning">
+                          <h2>请确认导出范围</h2>
+                          {comparison.warnings.map((w, i) => (
+                            <p key={i}>⚠ {w}</p>
+                          ))}
+                          <p>
+                            这些差异仅来自 CSV 记录。范围不一致或记录不完整时，新增 /
+                            删除不一定代表磁盘实际变化。
+                          </p>
+                          <button
+                            className="primary"
+                            onClick={() => setConfirmed(comparison.comparisonId)}
+                          >
+                            我理解范围限制，继续查看
+                          </button>
+                        </section>
+                      ) : (
+                        <>
+                          <DiffTree
+                            ref={tree}
+                            comparisonId={comparison.comparisonId}
+                            metric={metric}
+                            changesOnly={changesOnly}
+                            selected={selected}
+                            onSelect={setSelected}
+                            onScope={setPath}
+                            reveal={reveal}
+                          />
+                        </>
+                      )}
+                    </div>
+                  }
+                  second={
+                    <aside className="right-pane">
+                      {allowed && (
+                        <FileTypePanel
+                          comparisonId={comparison.comparisonId}
+                          parentId={selected ?? path.at(-1)?.nodeId ?? null}
+                          metric={metric}
+                          mode={mode}
+                          name={
+                            selected
+                              ? selectedName || "所选项目"
+                              : (path.at(-1)?.name ?? "工作区")
+                          }
+                          showFiles
+                        />
+                      )}
+                    </aside>
+                  }
                 />
-              )}
-              {!allowed ? (
-                <section className="scope-warning">
-                  <h2>请确认导出范围</h2>
-                  {comparison.warnings.map((w, i) => (
-                    <p key={i}>⚠ {w}</p>
-                  ))}
-                  <p>
-                    这些差异仅来自 CSV 记录。范围不一致或记录不完整时，新增 /
-                    删除不一定代表磁盘实际变化。
-                  </p>
-                  <button
-                    className="primary"
-                    onClick={() => setConfirmed(comparison.comparisonId)}
-                  >
-                    我理解范围限制，继续查看
-                  </button>
-                </section>
-              ) : (
-                <>
-                  <DiffTree
-                    ref={tree}
-                    comparisonId={comparison.comparisonId}
-                    metric={metric}
-                    changesOnly={changesOnly}
-                    selected={selected}
-                    onSelect={setSelected}
-                    onScope={setPath}
-                    reveal={reveal}
-                  />
-                </>
-              )}
-            </div>
-            <aside className="right-pane">
-              {allowed && (
-                <FileTypePanel
-                  comparisonId={comparison.comparisonId}
-                  parentId={selected ?? path.at(-1)?.nodeId ?? null}
+              }
+              second={allowed ? (
+                <OccupancyCharts
                   metric={metric}
                   mode={mode}
-                  name={
-                    selected
-                      ? selectedName || "所选项目"
-                      : (path.at(-1)?.name ?? "工作区")
-                  }
-                  showFiles
+                  onMetricChange={setMetric}
+                  onModeChange={setMode}
+                  selectedId={selected}
+                  comparisonId={comparison.comparisonId}
+                  onSelect={setSelected}
                 />
-              )}
-            </aside>
-            {allowed && (
-              <OccupancyCharts
-                metric={metric}
-                mode={mode}
-                onMetricChange={setMetric}
-                onModeChange={setMode}
-                selectedId={selected}
-                comparisonId={comparison.comparisonId}
-                onSelect={setSelected}
-              />
-            )}
+              ) : null}
+            />
           </div>
         </>
       )}

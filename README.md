@@ -1,6 +1,6 @@
 # WizTree Diff
 
-Windows 本地 WizTree CSV 快照对比工具，使用 Tauri 2、React/TypeScript 和 Rust 内存数据结构。
+Windows 本地 WizTree CSV 快照对比工具，使用 Tauri 2。
 
 ## 功能概述
 

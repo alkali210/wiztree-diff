@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "WizTree Diff",
-        "width": 1440,
-        "height": 960,
+        "width": 1280,
+        "height": 840,
         "minWidth": 1000,
         "minHeight": 700
       }
