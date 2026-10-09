@@ -38,3 +38,7 @@ pnpm tauri build --bundles nsis
 - [输入、比较与统计口径](docs/data-model.md)
 - [开发、运行时内存与源码包](docs/development.md)
 - [项目协作约定](AGENTS.md)
+
+## 许可
+
+[MIT](LICENSE)
