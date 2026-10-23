@@ -769,17 +769,12 @@ impl TreemapLayout {
         })
     }
     fn finish_metadata(&mut self, c: &Comparison, control: &JobControl) -> Result<()> {
-        for id in 1..=c.nodes.len() as u32 {
-            if id % 512 == 0 {
-                control.check()?;
-            }
-            let own = values(c.own_files(id), self.metric);
-            if own[1] >= own[0] {
-                self.positive += own[1] - own[0];
-            } else {
-                self.negative += own[0] - own[1];
-            }
-        }
+        // Global aggregates contain per-file gross change, never directory CSV totals.
+        // Widen before adding: gross change may exceed i64::MAX.
+        let [before, after, gross] = values(c.aggregate(0), self.metric).map(i128::from);
+        let net = after - before;
+        self.positive = ((gross + net) / 2) as u64;
+        self.negative = ((gross - net) / 2) as u64;
         let mut exported = [0u64; 2];
         for (s, source) in [&c.summary.before, &c.summary.after]
             .into_iter()

@@ -21,32 +21,32 @@ pub fn extension(name: &str) -> &str {
 }
 
 const CACHE_BYTES: usize = 16 * 1024 * 1024;
-type ScopeKey = (usize, NodeId, bool);
+type ScopeKey = (usize, NodeId);
 enum Statistics {
-    Global(Vec<usize>),
+    Global,
     Directory(Vec<ExtensionStat>),
 }
 struct Scope {
-    statistics: Statistics,
+    statistics: Arc<Statistics>,
+    order: Vec<usize>,
+    allocated: bool,
     total: [u64; 3],
     bytes: usize,
 }
 impl Scope {
     fn len(&self) -> usize {
-        match &self.statistics {
-            Statistics::Global(v) => v.len(),
-            Statistics::Directory(v) => v.len(),
-        }
+        self.order.len()
     }
+
     fn get<'a>(
         &'a self,
         comparison: &'a Comparison,
         side: usize,
         index: usize,
     ) -> &'a ExtensionStat {
-        match &self.statistics {
-            Statistics::Global(order) => &comparison.extensions[side][order[index]],
-            Statistics::Directory(stats) => &stats[index],
+        match self.statistics.as_ref() {
+            Statistics::Global => &comparison.extensions[side][self.order[index]],
+            Statistics::Directory(stats) => &stats[self.order[index]],
         }
     }
 }
@@ -60,7 +60,13 @@ pub struct ScopeCache {
 impl ScopeCache {
     fn insert(&mut self, key: ScopeKey, scope: Arc<Scope>) -> Arc<Scope> {
         if let Some(existing) = self.scopes.get(&key) {
-            return existing.clone();
+            if existing.allocated == scope.allocated {
+                return existing.clone();
+            }
+        }
+        if let Some(old) = self.scopes.remove(&key) {
+            self.bytes -= old.bytes;
+            self.order.retain(|k| *k != key);
         }
         if scope.bytes > CACHE_BYTES {
             return scope;
@@ -105,31 +111,24 @@ fn scope(
     node: NodeId,
     allocated: bool,
 ) -> Result<Arc<Scope>> {
-    let key = (side, node, allocated);
-    if let Some(cached) = comparison
+    let key = (side, node);
+    let cached = comparison
         .extension_cache
         .lock()
         .map_err(|_| ApiError::new("INTERNAL_ERROR", "扩展名缓存锁不可用"))?
         .scopes
         .get(&key)
-    {
-        return Ok(cached.clone());
-    }
-    let value = if node == 0 {
-        let stats = &comparison.extensions[side];
-        let mut order: Vec<_> = (0..stats.len()).collect();
-        order.sort_unstable_by(|&a, &b| {
-            weight(&stats[b], allocated)
-                .cmp(&weight(&stats[a], allocated))
-                .then_with(|| stats[a].extension.cmp(&stats[b].extension))
-        });
-        let bytes =
-            order.capacity() * std::mem::size_of::<usize>() + std::mem::size_of::<Scope>() + 128;
-        Scope {
-            statistics: Statistics::Global(order),
-            total: totals(stats)?,
-            bytes,
+        .cloned();
+    if let Some(ref cached) = cached {
+        if cached.allocated == allocated {
+            return Ok(cached.clone());
         }
+    }
+    // Keep one requested ordering per scope; metric switches share immutable totals.
+    let statistics = if let Some(ref cached) = cached {
+        cached.statistics.clone()
+    } else if node == 0 {
+        Arc::new(Statistics::Global)
     } else {
         let mut aggregated: HashMap<&str, [u64; 3]> = HashMap::new();
         let mut pending = Vec::new();
@@ -156,7 +155,7 @@ fn scope(
                 }
             }
         }
-        let mut stats: Vec<_> = aggregated
+        let stats: Vec<_> = aggregated
             .into_iter()
             .map(|(extension, [size, allocated, files])| ExtensionStat {
                 extension: extension.into(),
@@ -165,21 +164,39 @@ fn scope(
                 files,
             })
             .collect();
-        stats.sort_unstable_by(|a, b| {
-            weight(b, allocated)
-                .cmp(&weight(a, allocated))
-                .then_with(|| a.extension.cmp(&b.extension))
-        });
-        let total = totals(&stats)?;
-        let bytes = stats.capacity() * std::mem::size_of::<ExtensionStat>()
-            + stats.iter().map(|v| v.extension.capacity()).sum::<usize>()
-            + std::mem::size_of::<Scope>()
-            + 128;
-        Scope {
-            statistics: Statistics::Directory(stats),
-            total,
-            bytes,
-        }
+        Arc::new(Statistics::Directory(stats))
+    };
+    let stats = match statistics.as_ref() {
+        Statistics::Global => &comparison.extensions[side],
+        Statistics::Directory(stats) => stats,
+    };
+    let mut order: Vec<_> = (0..stats.len()).collect();
+    order.sort_unstable_by(|&a, &b| {
+        weight(&stats[b], allocated)
+            .cmp(&weight(&stats[a], allocated))
+            .then_with(|| stats[a].extension.cmp(&stats[b].extension))
+    });
+    let total = match cached {
+        Some(ref cached) => cached.total,
+        None => totals(stats)?,
+    };
+    let bytes = order.capacity() * std::mem::size_of::<usize>()
+        + std::mem::size_of::<Scope>()
+        + std::mem::size_of::<Statistics>()
+        + 160
+        + match statistics.as_ref() {
+            Statistics::Global => 0,
+            Statistics::Directory(stats) => {
+                stats.capacity() * std::mem::size_of::<ExtensionStat>()
+                    + stats.iter().map(|v| v.extension.capacity()).sum::<usize>()
+            }
+        };
+    let value = Scope {
+        statistics,
+        order,
+        allocated,
+        total,
+        bytes,
     };
     let value = Arc::new(value);
     Ok(comparison
@@ -188,6 +205,51 @@ fn scope(
         .map_err(|_| ApiError::new("INTERNAL_ERROR", "扩展名缓存锁不可用"))?
         .insert(key, value))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::import::JobControl;
+
+    #[test]
+    fn metric_switches_share_statistics_keep_live_orders_and_account_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scope.csv");
+        std::fs::write(
+            &path,
+            "文件名称,大小,分配\nC:\\r\\,0,0\nC:\\r\\a.txt,20,1\nC:\\r\\b.bin,10,30\n",
+        )
+        .unwrap();
+        let c = store::build_comparison(&path, &path, "test", &JobControl::default(), &mut |_| {})
+            .unwrap();
+        let root = (1..=c.nodes.len() as u32)
+            .find(|&id| c.container(id))
+            .unwrap();
+        for node in [0, root] {
+            let size = scope(&c, 0, node, false).unwrap();
+            assert_eq!(size.get(&c, 0, 0).extension, ".txt");
+            for allocated in [true, false, true, false] {
+                let current = scope(&c, 0, node, allocated).unwrap();
+                assert!(Arc::ptr_eq(&size.statistics, &current.statistics));
+                assert_eq!(current.total, [30, 31, 2]);
+                assert_eq!(
+                    current.get(&c, 0, 0).extension,
+                    if allocated { ".bin" } else { ".txt" }
+                );
+                // A request already holding the previous ordering remains immutable.
+                assert_eq!(size.get(&c, 0, 0).extension, ".txt");
+                let cache = c.extension_cache.lock().unwrap();
+                assert_eq!(
+                    cache.bytes,
+                    cache.scopes.values().map(|v| v.bytes).sum::<usize>()
+                );
+                assert_eq!(cache.order.len(), cache.scopes.len());
+                assert!(cache.bytes <= CACHE_BYTES);
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {

@@ -192,16 +192,6 @@ export function OccupancyCharts({
         ctx.fillText(text, x + 4, baseline);
         ctx.restore();
       }
-      if (highlight) {
-        ctx.strokeStyle = "#ffdf49";
-        ctx.lineWidth = 2;
-        ctx.strokeRect(
-          highlight.x * b.width + 1,
-          highlight.y * b.height + 1,
-          Math.max(0, highlight.width * b.width - 2),
-          Math.max(0, highlight.height * b.height - 2),
-        );
-      }
       if (displayed.current !== lease) {
         const previous = displayed.current;
         displayed.current = lease;
@@ -226,7 +216,7 @@ export function OccupancyCharts({
       bitmap.onload = null;
       bitmap.onerror = null;
     };
-  }, [data, lease, highlight]);
+  }, [data, lease]);
   function point(event: React.MouseEvent<HTMLCanvasElement>) {
     const b = event.currentTarget.getBoundingClientRect();
     return {
@@ -359,6 +349,22 @@ export function OccupancyCharts({
             }}
             onClick={click}
           />
+          {interactive && highlight && (
+            <div
+              className="treemap-highlight"
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                pointerEvents: "none",
+                boxSizing: "border-box",
+                border: "2px solid #ffdf49",
+                left: `${highlight.x * 100}%`,
+                top: `${highlight.y * 100}%`,
+                width: `${highlight.width * 100}%`,
+                height: `${highlight.height * 100}%`,
+              }}
+            />
+          )}
           {BigInt(data.weightTotal) === 0n && (
             <div className="canvas-empty">
               {mode === "delta"

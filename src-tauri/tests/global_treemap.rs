@@ -1443,6 +1443,32 @@ fn delta_area_uses_only_the_selected_metric() {
 }
 
 #[test]
+fn global_change_totals_are_exact_above_i64_for_every_mode_and_depth() {
+    let max = i64::MAX;
+    let (_dir, c) = build(
+        &format!("文件名称,大小,分配\nC:\\r\\,0,0\nC:\\r\\gone.bin,{max},7\n"),
+        &format!(
+            "文件名称,大小,分配\nC:\\r\\,0,0\nC:\\r\\new.bin,{},11\n",
+            max - 2
+        ),
+    );
+    for metric in [Metric::Size, Metric::Allocated] {
+        let (positive, negative, net) = match metric {
+            Metric::Size => ((max - 2).to_string(), max.to_string(), "-2"),
+            Metric::Allocated => ("11".into(), "7".into(), "4"),
+        };
+        for mode in [ChartMode::Before, ChartMode::After, ChartMode::Delta] {
+            for depth in [0, 1] {
+                let frame = request_frame(&c, metric, mode, depth).unwrap();
+                assert_eq!(frame.positive_total, positive);
+                assert_eq!(frame.negative_total, negative);
+                assert_eq!(frame.net_delta, net);
+            }
+        }
+    }
+}
+
+#[test]
 fn independently_requested_layouts_are_read_only_and_bound_to_comparison() {
     let before = "文件名称,大小,分配\nC:\\r\\,30,60\nC:\\r\\a.txt,10,20\nC:\\r\\b.mp3,20,40\n";
     let after = before.replace("a.txt,10,20", "a.txt,30,60");

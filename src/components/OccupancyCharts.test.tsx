@@ -159,3 +159,30 @@ it("releases a failed image and allows retry without reusing its handle", async 
   await flush(); await load();
   expect(canvas().getAttribute("data-layout-id")).toBe("retry");
 });
+
+it("updates selection overlay without redrawing the bitmap and ignores late selection bounds", async () => {
+  vi.mocked(api.getFullTreemap).mockResolvedValue(frame("layout", 10));
+  const late = deferred<{ x: number; y: number; width: number; height: number } | null>();
+  vi.mocked(api.getTreemapBounds)
+    .mockResolvedValueOnce({ x: 0.1, y: 0.2, width: 0.3, height: 0.4 })
+    .mockReturnValueOnce(late.promise)
+    .mockResolvedValueOnce({ x: 0.5, y: 0.6, width: 0.2, height: 0.1 });
+  const view = render(chart("one", "before", "first"));
+  await flush(); await load();
+  const context = (canvas() as HTMLCanvasElement).getContext("2d")!;
+  const draws = vi.mocked(context.drawImage).mock.calls.length;
+  const images = Bitmap.instances.length;
+  expect((view.container.querySelector(".treemap-highlight") as HTMLElement).style.left).toBe("10%");
+  view.rerender(chart("one", "before", "second"));
+  await flush();
+  expect(view.container.querySelector(".treemap-highlight")).toBeNull();
+  view.rerender(chart("one", "before", "third"));
+  await flush();
+  await act(async () => late.resolve({ x: 0, y: 0, width: 1, height: 1 }));
+  expect((view.container.querySelector(".treemap-highlight") as HTMLElement).style.left).toBe("50%");
+  expect(Bitmap.instances.length).toBe(images);
+  expect(context.drawImage).toHaveBeenCalledTimes(draws);
+  view.rerender(chart("one", "before"));
+  await flush();
+  expect(view.container.querySelector(".treemap-highlight")).toBeNull();
+});

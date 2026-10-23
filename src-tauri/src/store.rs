@@ -603,9 +603,10 @@ impl Builder {
             self.totals[side][0] = checked_add(self.totals[side][0], row.size, "文件路径大小")?;
             self.totals[side][1] =
                 checked_add(self.totals[side][1], row.allocated, "文件路径分配")?;
+            let category_name = crate::file_categories::category(row.name);
             let category = crate::file_categories::CATEGORIES
                 .iter()
-                .position(|c| *c == crate::file_categories::category(row.name))
+                .position(|c| *c == category_name)
                 .unwrap();
             let values = &mut self.data.categories[side][category];
             values[0] = checked_add(values[0], row.size, "文件类别大小")?;
