@@ -189,6 +189,27 @@ main {
   flex: 1;
   min-height: 0;
 }
+.workspace-controls {
+  display: flex;
+  flex: none;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.workspace-controls { justify-content: flex-end; gap: 3px; }
+.workspace-controls .panel-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: #627082;
+}
+.workspace-controls .panel-toggle[aria-expanded="true"] { color: #334157; }
+.treemap-panel { display: flex; flex: 1; min-width: 0; min-height: 0; }
 .left-pane,
 .right-pane,
 .center-pane,

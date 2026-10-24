@@ -18,6 +18,7 @@ function release(lease: LayoutLease | null) {
   void api.releaseTreemap(lease.data.comparisonId, lease.data.layoutId).catch(() => {});
 }
 interface Props {
+  active?: boolean;
   comparisonId: string;
   metric: Metric;
   mode: ChartMode;
@@ -48,6 +49,7 @@ function fitCaption(
   return name.slice(0, low) + "…" + tail;
 }
 export function OccupancyCharts({
+  active = true,
   comparisonId,
   metric,
   mode,
@@ -60,6 +62,13 @@ export function OccupancyCharts({
   const [depthInput, setDepthInput] = useState(String(maxDepth));
   const [retry, setRetry] = useState(0);
   const key = JSON.stringify([comparisonId, metric, mode, maxDepth, retry]);
+  // A view starts only when shown, then survives visibility toggles (including in-flight work).
+  const requested = useRef({ key, started: active });
+  if (requested.current.key !== key) requested.current = { key, started: active };
+  else if (active) requested.current.started = true;
+  const requestKey = requested.current.started ? key : null;
+  const visible = useRef(active);
+  visible.current = active;
   const epoch = useRef({ key, value: 0 });
   if (epoch.current.key !== key) epoch.current = { key, value: epoch.current.value + 1 };
   const [frame, setFrame] = useState<{ key: string; lease: LayoutLease } | null>(null),
@@ -85,7 +94,7 @@ export function OccupancyCharts({
     pending = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lease = frame?.key === key ? frame.lease : null;
   const data = lease?.data ?? null;
-  const interactive = !!lease && !lease.released && drawnId === data?.layoutId;
+  const interactive = active && !!lease && !lease.released && drawnId === data?.layoutId;
   const highlight = bounds?.layoutId === data?.layoutId && bounds?.nodeId === selectedId
     ? bounds.rect : null;
   useEffect(() => {
@@ -97,6 +106,13 @@ export function OccupancyCharts({
     };
   }, []);
   useEffect(() => {
+    if (!requestKey) {
+      release(displayed.current);
+      displayed.current = null;
+      setFrame(null);
+      setDrawnId(null);
+      return;
+    }
     let live = true;
     let candidate: LayoutLease | null = null;
     const token = epoch.current.value;
@@ -129,7 +145,15 @@ export function OccupancyCharts({
         api.releaseTreemap(comparisonId, "").catch(() => {}),
       );
     };
-  }, [comparisonId, metric, mode, maxDepth, retry]);
+  }, [requestKey]);
+  useEffect(() => {
+    if (!active) {
+      pointerSeq.current++;
+      clickSeq.current++;
+      if (pending.current) clearTimeout(pending.current);
+      setHover(null);
+    }
+  }, [active]);
   useEffect(() => {
     let live = true;
     const token = epoch.current.value;
@@ -152,11 +176,15 @@ export function OccupancyCharts({
     let live = true;
     const token = epoch.current.value;
     const bitmap = new Image();
+    let painted: { width: number; height: number; dpr: number } | null = null;
     const draw = () => {
       if (!live || epoch.current.value !== token || lease.released ||
           !bitmap.complete || !bitmap.naturalWidth) return;
       const b = element.getBoundingClientRect(),
         dpr = window.devicePixelRatio || 1;
+      // display:none reports zero size. Keep existing pixels and avoid redrawing on an unchanged reopen.
+      if (!visible.current || b.width <= 0 || b.height <= 0) return;
+      if (painted?.width === b.width && painted.height === b.height && painted.dpr === dpr) return;
       element.width = Math.round(b.width * dpr);
       element.height = Math.round(b.height * dpr);
       const ctx = element.getContext("2d");
@@ -198,6 +226,7 @@ export function OccupancyCharts({
         release(previous);
         setDrawnId(data.layoutId);
       }
+      painted = { width: b.width, height: b.height, dpr };
     };
     bitmap.onload = draw;
     bitmap.onerror = () => {
@@ -229,7 +258,7 @@ export function OccupancyCharts({
   function move(event: React.MouseEvent<HTMLCanvasElement>) {
     if (!data || !lease || !interactive) return;
     const p = point(event), seq = ++pointerSeq.current, token = epoch.current.value;
-    const valid = () => mounted.current && epoch.current.value === token &&
+    const valid = () => mounted.current && visible.current && epoch.current.value === token &&
       seq === pointerSeq.current && displayed.current === lease && !lease.released;
     if (pending.current) clearTimeout(pending.current);
     pending.current = setTimeout(() => {
@@ -245,7 +274,7 @@ export function OccupancyCharts({
   function click(event: React.MouseEvent<HTMLCanvasElement>) {
     if (!data || !lease || !interactive) return;
     const p = point(event), seq = ++clickSeq.current, token = epoch.current.value;
-    const valid = () => mounted.current && epoch.current.value === token &&
+    const valid = () => mounted.current && visible.current && epoch.current.value === token &&
       seq === clickSeq.current && displayed.current === lease && !lease.released;
     void api.hitTestTreemap(data.comparisonId, data.layoutId, p.x, p.y).then(
       (hit) => { if (valid() && hit) onSelect(hit.nodeId); },
@@ -254,7 +283,7 @@ export function OccupancyCharts({
   }
   const shownHover = interactive && hover?.layoutId === data?.layoutId ? hover : null;
   return (
-    <section className="charts-panel">
+    <section className="charts-panel" style={active ? undefined : { display: "none" }}>
       <header className="charts-heading">
         <span>全部文件</span>
         <div className="chart-controls">

@@ -5,19 +5,20 @@ interface Props {
   label: string;
   first: ReactNode;
   second?: ReactNode;
+  secondHidden?: boolean;
   defaultRatio: number;
   minFirst: number;
   minSecond: number;
 }
 
 // Only sizes the existing panels. Resizing does not remount children or request data.
-export function SplitPane({ axis, label, first, second, defaultRatio, minFirst, minSecond }: Props) {
+export function SplitPane({ axis, label, first, second, secondHidden = false, defaultRatio, minFirst, minSecond }: Props) {
   const id = useId();
   const container = useRef<HTMLDivElement>(null);
   const end = useRef<HTMLDivElement>(null);
   const separator = useRef<HTMLDivElement>(null);
   const ratio = useRef(defaultRatio);
-  const enabled = second != null;
+  const enabled = second != null && !secondHidden;
   useLayoutEffect(() => {
     const parent = container.current, target = end.current, handle = separator.current;
     if (!enabled || !parent || !target || !handle) return;
@@ -113,8 +114,9 @@ export function SplitPane({ axis, label, first, second, defaultRatio, minFirst, 
           aria-label={label} aria-orientation={axis === "horizontal" ? "vertical" : "horizontal"}
           aria-controls={id + "-first " + id + "-second"}
           title="拖动调整 · 双击恢复 · 方向键微调" />
-        <div ref={end} id={id + "-second"} className="split-pane-second" style={secondMin}>{second}</div>
       </>}
+      {second != null && <div ref={end} id={id + "-second"} className="split-pane-second"
+        style={{ ...secondMin, ...(secondHidden ? { display: "none" } : {}) }}>{second}</div>}
     </div>
   );
 }

@@ -18,10 +18,11 @@ class Bitmap {
   constructor() { Bitmap.instances.push(this); }
   load() { this.complete = true; this.naturalWidth = 4096; this.onload?.(); }
 }
+let resizeChart: () => void;
 beforeEach(() => {
   Bitmap.instances = [];
   vi.stubGlobal("Image", Bitmap);
-  vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+  vi.stubGlobal("ResizeObserver", class { constructor(callback: () => void) { resizeChart = callback; } observe() {} disconnect() {} });
   vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 800, 400));
   vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
     scale: vi.fn(), clearRect: vi.fn(), drawImage: vi.fn(), strokeRect: vi.fn(),
@@ -53,13 +54,77 @@ function frame(layoutId: string, fileCount: number, comparisonId = "one"): FullT
     netDelta: "0", exportedTotal: "9007199254740993", labels: [], warnings: [],
   };
 }
-function chart(comparisonId: string, mode: ChartMode, selectedId: string | null = null, onSelect = (_id: string) => {}) {
+function chart(comparisonId: string, mode: ChartMode, selectedId: string | null = null, onSelect = (_id: string) => {}, active = true) {
   return <OccupancyCharts comparisonId={comparisonId} metric="size" mode={mode}
-    onMetricChange={() => {}} onModeChange={() => {}} selectedId={selectedId} onSelect={onSelect} />;
+    active={active} onMetricChange={() => {}} onModeChange={() => {}} selectedId={selectedId} onSelect={onSelect} />;
 }
 async function flush() { await act(async () => {}); }
 async function load() { await act(async () => Bitmap.instances.at(-1)!.load()); }
 function canvas() { return screen.getByLabelText("全部文件层级占用图"); }
+
+it("defers first load and reuses layout, image and canvas pixels across visibility toggles", async () => {
+  vi.mocked(api.getFullTreemap).mockResolvedValue(frame("first", 10));
+  const view = render(chart("one", "after", null, undefined, false));
+  await flush();
+  expect(api.getFullTreemap).not.toHaveBeenCalled();
+  view.rerender(chart("one", "after"));
+  await flush(); await load();
+  const element = canvas();
+  const context = (element as HTMLCanvasElement).getContext("2d")!;
+  const draws = vi.mocked(context.drawImage).mock.calls.length;
+  for (let i = 0; i < 3; i++) {
+    view.rerender(chart("one", "after", null, undefined, false));
+    await flush();
+    act(() => resizeChart());
+    expect(api.releaseTreemap).not.toHaveBeenCalled();
+    view.rerender(chart("one", "after"));
+    await flush();
+    act(() => resizeChart());
+    expect(canvas()).toBe(element);
+  }
+  expect(api.getFullTreemap).toHaveBeenCalledTimes(1);
+  expect(Bitmap.instances).toHaveLength(1);
+  expect(context.drawImage).toHaveBeenCalledTimes(draws);
+  expect(canvas().getAttribute("data-layout-id")).toBe("first");
+  vi.mocked(HTMLCanvasElement.prototype.getBoundingClientRect).mockReturnValue(new DOMRect(0, 0, 900, 400));
+  act(() => resizeChart());
+  expect(context.drawImage).toHaveBeenCalledTimes(draws + 1);
+  view.unmount();
+  expect(api.releaseTreemap).toHaveBeenCalledWith("one", "first");
+});
+
+it("finishes a hidden in-flight view and draws it on reopen without requesting twice", async () => {
+  const late = deferred<FullTreemapData>();
+  vi.mocked(api.getFullTreemap).mockReturnValue(late.promise);
+  const view = render(chart("one", "after"));
+  await flush();
+  view.rerender(chart("one", "after", null, undefined, false));
+  await act(async () => late.resolve(frame("late", 99)));
+  await load();
+  expect(api.releaseTreemap).not.toHaveBeenCalled();
+  expect(canvas().getAttribute("data-layout-id")).toBeNull();
+  view.rerender(chart("one", "after"));
+  await flush();
+  act(() => resizeChart());
+  expect(api.getFullTreemap).toHaveBeenCalledTimes(1);
+  expect(canvas().getAttribute("data-layout-id")).toBe("late");
+});
+
+it("invalidates retained hidden views when the comparison or view changes", async () => {
+  vi.mocked(api.getFullTreemap).mockResolvedValueOnce(frame("old", 10)).mockResolvedValueOnce(frame("new", 20, "two"));
+  const view = render(chart("one", "after"));
+  await flush(); await load();
+  view.rerender(chart("one", "after", null, undefined, false));
+  await flush();
+  view.rerender(chart("two", "before", null, undefined, false));
+  await flush();
+  expect(api.releaseTreemap).toHaveBeenCalledWith("one", "old");
+  expect(api.getFullTreemap).toHaveBeenCalledTimes(1);
+  view.rerender(chart("two", "before"));
+  await flush(); await load();
+  expect(api.getFullTreemap).toHaveBeenLastCalledWith("two", "size", "before", 0);
+  expect(canvas().getAttribute("data-layout-id")).toBe("new");
+});
 
 it("requests only the current view, discards late frames, and recomputes revisited modes", async () => {
   const before = deferred<FullTreemapData>(), after = deferred<FullTreemapData>();

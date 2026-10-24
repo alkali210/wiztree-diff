@@ -38,6 +38,23 @@ function mount(axis: "horizontal" | "vertical" = "horizontal", first = <div>firs
   const size = () => parseFloat(view.container.querySelector<HTMLElement>(".split-pane-second")!.style.flexBasis);
   return { ...view, handle, size };
 }
+it("hides a pane while retaining child state and adjusted size", () => {
+  function Counter() { const [value, setValue] = useState(0); return <button onClick={() => setValue(value + 1)}>count {value}</button>; }
+  const pane = (hidden: boolean) => <SplitPane axis="vertical" label="resize" first={<Counter />} second={<input aria-label="setting" defaultValue="initial" />}
+    secondHidden={hidden} defaultRatio={0.4} minFirst={180} minSecond={200} />;
+  const view = render(pane(false));
+  fireEvent.click(screen.getByText("count 0"));
+  fireEvent.change(screen.getByLabelText("setting"), {target: {value: "retained"}});
+  fireEvent.keyDown(screen.getByRole("separator"), {key: "ArrowUp"});
+  const size = view.container.querySelector<HTMLElement>(".split-pane-second")!.style.flexBasis;
+  view.rerender(pane(true));
+  expect(screen.queryByRole("separator")).toBeNull();
+  expect(view.container.querySelector<HTMLElement>(".split-pane-second")!.style.display).toBe("none");
+  expect(screen.getByText("count 1")).toBeTruthy();
+  view.rerender(pane(false));
+  expect((screen.getByLabelText("setting") as HTMLInputElement).value).toBe("retained");
+  expect(view.container.querySelector<HTMLElement>(".split-pane-second")!.style.flexBasis).toBe(size);
+});
 it.each(["horizontal", "vertical"] as const)("drags %s panels, clamps both limits and releases capture", (axis) => {
   const { handle, size } = mount(axis);
   const coordinate = axis === "horizontal" ? "clientX" : "clientY";

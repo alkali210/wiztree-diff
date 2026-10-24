@@ -20,7 +20,10 @@ import { RootList } from "./components/RootList";
 import { FileTypePanel } from "./components/FileTypePanel";
 import { CategoryPanel } from "./components/CategoryPanel";
 import { SplitPane } from "./components/SplitPane";
+import { PanelToggle } from "./components/PanelToggle";
 import "./App.css";
+// Record count bounds layout work better than the disk sizes represented by CSV rows.
+const DEFER_TREEMAP_ROWS = 1_000_000;
 const statuses: Status[] = [
   "added",
   "removed",
@@ -36,6 +39,12 @@ const labels: Record<Status, string> = {
   unchanged: "不变",
 };
 export default function App() {
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [extensionsCollapsed, setExtensionsCollapsed] = useState(false);
+  const [treemapPreference, setTreemapPreference] = useState<{
+    comparisonId: string;
+    collapsed: boolean;
+  } | null>(null);
   const [metric, setMetric] = useState<Metric>("size"),
     [mode, setMode] = useState<ChartMode>("after");
   const [selectedName, setSelectedName] = useState("");
@@ -109,6 +118,10 @@ export default function App() {
   const allowed =
     comparison &&
     (!comparison.warnings.length || confirmed === comparison.comparisonId);
+  const largeComparison = !!comparison &&
+    comparison.before.rows + comparison.after.rows >= DEFER_TREEMAP_ROWS;
+  const treemapCollapsed = treemapPreference && treemapPreference.comparisonId === comparison?.comparisonId
+    ? treemapPreference.collapsed : largeComparison;
   return (
     <main>
       <ImportPanel onReady={refresh} />
@@ -135,8 +148,16 @@ export default function App() {
       )}
       {comparison && (
         <>
+          <div className="workspace-controls">
+            <PanelToggle panel="left" label="左侧栏" expanded={!sidebarCollapsed} controls="workspace-sidebar"
+              onClick={() => setSidebarCollapsed((value) => !value)} />
+            <PanelToggle panel="bottom" label="占用图" expanded={!treemapCollapsed} controls="workspace-treemap" disabled={!allowed}
+              onClick={() => setTreemapPreference({ comparisonId: comparison.comparisonId, collapsed: !treemapCollapsed })} />
+            <PanelToggle panel="right" label="右侧栏" expanded={!extensionsCollapsed} controls="workspace-extensions"
+              onClick={() => setExtensionsCollapsed((value) => !value)} />
+          </div>
           <div className="workspace">
-            <aside className="left-pane">
+            <aside id="workspace-sidebar" className="left-pane" hidden={sidebarCollapsed}>
               <section className="global-totals">
                 <h2>工作区</h2>
                 {["before", "after"].map((side, i) => {
@@ -226,6 +247,7 @@ export default function App() {
               defaultRatio={0.34}
               minFirst={180}
               minSecond={200}
+              secondHidden={treemapCollapsed}
               first={
                 <SplitPane
                   axis="horizontal"
@@ -233,6 +255,7 @@ export default function App() {
                   defaultRatio={0.25}
                   minFirst={300}
                   minSecond={250}
+                  secondHidden={extensionsCollapsed}
                   first={
                     <div className="center-pane">
                       {rootReview && (
@@ -293,7 +316,7 @@ export default function App() {
                     </div>
                   }
                   second={
-                    <aside className="right-pane">
+                    <aside id="workspace-extensions" className="right-pane">
                       {allowed && (
                         <FileTypePanel
                           comparisonId={comparison.comparisonId}
@@ -313,15 +336,18 @@ export default function App() {
                 />
               }
               second={allowed ? (
-                <OccupancyCharts
-                  metric={metric}
-                  mode={mode}
-                  onMetricChange={setMetric}
-                  onModeChange={setMode}
-                  selectedId={selected}
-                  comparisonId={comparison.comparisonId}
-                  onSelect={setSelected}
-                />
+                <div id="workspace-treemap" className="treemap-panel">
+                  <OccupancyCharts
+                    active={!treemapCollapsed}
+                    metric={metric}
+                    mode={mode}
+                    onMetricChange={setMetric}
+                    onModeChange={setMode}
+                    selectedId={selected}
+                    comparisonId={comparison.comparisonId}
+                    onSelect={setSelected}
+                  />
+                </div>
               ) : null}
             />
           </div>
