@@ -35,9 +35,3 @@ pnpm tauri build --bundles nsis
 ```
 
 运行覆盖改动路径的测试。交互改动需在真实桌面窗口验证；不能只以编译成功代替行为验证。测试关注行为、边界、精度、状态变化和错误，不固定无关文案、实现细节或 mock 转发。
-
-## 文档与交付
-
-- 更新受影响的文档和 CHANGELOG；详细内容分类放入 `docs/`，避免不断扩充 README。
-- 排除 `verification/`、截图、`csv-example/`、`.tmp/`、Git 元数据、`node_modules/`、`dist/`、`src-tauri/target/`、`src-tauri/gen/`、数据库和临时记录。
-- 打包后核对条目、解压并验证构建；删除自己的临时验证目录，不改动用户 CSV 或与任务无关的文件。

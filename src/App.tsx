@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { isTauri } from "@tauri-apps/api/core";
+import { WindowControls } from "./components/WindowControls";
 import { api } from "./api";
 import { bytes, errorText, signed } from "./format";
 import type {
@@ -124,6 +126,11 @@ export default function App() {
     ? treemapPreference.collapsed : largeComparison;
   return (
     <main>
+      {isTauri() && (
+        <header className="window-header" data-tauri-drag-region>
+          <WindowControls />
+        </header>
+      )}
       <ImportPanel onReady={refresh} />
       {comparison?.orderWarning && (
         <div className="warning" role="status">
