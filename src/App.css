@@ -652,6 +652,7 @@ main {
   border-bottom: 1px solid #f0f3f6;
   font-size: 11px;
   color: #778191;
+  user-select: none;
 }
 .tree-row > span:not(.node-name) {
   padding: 0 8px;

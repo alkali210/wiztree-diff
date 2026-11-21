@@ -712,17 +712,21 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
                 }
                 style={{ transform: `translateY(${item.start}px)` }}
                 onClick={() => select(r.nodeId)}
-                onDoubleClick={() =>
-                  r.expandable
-                    ? void navigate(r.nodeId, true)
-                    : onSelect(r.nodeId)
-                }
+                onDoubleClick={() => {
+                  if (!r.expandable) {
+                    onSelect(r.nodeId);
+                    return;
+                  }
+                  if (expanded.current.has(r.nodeId)) collapse(r.nodeId);
+                  else void navigate(r.nodeId, true);
+                }}
               >
                 <span
                   className="node-name"
                   style={{ paddingLeft: 8 + v.depth * 16 }}
                 >
                   <button
+                    type="button"
                     className="disclosure"
                     aria-label={
                       expanded.current.has(r.nodeId) ? "收起目录" : "展开目录"
@@ -734,6 +738,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
                         ? collapse(r.nodeId)
                         : void navigate(r.nodeId, true);
                     }}
+                    onDoubleClick={(e) => e.stopPropagation()}
                   >
                     {r.expandable
                       ? expanded.current.has(r.nodeId)

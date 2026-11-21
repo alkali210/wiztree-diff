@@ -283,3 +283,34 @@ it("loads batched Windows system icons for folders and file extensions and falls
       .querySelector("i.file-glyph"),
   ).not.toBeNull();
 });
+
+it("toggles folder expansion on row double-click and prevents rapid disclosure clicks from bouncing open", async () => {
+  vi.mocked(api.listChildren).mockImplementation(async (_id, parent) => {
+    if (!parent) return page(row("n1", "BDalSystemData", true));
+    return page(row("n2", "BuildingBlocks", true));
+  });
+
+  render(<Tree />);
+  const folderText = await screen.findByText("BDalSystemData");
+  const folderRow = folderText.closest('[role="treeitem"]')!;
+
+  // Double-clicking the row expands the directory.
+  fireEvent.doubleClick(folderRow);
+  await screen.findByText("BuildingBlocks");
+  expect(folderRow.getAttribute("aria-expanded")).toBe("true");
+
+  // Double-clicking the row again collapses the directory.
+  fireEvent.doubleClick(folderRow);
+  expect(screen.queryByText("BuildingBlocks")).toBeNull();
+  expect(folderRow.getAttribute("aria-expanded")).toBe("false");
+
+  // Rapidly clicking the disclosure button twice (click, click, dblclick) must end collapsed without bouncing back open.
+  const toggleBtn = disclosure("BDalSystemData");
+  fireEvent.click(toggleBtn);
+  await screen.findByText("BuildingBlocks");
+  fireEvent.click(toggleBtn);
+  fireEvent.doubleClick(toggleBtn);
+  await act(async () => {});
+  expect(screen.queryByText("BuildingBlocks")).toBeNull();
+  expect(folderRow.getAttribute("aria-expanded")).toBe("false");
+});
