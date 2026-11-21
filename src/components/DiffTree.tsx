@@ -9,7 +9,17 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { api } from "../api";
 import { bytes, errorText, signed } from "../format";
-import type { ChildRow, Metric } from "../types";
+import type { ChildRow, ChildSort, ChildSortBy, Metric, SortDirection } from "../types";
+const DEFAULT_DIRECTION: Record<ChildSortBy, SortDirection> = {
+  name: "asc",
+  before: "desc",
+  after: "desc",
+  delta: "desc",
+  kind: "asc",
+  beforeModified: "desc",
+  afterModified: "desc",
+  attributes: "asc",
+};
 export interface Breadcrumb {
   nodeId: string;
   name: string;
@@ -65,8 +75,50 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     anchor = useRef<{ key: string; offset: number } | null>(null);
   currentSelected.current = selected;
   const [, render] = useState(0),
-    [hint, setHint] = useState("");
+    [hint, setHint] = useState(""),
+    [sortState, setSortState] = useState<{
+      comparisonId: string;
+      by: ChildSortBy;
+      direction: SortDirection;
+    }>({ comparisonId, by: "name", direction: "asc" });
+  const sort =
+    sortState.comparisonId === comparisonId
+      ? sortState
+      : { comparisonId, by: "name" as const, direction: "asc" as const };
+  const sortMetric: Metric =
+    sort.by === "before" || sort.by === "after" || sort.by === "delta"
+      ? metric
+      : "size";
+  const currentSort = useRef<ChildSort>({
+    by: sort.by,
+    direction: sort.direction,
+    metric: sortMetric,
+  });
+  currentSort.current = {
+    by: sort.by,
+    direction: sort.direction,
+    metric: sortMetric,
+  };
+  const previousScopeKey = useRef("");
   const redraw = () => render((v) => v + 1);
+  function toggleSort(by: ChildSortBy) {
+    setSortState((prev) => {
+      const active =
+        prev.comparisonId === comparisonId
+          ? prev
+          : { comparisonId, by: "name" as const, direction: "asc" as const };
+      return {
+        comparisonId,
+        by,
+        direction:
+          active.by === by
+            ? active.direction === "asc"
+              ? "desc"
+              : "asc"
+            : DEFAULT_DIRECTION[by],
+      };
+    });
+  }
   function find(id: string) {
     for (const p of pages.current.values()) {
       const r = p.rows.find((r) => r.nodeId === id);
@@ -207,6 +259,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
         comparisonId,
         parent || null,
         changesOnly,
+        currentSort.current,
         more ? own.cursor : null,
       );
       if (
@@ -364,6 +417,11 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     },
   }));
   useEffect(() => {
+    const scopeKey = `${comparisonId}\0${changesOnly}`;
+    const preserveExpanded = previousScopeKey.current === scopeKey;
+    previousScopeKey.current = scopeKey;
+    const wasExpanded = preserveExpanded ? new Set(expanded.current) : null;
+    const wasScope = preserveExpanded ? scope.current : null;
     epoch.current++;
     const generation = epoch.current;
     navigation.current++;
@@ -371,10 +429,40 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     viewport.current = [];
     pages.current.clear();
     expanded.current.clear();
-    scope.current = [];
-    onScope([]);
-    setHint("");
+    if (!preserveExpanded) {
+      scope.current = [];
+      onScope([]);
+      setHint("");
+    } else if (scroll.current) {
+      scroll.current.scrollTop = 0;
+    }
     void (async () => {
+      if (preserveExpanded && wasExpanded && wasScope) {
+        async function reloadTree(parent: string) {
+          if (!(await load(parent)) || generation !== epoch.current) return;
+          const rows = pages.current.get(parent)?.rows ?? [];
+          for (const row of rows) {
+            if (generation !== epoch.current) return;
+            if (row.expandable && wasExpanded!.has(row.nodeId)) {
+              expanded.current.add(row.nodeId);
+              redraw();
+              await reloadTree(row.nodeId);
+            }
+          }
+        }
+        await reloadTree("");
+        if (generation !== epoch.current) return;
+        let kept = 0;
+        while (
+          kept < wasScope.length &&
+          expanded.current.has(wasScope[kept].nodeId)
+        )
+          kept++;
+        const nextScope = wasScope.slice(0, kept);
+        scope.current = nextScope;
+        onScope(nextScope);
+        return;
+      }
       if (!(await load(""))) return;
       if (!changesOnly && reveal?.comparisonId === comparisonId) {
         setHint("已关闭“仅变化”，以定位占用图中的目录。");
@@ -389,7 +477,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     return () => {
       epoch.current++;
     };
-  }, [comparisonId, changesOnly]);
+  }, [comparisonId, changesOnly, sort.by, sort.direction, sortMetric]);
   const visible: Visible[] = [];
   function flatten(parent: string, depth: number) {
     const p = pages.current.get(parent);
@@ -497,14 +585,60 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
         onKeyDown={key}
       >
         <div className="tree-heading">
-          <span>名称</span>
-          <span>{metric === "size" ? "大小" : "分配"}（之前）</span>
-          <span>{metric === "size" ? "大小" : "分配"}（之后）</span>
-          <span>Δ {metric === "size" ? "大小" : "分配"}</span>
-          <span>类型</span>
-          <span>修改时间（之前）</span>
-          <span>修改时间（之后）</span>
-          <span>属性</span>
+          {(
+            [
+              { by: "name", label: "名称" },
+              {
+                by: "before",
+                label: `${metric === "size" ? "大小" : "分配"}（之前）`,
+                numeric: true,
+              },
+              {
+                by: "after",
+                label: `${metric === "size" ? "大小" : "分配"}（之后）`,
+                numeric: true,
+              },
+              {
+                by: "delta",
+                label: `Δ ${metric === "size" ? "大小" : "分配"}`,
+                numeric: true,
+              },
+              { by: "kind", label: "类型" },
+              { by: "beforeModified", label: "修改时间（之前）" },
+              { by: "afterModified", label: "修改时间（之后）" },
+              { by: "attributes", label: "属性" },
+            ] as { by: ChildSortBy; label: string; numeric?: boolean }[]
+          ).map((col) => {
+            const active = sort.by === col.by;
+            const dir = active ? sort.direction : null;
+            return (
+              <button
+                key={col.by}
+                type="button"
+                className={
+                  "tree-sort" +
+                  (col.numeric ? " numeric" : "") +
+                  (active ? " active" : "")
+                }
+                data-sort-by={col.by}
+                data-sort-dir={dir ?? undefined}
+                aria-pressed={active}
+                title={
+                  active
+                    ? `${col.label}（当前${dir === "asc" ? "升序" : "降序"}，点击切换）`
+                    : `按${col.label}排序`
+                }
+                onClick={() => toggleSort(col.by)}
+              >
+                <span>{col.label}</span>
+                {active && (
+                  <i className="sort-indicator" aria-hidden="true">
+                    {dir === "asc" ? "▲" : "▼"}
+                  </i>
+                )}
+              </button>
+            );
+          })}
         </div>
         <div style={{ height: virtual.getTotalSize(), position: "relative" }}>
           {items.map((item) => {

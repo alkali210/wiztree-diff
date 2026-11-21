@@ -9,7 +9,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { api } from "../api";
-import type { ChildPage, ChildRow } from "../types";
+import type { ChildPage, ChildRow, ChildSort, Metric } from "../types";
 import { DiffTree } from "./DiffTree";
 
 vi.mock("../api", () => ({ api: { listChildren: vi.fn() } }));
@@ -61,7 +61,13 @@ function pending() {
   });
   return { promise, resolve };
 }
-function Tree({ comparisonId = "c-one" }: { comparisonId?: string }) {
+function Tree({
+  comparisonId = "c-one",
+  metric = "size",
+}: {
+  comparisonId?: string;
+  metric?: Metric;
+}) {
   const [selected, onSelect] = useState<string | null>(null);
   const [scope, setScope] = useState("");
   return (
@@ -69,7 +75,7 @@ function Tree({ comparisonId = "c-one" }: { comparisonId?: string }) {
       <output aria-label="目录范围">{scope}</output>
       <DiffTree
         comparisonId={comparisonId}
-        metric="size"
+        metric={metric}
         changesOnly={false}
         selected={selected}
         onSelect={onSelect}
@@ -144,4 +150,85 @@ it("rejects pending children from a replaced comparison", async () => {
   });
   await waitFor(() => expect(screen.queryByText("obsolete.dll")).toBeNull());
   expect(screen.queryByText("System32")).toBeNull();
+});
+
+it("sorts by clicked column headers, toggles direction, preserves expanded folders, and follows metric changes", async () => {
+  const calls: Array<{ parent: string | null; sort: ChildSort }> = [];
+  vi.mocked(api.listChildren).mockImplementation(async (_id, parent, _changes, sort) => {
+    calls.push({ parent, sort });
+    if (!parent) {
+      const items = [row("n1", "Alpha"), row("n2", "Beta")];
+      return page(...(sort.direction === "desc" ? items.reverse() : items));
+    }
+    const children = [row("n3", "a.dll", false), row("n4", "b.dll", false)];
+    return page(...(sort.direction === "desc" ? children.reverse() : children));
+  });
+
+  const view = render(<Tree metric="size" />);
+  await screen.findByText("Alpha");
+  expect(calls.at(-1)).toEqual({
+    parent: null,
+    sort: { by: "name", direction: "asc", metric: "size" },
+  });
+
+  fireEvent.click(disclosure("Alpha"));
+  await screen.findByText("a.dll");
+
+  // Clicking a size column defaults to descending and reloads expanded folder too.
+  fireEvent.click(screen.getByRole("button", { name: "大小（之后）" }));
+  await waitFor(() =>
+    expect(calls.some((c) => c.parent === "n1" && c.sort.by === "after" && c.sort.direction === "desc")).toBe(true),
+  );
+  expect(screen.getByText("a.dll")).toBeTruthy();
+
+  // Clicking the active column again flips to ascending.
+  fireEvent.click(screen.getByRole("button", { name: "大小（之后）" }));
+  await waitFor(() =>
+    expect(calls.some((c) => c.parent === null && c.sort.by === "after" && c.sort.direction === "asc")).toBe(true),
+  );
+
+  // Switching metric re-sorts when sorting by a metric column.
+  view.rerender(<Tree metric="allocated" />);
+  await waitFor(() =>
+    expect(
+      calls.some(
+        (c) => c.parent === null && c.sort.by === "after" && c.sort.direction === "asc" && c.sort.metric === "allocated",
+      ),
+    ).toBe(true),
+  );
+
+  // Switching to a non-metric column does not trigger an extra reload on metric change.
+  fireEvent.click(screen.getByRole("button", { name: "名称" }));
+  await waitFor(() =>
+    expect(calls.some((c) => c.parent === null && c.sort.by === "name" && c.sort.direction === "asc")).toBe(true),
+  );
+  const countBefore = calls.length;
+  view.rerender(<Tree metric="size" />);
+  await act(async () => {});
+  expect(calls.length).toBe(countBefore);
+});
+
+it("discards stale sort responses when the user rapidly changes sort order", async () => {
+  const firstSort = pending();
+  const secondSort = pending();
+  vi.mocked(api.listChildren)
+    .mockResolvedValueOnce(page(row("n1", "Initial")))
+    .mockReturnValueOnce(firstSort.promise)
+    .mockReturnValueOnce(secondSort.promise);
+
+  render(<Tree />);
+  await screen.findByText("Initial");
+
+  fireEvent.click(screen.getByRole("button", { name: "Δ 大小" }));
+  fireEvent.click(screen.getByRole("button", { name: "Δ 大小" }));
+
+  await act(async () => {
+    secondSort.resolve(page(row("n3", "LatestSort")));
+  });
+  await act(async () => {
+    firstSort.resolve(page(row("n2", "StaleSort")));
+  });
+
+  expect(screen.getByText("LatestSort")).toBeTruthy();
+  expect(screen.queryByText("StaleSort")).toBeNull();
 });

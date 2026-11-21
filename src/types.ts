@@ -5,6 +5,21 @@ export type Status =
   | "unchanged"
   | "typeChanged";
 export type Metric = "size" | "allocated";
+export type ChildSortBy =
+  | "name"
+  | "before"
+  | "after"
+  | "delta"
+  | "kind"
+  | "beforeModified"
+  | "afterModified"
+  | "attributes";
+export type SortDirection = "asc" | "desc";
+export interface ChildSort {
+  by: ChildSortBy;
+  direction: SortDirection;
+  metric: Metric;
+}
 export type ChartMode = "before" | "after" | "delta";
 export interface ApiError {
   code: string;

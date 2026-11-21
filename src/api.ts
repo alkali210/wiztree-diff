@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ChartMode,
   ChildPage,
+  ChildSort,
   ComparisonSummary,
   JobSummary,
   Metric,
@@ -31,12 +32,14 @@ export const api = {
     comparisonId: string,
     parentId: string | null,
     changesOnly: boolean,
+    sort: ChildSort,
     cursor: string | null = null,
   ) =>
     invoke<ChildPage>("list_children", {
       comparisonId,
       parentId,
       changesOnly,
+      sort,
       cursor,
     }),
   getDetails: (comparisonId: string, nodeId: string) =>

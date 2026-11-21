@@ -43,6 +43,42 @@ pub enum Metric {
     Size,
     Allocated,
 }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ChildSortBy {
+    #[default]
+    Name,
+    Before,
+    After,
+    Delta,
+    Kind,
+    BeforeModified,
+    AfterModified,
+    Attributes,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildSort {
+    pub by: ChildSortBy,
+    pub direction: SortDirection,
+    pub metric: Metric,
+}
+impl Default for ChildSort {
+    fn default() -> Self {
+        Self {
+            by: ChildSortBy::Name,
+            direction: SortDirection::Asc,
+            metric: Metric::Size,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum ChartMode {

@@ -424,6 +424,7 @@ pub async fn list_children(
     comparison_id: String,
     parent_id: Option<String>,
     changes_only: bool,
+    sort: ChildSort,
     cursor: Option<String>,
 ) -> Result<ChildPage> {
     let state = state.inner().clone();
@@ -434,6 +435,7 @@ pub async fn list_children(
             &comparison_id,
             parent_id.as_deref(),
             changes_only,
+            sort,
             cursor.as_deref(),
         )
     })

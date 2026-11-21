@@ -574,14 +574,14 @@ main {
   position: relative;
 }
 .tree-scroll > div {
-  min-width: 980px;
+  min-width: 1000px;
 }
 .tree-heading,
 .tree-row {
   display: grid;
-  grid-template-columns: minmax(200px, 1fr) 85px 85px 85px 80px 138px 138px 70px;
+  grid-template-columns: minmax(200px, 1fr) 98px 98px 92px 84px 142px 142px 72px;
   align-items: center;
-  min-width: 980px;
+  min-width: 1000px;
 }
 .tree-heading {
   height: 32px;
@@ -593,10 +593,45 @@ main {
   color: #727e90;
   font-size: 11px;
 }
-.tree-heading > span {
+.tree-heading > .tree-sort {
+  height: 100%;
   padding: 0 8px;
+  border: 0;
   border-right: 1px solid #eef1f4;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
   white-space: nowrap;
+  text-align: left;
+}
+.tree-heading > .tree-sort.numeric {
+  justify-content: flex-end;
+}
+.tree-heading > .tree-sort:last-child {
+  border-right: 0;
+}
+.tree-heading > .tree-sort:hover {
+  background: #eef3f8;
+  color: #334157;
+}
+.tree-heading > .tree-sort.active {
+  color: #263247;
+  font-weight: 600;
+}
+.tree-heading > .tree-sort > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sort-indicator {
+  font-style: normal;
+  font-size: 8px;
+  line-height: 1;
+  color: #4487ce;
+  flex: none;
 }
 .tree-row {
   height: 28px;

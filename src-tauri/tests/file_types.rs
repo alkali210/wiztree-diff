@@ -2,7 +2,7 @@ use wiztree_diff_lib::{
     diff, file_extensions,
     import::{self, JobControl},
     store::{self, Comparison},
-    types::{Metric, SnapshotSide, Status},
+    types::{ChildSort, Metric, SnapshotSide, Status},
 };
 fn build(b: &str, a: &str) -> (tempfile::TempDir, Comparison) {
     let dir = tempfile::TempDir::new().unwrap();
@@ -73,7 +73,7 @@ fn exact_leaf_scopes_hardlinks_zeros_orphans_type_changes_and_metadata() {
     assert_eq!(swap_after.total.size, "5");
     assert_eq!(swap_after.rows[0].extension, ".mp3");
     let sub = id(&c, "C:\\root\\sub\\");
-    let children = diff::list_children(&c, "test", Some(&sub), false, None).unwrap();
+    let children = diff::list_children(&c, "test", Some(&sub), false, ChildSort::default(), None).unwrap();
     let row = children.rows.iter().find(|r| r.node_id == leaf).unwrap();
     assert_eq!(row.status, Status::Unchanged);
     assert_eq!(

@@ -3,6 +3,7 @@ use crate::{
     types::*,
 };
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 
 pub(crate) fn node_number(id: &str) -> Result<NodeId> {
     id.strip_prefix('n')
@@ -166,9 +167,214 @@ struct Cursor {
     comparison: String,
     parent: Option<String>,
     changes: bool,
+    sort: ChildSort,
     directory: bool,
     rank: u64,
     node: NodeId,
+}
+
+fn default_cmp(comparison: &Comparison, a: NodeId, b: NodeId) -> Ordering {
+    let (na, nb) = (comparison.node(a), comparison.node(b));
+    nb.expandable
+        .cmp(&na.expandable)
+        .then_with(|| comparison.basename(a).cmp(comparison.basename(b)))
+        .then(a.cmp(&b))
+}
+
+fn apply_direction(order: Ordering, direction: SortDirection) -> Ordering {
+    match direction {
+        SortDirection::Asc => order,
+        SortDirection::Desc => order.reverse(),
+    }
+}
+
+fn cmp_opt<T>(
+    a: Option<T>,
+    b: Option<T>,
+    direction: SortDirection,
+    cmp: impl FnOnce(T, T) -> Ordering,
+) -> Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => apply_direction(cmp(x, y), direction),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn side_metric(comparison: &Comparison, id: NodeId, side: usize, metric: Metric) -> Option<u64> {
+    comparison.entry(id, side).map(|entry| match metric {
+        Metric::Size => entry.size,
+        Metric::Allocated => entry.allocated,
+    })
+}
+
+fn metric_delta(comparison: &Comparison, id: NodeId, metric: Metric) -> i128 {
+    let after = side_metric(comparison, id, 1, metric).unwrap_or(0) as i128;
+    let before = side_metric(comparison, id, 0, metric).unwrap_or(0) as i128;
+    after - before
+}
+
+fn kind_key(comparison: &Comparison, id: NodeId) -> (u8, &str) {
+    let node = comparison.node(id);
+    if node.status == Status::TypeChanged {
+        return if comparison
+            .entry(id, 0)
+            .is_some_and(|e| e.kind == NodeKind::Directory)
+        {
+            (0, "")
+        } else {
+            (1, "")
+        };
+    }
+    let current = comparison
+        .entry(id, 1)
+        .or_else(|| comparison.entry(id, 0));
+    if current.is_some_and(|e| e.kind == NodeKind::Directory) {
+        return (2, "");
+    }
+    let base = comparison.basename(id);
+    match base.rfind('.') {
+        Some(i) if i + 1 < base.len() => (4, &base[i + 1..]),
+        _ => (3, ""),
+    }
+}
+
+fn parse_datetime(text: &str) -> Option<[u16; 6]> {
+    let trimmed = text.trim();
+    let (date, time) = match trimmed.split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t.trim())),
+        None => (trimmed, None),
+    };
+    let sep = if date.contains('/') {
+        '/'
+    } else if date.contains('-') {
+        '-'
+    } else {
+        return None;
+    };
+    let mut date_parts = date.split(sep);
+    let parse_part = |part: &str, max_len: usize| -> Option<u16> {
+        if part.is_empty()
+            || part.len() > max_len
+            || !part.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        part.parse().ok()
+    };
+    let year = parse_part(date_parts.next()?, 4)?;
+    let month = parse_part(date_parts.next()?, 2)?;
+    let day = parse_part(date_parts.next()?, 2)?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (hour, minute, second) = if let Some(clock) = time {
+        let mut clock_parts = clock.split(':');
+        let h = parse_part(clock_parts.next()?, 2)?;
+        let m = parse_part(clock_parts.next()?, 2)?;
+        let s = match clock_parts.next() {
+            Some(sec) => parse_part(sec, 2)?,
+            None => 0,
+        };
+        if clock_parts.next().is_some() || h > 23 || m > 59 || s > 59 {
+            return None;
+        }
+        (h, m, s)
+    } else {
+        (0, 0, 0)
+    };
+    Some([year, month, day, hour, minute, second])
+}
+
+fn sorted_children(comparison: &Comparison, children: &[NodeId], sort: ChildSort) -> Vec<NodeId> {
+    let mut ordered = children.to_vec();
+    match sort.by {
+        ChildSortBy::Name => {
+            ordered.sort_unstable_by(|&a, &b| {
+                let (na, nb) = (comparison.node(a), comparison.node(b));
+                nb.expandable
+                    .cmp(&na.expandable)
+                    .then_with(|| {
+                        apply_direction(
+                            comparison.basename(a).cmp(comparison.basename(b)),
+                            sort.direction,
+                        )
+                    })
+                    .then(a.cmp(&b))
+            });
+        }
+        ChildSortBy::Before | ChildSortBy::After => {
+            let side = usize::from(sort.by == ChildSortBy::After);
+            ordered.sort_unstable_by(|&a, &b| {
+                cmp_opt(
+                    side_metric(comparison, a, side, sort.metric),
+                    side_metric(comparison, b, side, sort.metric),
+                    sort.direction,
+                    |x, y| x.cmp(&y),
+                )
+                .then_with(|| default_cmp(comparison, a, b))
+            });
+        }
+        ChildSortBy::Delta => {
+            ordered.sort_unstable_by(|&a, &b| {
+                apply_direction(
+                    metric_delta(comparison, a, sort.metric)
+                        .cmp(&metric_delta(comparison, b, sort.metric)),
+                    sort.direction,
+                )
+                .then_with(|| default_cmp(comparison, a, b))
+            });
+        }
+        ChildSortBy::Kind => {
+            ordered.sort_unstable_by(|&a, &b| {
+                apply_direction(
+                    kind_key(comparison, a).cmp(&kind_key(comparison, b)),
+                    sort.direction,
+                )
+                .then_with(|| default_cmp(comparison, a, b))
+            });
+        }
+        ChildSortBy::BeforeModified | ChildSortBy::AfterModified => {
+            let side = usize::from(sort.by == ChildSortBy::AfterModified);
+            let mut keyed: Vec<(Option<(Option<[u16; 6]>, &str)>, NodeId)> = children
+                .iter()
+                .map(|&id| {
+                    let raw = comparison
+                        .entry(id, side)
+                        .and_then(|e| comparison.entry_field(e, 0));
+                    (raw.map(|text| (parse_datetime(text), text)), id)
+                })
+                .collect();
+            keyed.sort_unstable_by(|(ka, a), (kb, b)| {
+                cmp_opt(*ka, *kb, sort.direction, |(da, ta), (db, tb)| match (da, db) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => ta.cmp(tb),
+                })
+                .then_with(|| default_cmp(comparison, *a, *b))
+            });
+            return keyed.into_iter().map(|(_, id)| id).collect();
+        }
+        ChildSortBy::Attributes => {
+            let attr = |id: NodeId| {
+                comparison
+                    .entry(id, 1)
+                    .and_then(|e| comparison.entry_field(e, 1))
+                    .or_else(|| {
+                        comparison
+                            .entry(id, 0)
+                            .and_then(|e| comparison.entry_field(e, 1))
+                    })
+            };
+            ordered.sort_unstable_by(|&a, &b| {
+                cmp_opt(attr(a), attr(b), sort.direction, |x, y| x.cmp(y))
+                    .then_with(|| default_cmp(comparison, a, b))
+            });
+        }
+    }
+    ordered
 }
 
 pub fn list_children(
@@ -176,20 +382,29 @@ pub fn list_children(
     comparison_id: &str,
     parent: Option<&str>,
     changes_only: bool,
+    sort: ChildSort,
     cursor: Option<&str>,
 ) -> Result<ChildPage> {
     comparison.check_id(comparison_id)?;
     let parent_id = parent_number(comparison, parent)?;
-    let children = if changes_only {
+    let base = if changes_only {
         comparison.changed_children(parent_id)
     } else {
         comparison.children(parent_id)
+    };
+    let owned;
+    let children = if sort.by == ChildSortBy::Name && sort.direction == SortDirection::Asc {
+        base
+    } else {
+        owned = sorted_children(comparison, base, sort);
+        &owned
     };
     let start = if let Some(text) = cursor {
         let c: Cursor = decode(text)?;
         if c.comparison != comparison_id
             || c.parent.as_deref() != parent
             || c.changes != changes_only
+            || c.sort != sort
         {
             return Err(invalid_cursor());
         }
@@ -217,6 +432,7 @@ pub fn list_children(
             comparison: comparison_id.into(),
             parent: parent.map(str::to_owned),
             changes: changes_only,
+            sort,
             directory: comparison.node(node).expandable,
             rank: end as u64,
             node,

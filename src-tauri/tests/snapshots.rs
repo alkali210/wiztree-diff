@@ -3,7 +3,7 @@ use tempfile::TempDir;
 use wiztree_diff_lib::{
     import::{self, JobControl},
     store::{self, Comparison},
-    types::NodeKind,
+    types::{ChildSort, ChildSortBy, NodeKind, SortDirection},
 };
 
 fn source(dir: &TempDir, name: &str, text: &str) -> std::path::PathBuf {
@@ -185,7 +185,8 @@ fn out_of_order_actual_parents_preserve_all_paths_and_exact_children() {
         ("4101", "8202")
     );
     let root = id(&conn, "C:/Root/");
-    let page = diff::list_children(&conn, "test", Some(&root), false, None).unwrap();
+    let page =
+        diff::list_children(&conn, "test", Some(&root), false, ChildSort::default(), None).unwrap();
     assert_eq!(page.total_children, 4101);
     let file = diff::get_details(&conn, &id(&conn, "C:/Root/Dir4100/File.TxT")).unwrap();
     assert_eq!(file.parent_id, Some(id(&conn, "C:/Root/Dir4100/")));
@@ -749,8 +750,15 @@ fn ranked_tree_pages_preserve_binary_unicode_order_and_validate_ranked_cursors()
         let mut actual = Vec::new();
         let mut cursor = None;
         loop {
-            let page = diff::list_children(&conn, "test", Some(&left), changes, cursor.as_deref())
-                .unwrap();
+            let page = diff::list_children(
+                &conn,
+                "test",
+                Some(&left),
+                changes,
+                ChildSort::default(),
+                cursor.as_deref(),
+            )
+            .unwrap();
             if cursor.is_none() {
                 let mut corrupt: serde_json::Value =
                     serde_json::from_str(page.next_cursor.as_deref().unwrap()).unwrap();
@@ -761,6 +769,7 @@ fn ranked_tree_pages_preserve_binary_unicode_order_and_validate_ranked_cursors()
                         "test",
                         Some(&left),
                         changes,
+                        ChildSort::default(),
                         Some(&corrupt.to_string())
                     )
                     .unwrap_err()
@@ -807,7 +816,8 @@ fn exact_statuses_internal_changes_and_signed_charts() {
     );
     let root = id(&conn, "C:\\test\\");
     let cancel = id(&conn, "C:\\test\\cancel\\");
-    let page = diff::list_children(&conn, "test", Some(&root), false, None).unwrap();
+    let page =
+        diff::list_children(&conn, "test", Some(&root), false, ChildSort::default(), None).unwrap();
     assert_eq!(page.total_children, 8);
     for row in &page.rows {
         match row.name.as_str() {
@@ -822,11 +832,12 @@ fn exact_statuses_internal_changes_and_signed_charts() {
             _ => assert_eq!(row.status, Status::Modified),
         }
     }
-    let filtered = diff::list_children(&conn, "test", Some(&root), true, None).unwrap();
+    let filtered =
+        diff::list_children(&conn, "test", Some(&root), true, ChildSort::default(), None).unwrap();
     assert_eq!(filtered.rows.len(), 6);
     assert!(filtered.rows.iter().any(|r| r.node_id == cancel));
     assert_eq!(
-        diff::list_children(&conn, "test", None, true, None)
+        diff::list_children(&conn, "test", None, true, ChildSort::default(), None)
             .unwrap()
             .rows
             .len(),
@@ -841,7 +852,15 @@ fn exact_statuses_internal_changes_and_signed_charts() {
         assert_eq!(chart.negative_total, negative);
         assert_eq!(chart.net_delta, net);
     }
-    let cancel_children = diff::list_children(&conn, "test", Some(&cancel), true, None).unwrap();
+    let cancel_children = diff::list_children(
+        &conn,
+        "test",
+        Some(&cancel),
+        true,
+        ChildSort::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(cancel_children.total_children, 2);
     for field in [true, false] {
         let sum: i64 = cancel_children
@@ -866,7 +885,8 @@ fn exact_statuses_internal_changes_and_signed_charts() {
 fn type_replacement_exact_large_integers_and_mft_are_path_based() {
     let (_dir,conn)=comparison("文件名称,大小,分配,MFTRECNO\nC:\\t\\,9007199254740993,0\nC:\\t\\swap,0,0\nC:\\t\\Ä,9007199254740993,0,018446744073709551615\nC:\\t\\link,0,0,18446744073709551615\nD:\\other,0,0,18446744073709551615\n", "文件名称,大小,分配,MFTRECNO\nC:\\t\\,9007199254740994,0\nC:\\t\\swap\\,0,0\nC:\\t\\ä,9007199254740994,0,2\nC:\\t\\link,0,0,3\nD:\\other,0,0,3\n");
     let root = id(&conn, "c:\\t\\");
-    let page = diff::list_children(&conn, "test", Some(&root), false, None).unwrap();
+    let page =
+        diff::list_children(&conn, "test", Some(&root), false, ChildSort::default(), None).unwrap();
     let swap = page.rows.iter().find(|r| r.name == "swap").unwrap();
     assert_eq!(swap.status, Status::TypeChanged);
     assert!(swap.expandable);
@@ -890,11 +910,20 @@ fn type_replacement_exact_large_integers_and_mft_are_path_based() {
         page.rows.iter().find(|r| r.name == "link").unwrap().status,
         Status::Unchanged
     );
-    assert!(diff::list_children(&conn, "stale", Some(&root), false, None).is_err());
-    assert!(diff::get_details(&conn, "n999999").is_err());
     assert!(
-        diff::list_children(&conn, "test", Some(&id(&conn, "c:\\t\\link")), false, None).is_err()
+        diff::list_children(&conn, "stale", Some(&root), false, ChildSort::default(), None)
+            .is_err()
     );
+    assert!(diff::get_details(&conn, "n999999").is_err());
+    assert!(diff::list_children(
+        &conn,
+        "test",
+        Some(&id(&conn, "c:\\t\\link")),
+        false,
+        ChildSort::default(),
+        None
+    )
+    .is_err());
 }
 #[test]
 fn tree_keyset_pagination_and_complete_signed_leaf_geometry_are_exact() {
@@ -913,8 +942,15 @@ fn tree_keyset_pagination_and_complete_signed_leaf_geometry_are_exact() {
     let mut names = std::collections::HashSet::new();
     let mut first_cursor = None;
     loop {
-        let page =
-            diff::list_children(&conn, "test", Some(&root), false, cursor.as_deref()).unwrap();
+        let page = diff::list_children(
+            &conn,
+            "test",
+            Some(&root),
+            false,
+            ChildSort::default(),
+            cursor.as_deref(),
+        )
+        .unwrap();
         assert_eq!(page.total_children, 450);
         assert!(page.rows.len() <= 200);
         for row in page.rows {
@@ -929,11 +965,33 @@ fn tree_keyset_pagination_and_complete_signed_leaf_geometry_are_exact() {
         }
     }
     assert_eq!(names.len(), 450);
-    assert!(diff::list_children(&conn, "test", None, false, first_cursor.as_deref()).is_err());
-    assert!(
-        diff::list_children(&conn, "test", Some(&root), true, first_cursor.as_deref()).is_err()
-    );
-    assert!(diff::list_children(&conn, "test", Some(&root), false, Some("garbage")).is_err());
+    assert!(diff::list_children(
+        &conn,
+        "test",
+        None,
+        false,
+        ChildSort::default(),
+        first_cursor.as_deref()
+    )
+    .is_err());
+    assert!(diff::list_children(
+        &conn,
+        "test",
+        Some(&root),
+        true,
+        ChildSort::default(),
+        first_cursor.as_deref()
+    )
+    .is_err());
+    assert!(diff::list_children(
+        &conn,
+        "test",
+        Some(&root),
+        false,
+        ChildSort::default(),
+        Some("garbage")
+    )
+    .is_err());
     for metric in [Metric::Size, Metric::Allocated] {
         for mode in [ChartMode::Before, ChartMode::After, ChartMode::Delta] {
             let layout = global_treemap::TreemapLayout::build(
@@ -1016,7 +1074,7 @@ fn missing_intermediate_roots_remain_real_roots_without_fabricated_children() {
     assert!(summary.warnings.iter().any(|s| s.contains("计数")));
     let root = id(&conn, "C:\\r\\");
     let child = id(&conn, "C:\\r\\gap\\child\\");
-    let roots = diff::list_children(&conn, "test", None, false, None).unwrap();
+    let roots = diff::list_children(&conn, "test", None, false, ChildSort::default(), None).unwrap();
     assert_eq!(roots.total_children, 3);
     assert!(
         !roots
@@ -1035,13 +1093,13 @@ fn missing_intermediate_roots_remain_real_roots_without_fabricated_children() {
             .has_changes
     );
     assert_eq!(
-        diff::list_children(&conn, "test", Some(&root), false, None)
+        diff::list_children(&conn, "test", Some(&root), false, ChildSort::default(), None)
             .unwrap()
             .total_children,
         0
     );
     assert_eq!(
-        diff::list_children(&conn, "test", Some(&child), false, None)
+        diff::list_children(&conn, "test", Some(&child), false, ChildSort::default(), None)
             .unwrap()
             .total_children,
         1
@@ -1131,8 +1189,15 @@ fn paged_direct_children_and_complete_global_leaves_respect_exact_edges() {
     let mut cursor = None;
     let mut seen = std::collections::BTreeSet::new();
     loop {
-        let page =
-            diff::list_children(&conn, "test", Some(&root), false, cursor.as_deref()).unwrap();
+        let page = diff::list_children(
+            &conn,
+            "test",
+            Some(&root),
+            false,
+            ChildSort::default(),
+            cursor.as_deref(),
+        )
+        .unwrap();
         assert_eq!(page.total_children, 450);
         for row in page.rows {
             assert!(row.name.starts_with('f'));
@@ -1209,8 +1274,15 @@ fn directory_first_cursor_crosses_the_file_boundary_without_repeats() {
     let mut cursor = None;
     let mut all = Vec::new();
     loop {
-        let page =
-            diff::list_children(&conn, "test", Some(&root), false, cursor.as_deref()).unwrap();
+        let page = diff::list_children(
+            &conn,
+            "test",
+            Some(&root),
+            false,
+            ChildSort::default(),
+            cursor.as_deref(),
+        )
+        .unwrap();
         all.extend(page.rows);
         cursor = page.next_cursor;
         if cursor.is_none() {
@@ -1346,5 +1418,150 @@ fn copied_mtimes_and_timestamp_filenames_do_not_define_export_order() {
         let c = store::build_comparison(&before, &after, "dates", &JobControl::new(), &mut |_| {})
             .unwrap();
         assert!(c.summary.order_warning.is_none());
+    }
+}
+
+#[test]
+fn list_children_sorts_all_columns_with_exact_precision_nulls_last_and_cursor_binding() {
+    let header = "文件名称,大小,分配,修改时间,属性\n";
+    let before = format!(
+        "{header}\
+C:\\s\\,9007199254741294,1000,2026/10/1 00:00:00,D\n\
+C:\\s\\dir_b\\,50,100,2026/9/30 23:59:59,D\n\
+C:\\s\\dir_a\\,200,50,2026/10/1 00:00:00,DH\n\
+C:\\s\\swap\\,10,10,2026/1/1 00:00:00,D\n\
+C:\\s\\big.bin,9007199254740993,100,2026/10/10 08:00:00,A\n\
+C:\\s\\removed.txt,30,400,2026/2/3 09:05:00,R\n\
+C:\\s\\plain,100,200,,\n"
+    );
+    let after = format!(
+        "{header}\
+C:\\s\\,9007199254741595,1200,2026/10/2 00:00:00,D\n\
+C:\\s\\dir_b\\,50,100,2026/9/30 23:59:59,D\n\
+C:\\s\\dir_a\\,200,50,2026/10/2 00:00:00,DH\n\
+C:\\s\\swap,20,20,2026/1/2 00:00:00,A\n\
+C:\\s\\big.bin,9007199254740995,50,2026/10/9 08:00:00,A\n\
+C:\\s\\added.dll,500,900,2026/10/11 12:00:00,S\n\
+C:\\s\\plain,100,200,,\n"
+    );
+    let (_dir, conn) = comparison(&before, &after);
+    let root = id(&conn, "C:\\s\\");
+    let names = |by, direction, metric| {
+        diff::list_children(
+            &conn,
+            "test",
+            Some(&root),
+            false,
+            ChildSort {
+                by,
+                direction,
+                metric,
+            },
+            None,
+        )
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r.name)
+        .collect::<Vec<_>>()
+    };
+
+    // Name keeps directories first in both directions.
+    assert_eq!(
+        names(ChildSortBy::Name, SortDirection::Asc, Metric::Size),
+        vec!["dir_a", "dir_b", "swap", "added.dll", "big.bin", "plain", "removed.txt"]
+    );
+    assert_eq!(
+        names(ChildSortBy::Name, SortDirection::Desc, Metric::Size),
+        vec!["swap", "dir_b", "dir_a", "removed.txt", "plain", "big.bin", "added.dll"]
+    );
+
+    // Before/After size & allocated: missing side sorts last in both directions.
+    assert_eq!(
+        names(ChildSortBy::Before, SortDirection::Desc, Metric::Size),
+        vec!["big.bin", "dir_a", "plain", "dir_b", "removed.txt", "swap", "added.dll"]
+    );
+    assert_eq!(
+        names(ChildSortBy::Before, SortDirection::Asc, Metric::Size),
+        vec!["swap", "removed.txt", "dir_b", "plain", "dir_a", "big.bin", "added.dll"]
+    );
+    assert_eq!(
+        names(ChildSortBy::After, SortDirection::Desc, Metric::Allocated),
+        vec!["added.dll", "plain", "dir_b", "dir_a", "big.bin", "swap", "removed.txt"]
+    );
+
+    // Delta respects signed i128 precision and metric switch (size vs allocated).
+    // Size deltas: added.dll(+500), swap(+10), big.bin(+2), dir_a/dir_b/plain(0), removed.txt(-30).
+    assert_eq!(
+        names(ChildSortBy::Delta, SortDirection::Desc, Metric::Size),
+        vec!["added.dll", "swap", "big.bin", "dir_a", "dir_b", "plain", "removed.txt"]
+    );
+    assert_eq!(
+        names(ChildSortBy::Delta, SortDirection::Asc, Metric::Size),
+        vec!["removed.txt", "dir_a", "dir_b", "plain", "big.bin", "swap", "added.dll"]
+    );
+    // Allocated deltas: added.dll(+900), swap(+10), dir_a/dir_b/plain(0), big.bin(-50), removed.txt(-400).
+    assert_eq!(
+        names(ChildSortBy::Delta, SortDirection::Asc, Metric::Allocated),
+        vec!["removed.txt", "big.bin", "dir_a", "dir_b", "plain", "swap", "added.dll"]
+    );
+
+    // Kind groups typeChanged, folders, plain files, then file extensions.
+    assert_eq!(
+        names(ChildSortBy::Kind, SortDirection::Asc, Metric::Size),
+        vec!["swap", "dir_a", "dir_b", "plain", "big.bin", "added.dll", "removed.txt"]
+    );
+
+    // Modified compares dates chronologically (2026/9/30 < 2026/10/1) with missing last.
+    assert_eq!(
+        names(ChildSortBy::BeforeModified, SortDirection::Desc, Metric::Size),
+        vec!["big.bin", "dir_a", "dir_b", "removed.txt", "swap", "added.dll", "plain"]
+    );
+    assert_eq!(
+        names(ChildSortBy::AfterModified, SortDirection::Asc, Metric::Size),
+        vec!["swap", "dir_b", "dir_a", "big.bin", "added.dll", "plain", "removed.txt"]
+    );
+
+    // Attributes use after ?? before with missing last.
+    assert_eq!(
+        names(ChildSortBy::Attributes, SortDirection::Asc, Metric::Size),
+        vec!["swap", "big.bin", "dir_b", "dir_a", "removed.txt", "added.dll", "plain"]
+    );
+
+    // Pagination under non-default sort spans pages without gaps/duplicates and rejects mismatched sort cursors.
+    let mut wide_b = "文件名称,大小,分配\nC:\\w\\,0,0\n".to_owned();
+    let mut wide_a = wide_b.clone();
+    for i in 0..250u64 {
+        wide_b.push_str(&format!("C:\\w\\f{i:03},{},{}\n", i * 10, i * 20));
+        wide_a.push_str(&format!("C:\\w\\f{i:03},{},{}\n", (249 - i) * 10, i * 20));
+    }
+    let (_dir2, wide) = comparison(&wide_b, &wide_a);
+    let wroot = id(&wide, "C:\\w\\");
+    let sort = ChildSort {
+        by: ChildSortBy::Delta,
+        direction: SortDirection::Desc,
+        metric: Metric::Size,
+    };
+    let page1 = diff::list_children(&wide, "test", Some(&wroot), false, sort, None).unwrap();
+    assert_eq!(page1.rows.len(), 200);
+    assert_eq!(page1.rows[0].name, "f000");
+    let cursor1 = page1.next_cursor.as_deref().unwrap();
+    let page2 = diff::list_children(&wide, "test", Some(&wroot), false, sort, Some(cursor1)).unwrap();
+    assert_eq!(page2.rows.len(), 50);
+    assert_eq!(page2.rows[49].name, "f249");
+    assert!(page2.next_cursor.is_none());
+
+    // Changing direction, column, or metric invalidates the cursor.
+    for other in [
+        ChildSort { direction: SortDirection::Asc, ..sort },
+        ChildSort { by: ChildSortBy::After, ..sort },
+        ChildSort { metric: Metric::Allocated, ..sort },
+    ] {
+        assert_eq!(
+            diff::list_children(&wide, "test", Some(&wroot), false, other, Some(cursor1))
+                .unwrap_err()
+                .code,
+            "INVALID_CURSOR"
+        );
     }
 }

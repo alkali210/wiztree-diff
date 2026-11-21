@@ -235,6 +235,9 @@ impl Comparison {
         }
         fields
     }
+    pub(crate) fn entry_field(&self, entry: &SideEntry, index: usize) -> Option<&str> {
+        self.field_ref(entry, index).map(|r| self.text(r))
+    }
     fn field_ref(&self, entry: &SideEntry, index: usize) -> Option<TextRef> {
         let d = &self.details[entry.details as usize - 1];
         if d.mask & (1 << index) == 0 {
