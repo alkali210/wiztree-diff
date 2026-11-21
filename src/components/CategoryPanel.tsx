@@ -71,7 +71,7 @@ export function CategoryPanel({
                   title={`${name} · ${v.files.toLocaleString()} 个文件`}
                 >
                   <i style={{ background: color }} />
-                  {name}
+                  <span>{name}</span>
                 </span>
                 <span className="type-value">
                   <i className="type-bar">

@@ -56,51 +56,57 @@ export function FileTypePanel({
   return (
     <section className={"file-types " + (showFiles ? "with-files" : "")}>
       <h2 title={name}>扩展名（{name}）</h2>
-      <div className="type-heading">
-        <span>扩展名</span>
-        <span>
-          {metric === "size" ? "大小" : "分配"}（
-          {side === "before" ? "之前" : "之后"}）
-        </span>
-        {showFiles && <span>文件</span>}
-      </div>
-      {error ? (
-        <p className="error">
-          {error}
-          <button onClick={() => setRetry((v) => v + 1)}>重试</button>
-        </p>
-      ) : !data ? (
-        <p className="muted">读取中…</p>
-      ) : (
-        <div className="extension-rows">
-          {data.rows.map((item) => {
-            const color = extensionColor(item.extension),
-              percent =
-                total > 0n
-                  ? Number((BigInt(item[metric]) * 10000n) / total) / 100
-                  : 0;
-            return (
-              <div className="type-row" key={item.extension}>
-                <span
-                  className="type-name"
-                  title={extensionLabel(item.extension)}
-                >
-                  <i style={{ background: color }} />
-                  {extensionLabel(item.extension)}
-                </span>
-                <span className="type-value">
-                  <i className="type-bar">
-                    <i style={{ width: percent + "%", background: color }} />
-                  </i>
-                  <span title={item[metric] + " B"}>{bytes(item[metric])}</span>
-                </span>
-                {showFiles && <span>{item.files.toLocaleString()}</span>}
-              </div>
-            );
-          })}
-          {!data.rows.length && <p className="muted">无文件</p>}
+      <div className="extension-rows">
+        <div className="type-heading">
+          <span>扩展名</span>
+          <span>
+            {metric === "size" ? "大小" : "分配"}（
+            {side === "before" ? "之前" : "之后"}）
+          </span>
+          {showFiles && <span>文件</span>}
         </div>
-      )}
+        {error ? (
+          <p className="error">
+            {error}
+            <button onClick={() => setRetry((v) => v + 1)}>重试</button>
+          </p>
+        ) : !data ? (
+          <p className="muted">读取中…</p>
+        ) : (
+          <>
+            {data.rows.map((item) => {
+              const color = extensionColor(item.extension),
+                percent =
+                  total > 0n
+                    ? Number((BigInt(item[metric]) * 10000n) / total) / 100
+                    : 0;
+              return (
+                <div className="type-row" key={item.extension}>
+                  <span
+                    className="type-name"
+                    title={extensionLabel(item.extension)}
+                  >
+                    <i style={{ background: color }} />
+                    <span>{extensionLabel(item.extension)}</span>
+                  </span>
+                  <span className="type-value">
+                    <i className="type-bar">
+                      <i style={{ width: percent + "%", background: color }} />
+                    </i>
+                    <span title={item[metric] + " B"}>{bytes(item[metric])}</span>
+                  </span>
+                  {showFiles && (
+                    <span className="type-files" title={item.files.toLocaleString()}>
+                      {item.files.toLocaleString()}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+            {!data.rows.length && <p className="muted">无文件</p>}
+          </>
+        )}
+      </div>
       {data && (
         <>
           <p className="type-total" title={data.warnings.join("；")}>

@@ -255,7 +255,9 @@ main {
 .right-pane {
   flex: 1;
   padding: 14px 10px;
-  overflow: auto;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 .center-pane {
   flex: 1;
@@ -345,8 +347,27 @@ main {
   padding: 8px 0;
 }
 .right-pane .file-types {
-  padding-top: 0;
+  padding: 0;
   border: 0;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.right-pane .file-types > h2,
+.right-pane .file-types > .type-total,
+.right-pane .file-types > .extension-paging {
+  flex: none;
+}
+.right-pane .type-heading {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #fff;
+}
+.extension-rows > .error,
+.extension-rows > .muted {
+  margin-top: 6px;
 }
 .file-types h2 {
   white-space: nowrap;
@@ -363,13 +384,22 @@ main {
 }
 .with-files .type-heading,
 .with-files .type-row {
-  grid-template-columns: 65px minmax(0, 1fr) 39px;
+  grid-template-columns: minmax(70px, 1fr) minmax(88px, 114px) 54px;
 }
 .type-heading {
   font-size: 10px;
   color: #8a919d;
   border-bottom: 1px solid #eef1f4;
   padding-bottom: 6px;
+}
+.type-heading > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.with-files .type-heading > span:last-child {
+  text-align: right;
 }
 .type-row {
   height: 26px;
@@ -380,7 +410,8 @@ main {
   display: flex;
   gap: 6px;
   align-items: center;
-  white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
 }
 .type-name > i {
   width: 12px;
@@ -388,11 +419,19 @@ main {
   border-radius: 2px;
   flex: none;
 }
+.type-name > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .type-value {
   display: grid;
   grid-template-columns: minmax(15px, 36px) minmax(11ch, 1fr);
   gap: 5px;
   align-items: center;
+  min-width: 0;
+  overflow: hidden;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
@@ -410,12 +449,24 @@ main {
   height: 100%;
   border-radius: 1px;
 }
-.type-row > span:last-child {
+.type-files {
   text-align: right;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 .extension-rows {
   max-height: 330px;
   overflow-y: auto;
+  overflow-x: hidden;
+}
+.right-pane .extension-rows {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  padding-right: 4px;
 }
 .extension-paging {
   display: flex;
