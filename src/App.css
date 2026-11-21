@@ -384,7 +384,7 @@ main {
 }
 .with-files .type-heading,
 .with-files .type-row {
-  grid-template-columns: minmax(70px, 1fr) minmax(88px, 114px) 54px;
+  grid-template-columns: minmax(84px, 1fr) minmax(82px, 110px) 52px;
 }
 .type-heading {
   font-size: 10px;
@@ -408,7 +408,7 @@ main {
 }
 .type-name {
   display: flex;
-  gap: 6px;
+  gap: 5px;
   align-items: center;
   min-width: 0;
   overflow: hidden;
@@ -418,6 +418,17 @@ main {
   height: 12px;
   border-radius: 2px;
   flex: none;
+}
+.type-name > i.type-swatch.slim {
+  width: 4px;
+  height: 14px;
+  border-radius: 1.5px;
+}
+.type-icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  object-fit: contain;
 }
 .type-name > span {
   min-width: 0;
@@ -693,6 +704,12 @@ main {
 }
 .disclosure:disabled {
   opacity: 1;
+}
+.node-icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  object-fit: contain;
 }
 .folder-glyph {
   display: inline-block;

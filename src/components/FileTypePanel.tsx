@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { bytes, errorText } from "../format";
 import { extensionColor, extensionLabel } from "../extensions";
+import { useSystemIcons } from "../systemIcons";
 import type { ChartMode, ExtensionPage, Metric } from "../types";
 export function FileTypePanel({
   comparisonId,
@@ -53,6 +54,7 @@ export function FileTypePanel({
   }, [comparisonId, parentId, side, metric, current.cursor, retry]);
   const data = result?.key === key ? result.data : null,
     total = data ? BigInt(data.total[metric]) : 0n;
+  const getIcon = useSystemIcons(data ? data.rows.map((item) => item.extension) : []);
   return (
     <section className={"file-types " + (showFiles ? "with-files" : "")}>
       <h2 title={name}>扩展名（{name}）</h2>
@@ -76,6 +78,7 @@ export function FileTypePanel({
           <>
             {data.rows.map((item) => {
               const color = extensionColor(item.extension),
+                iconSrc = getIcon(item.extension),
                 percent =
                   total > 0n
                     ? Number((BigInt(item[metric]) * 10000n) / total) / 100
@@ -86,7 +89,20 @@ export function FileTypePanel({
                     className="type-name"
                     title={extensionLabel(item.extension)}
                   >
-                    <i style={{ background: color }} />
+                    <i
+                      className={iconSrc ? "type-swatch slim" : "type-swatch"}
+                      style={{ background: color }}
+                      aria-hidden="true"
+                    />
+                    {iconSrc ? (
+                      <img
+                        className="type-icon"
+                        src={iconSrc}
+                        alt=""
+                        aria-hidden="true"
+                        draggable={false}
+                      />
+                    ) : null}
                     <span>{extensionLabel(item.extension)}</span>
                   </span>
                   <span className="type-value">

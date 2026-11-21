@@ -9,6 +9,7 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { api } from "../api";
 import { bytes, errorText, signed } from "../format";
+import { iconKeyForNode, useSystemIcons } from "../systemIcons";
 import type { ChildRow, ChildSort, ChildSortBy, Metric, SortDirection } from "../types";
 const DEFAULT_DIRECTION: Record<ChildSortBy, SortDirection> = {
   name: "asc",
@@ -512,6 +513,16 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
   });
   const items = virtual.getVirtualItems();
   viewport.current = items.map((item) => visible[item.index]);
+  const visibleIconKeys: string[] = [];
+  for (const v of viewport.current) {
+    if ("row" in v) {
+      const nodeKind =
+        (v.row.after ?? v.row.before)?.kind ??
+        (v.row.expandable ? "directory" : "file");
+      visibleIconKeys.push(iconKeyForNode(v.row.name, nodeKind));
+    }
+  }
+  const getIcon = useSystemIcons(visibleIconKeys);
   useLayoutEffect(() => {
     const saved = anchor.current;
     if (!saved) return;
@@ -730,14 +741,30 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
                         : "▸"
                       : ""}
                   </button>
-                  <i
-                    className={
-                      (r.after ?? r.before)?.kind === "directory"
-                        ? "folder-glyph"
-                        : "file-glyph"
-                    }
-                    aria-hidden="true"
-                  />
+                  {(() => {
+                    const nodeKind =
+                      (r.after ?? r.before)?.kind ??
+                      (r.expandable ? "directory" : "file");
+                    const iconSrc = getIcon(iconKeyForNode(r.name, nodeKind));
+                    return iconSrc ? (
+                      <img
+                        className="node-icon"
+                        src={iconSrc}
+                        alt=""
+                        aria-hidden="true"
+                        draggable={false}
+                      />
+                    ) : (
+                      <i
+                        className={
+                          nodeKind === "directory"
+                            ? "folder-glyph"
+                            : "file-glyph"
+                        }
+                        aria-hidden="true"
+                      />
+                    );
+                  })()}
                   <span title={r.name}>{r.name}</span>
                   {r.status === "typeChanged" ||
                   (r.status === "unchanged" && r.hasChanges) ||

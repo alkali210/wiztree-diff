@@ -3,10 +3,11 @@ use crate::{
     global_treemap::TreemapLayout,
     import::{JobControl, Progress},
     store::{self, Comparison},
+    system_icons::IconCache,
     types::*,
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -39,6 +40,7 @@ pub struct AppState {
     runtime: Arc<Mutex<Runtime>>,
     // Geometry, rasterization and encoding share this gate, never the runtime lock.
     render: Arc<Mutex<()>>,
+    icons: Arc<IconCache>,
 }
 fn locked<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>> {
     mutex
@@ -61,6 +63,7 @@ impl AppState {
                 pending_layout: None,
             })),
             render: Arc::new(Mutex::new(())),
+            icons: Arc::new(IconCache::new()),
         }
     }
     fn comparison(&self, id: &str) -> Result<Arc<Comparison>> {
@@ -567,6 +570,18 @@ pub async fn get_file_categories(
         crate::file_categories::get_file_categories(&comparison)
     })
     .await
+}
+#[tauri::command]
+pub async fn get_system_icons(
+    state: State<'_, AppState>,
+    keys: Vec<String>,
+) -> Result<HashMap<String, String>> {
+    let icons = state.icons.clone();
+    let (resolved, missing) = icons.split_cached(&keys);
+    if missing.is_empty() {
+        return Ok(resolved);
+    }
+    blocking(move || Ok(icons.resolve_missing(&keys, missing, resolved))).await
 }
 pub fn install(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Error>> {
     app.manage(AppState::new());

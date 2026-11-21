@@ -5,6 +5,7 @@ pub mod file_extensions;
 pub mod global_treemap;
 pub mod import;
 pub mod store;
+pub mod system_icons;
 pub mod types;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -24,7 +25,8 @@ pub fn run() {
             commands::hit_test_treemap,
             commands::get_treemap_bounds,
             commands::release_treemap,
-            commands::get_file_categories
+            commands::get_file_categories,
+            commands::get_system_icons
         ])
         .run(tauri::generate_context!())
         .expect("无法启动 WizTree Diff");

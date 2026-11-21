@@ -9,10 +9,13 @@ import {
 } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { api } from "../api";
+import { resetSystemIconCacheForTest } from "../systemIcons";
 import type { ChildPage, ChildRow, ChildSort, Metric } from "../types";
 import { DiffTree } from "./DiffTree";
 
-vi.mock("../api", () => ({ api: { listChildren: vi.fn() } }));
+vi.mock("../api", () => ({
+  api: { listChildren: vi.fn(), getSystemIcons: vi.fn() },
+}));
 // Keep every row in this small viewport; exercise the real cache/navigation state.
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
@@ -28,6 +31,7 @@ vi.mock("@tanstack/react-virtual", () => ({
 }));
 afterEach(() => {
   cleanup();
+  resetSystemIconCacheForTest();
   vi.clearAllMocks();
 });
 function row(nodeId: string, name: string, expandable = true): ChildRow {
@@ -231,4 +235,51 @@ it("discards stale sort responses when the user rapidly changes sort order", asy
 
   expect(screen.getByText("LatestSort")).toBeTruthy();
   expect(screen.queryByText("StaleSort")).toBeNull();
+});
+
+it("loads batched Windows system icons for folders and file extensions and falls back cleanly", async () => {
+  vi.mocked(api.listChildren).mockResolvedValueOnce(
+    page(
+      row("n1", "Windows", true),
+      row("n2", "bun.ps1", false),
+      row("n3", "other.PS1", false),
+      row("n4", "bun.", false),
+    ),
+  );
+  vi.mocked(api.getSystemIcons).mockResolvedValueOnce({
+    __dir__: "data:image/png;base64,DIR",
+    ".ps1": "data:image/png;base64,PS1",
+  });
+
+  render(<Tree />);
+  await screen.findByText("bun.ps1");
+
+  await waitFor(() => {
+    const dirImg = screen
+      .getByText("Windows")
+      .closest('[role="treeitem"]')!
+      .querySelector("img.node-icon");
+    expect(dirImg?.getAttribute("src")).toBe("data:image/png;base64,DIR");
+  });
+
+  // Deduplicated keys: __dir__, .ps1, "" fetched in one batched call.
+  expect(api.getSystemIcons).toHaveBeenCalledTimes(1);
+  expect(new Set(vi.mocked(api.getSystemIcons).mock.calls[0][0])).toEqual(
+    new Set(["__dir__", ".ps1", ""]),
+  );
+
+  // Both .ps1 and .PS1 reuse the same icon; missing "" falls back to .file-glyph.
+  expect(
+    screen
+      .getByText("other.PS1")
+      .closest('[role="treeitem"]')!
+      .querySelector("img.node-icon")
+      ?.getAttribute("src"),
+  ).toBe("data:image/png;base64,PS1");
+  expect(
+    screen
+      .getByText("bun.")
+      .closest('[role="treeitem"]')!
+      .querySelector("i.file-glyph"),
+  ).not.toBeNull();
 });

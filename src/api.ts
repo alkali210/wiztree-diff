@@ -83,4 +83,6 @@ export const api = {
     invoke<TreemapRect | null>("get_treemap_bounds", { comparisonId, layoutId, nodeId }),
   releaseTreemap: (comparisonId: string, layoutId: string) =>
     invoke<void>("release_treemap", { comparisonId, layoutId }),
+  getSystemIcons: (keys: string[]) =>
+    invoke<Record<string, string>>("get_system_icons", { keys }),
 };
