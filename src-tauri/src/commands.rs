@@ -356,20 +356,36 @@ pub async fn start_comparison(
     let control = state.start_job(&id)?;
     let task_id = id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut last = Instant::now() - Duration::from_secs(1);
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut last_update = Instant::now() - Duration::from_secs(1);
+        let mut last_phase: &'static str = "";
         let mut progress = |progress: Progress| {
+            let phase_changed = progress.phase != last_phase;
+            let completed = progress.total_bytes > 0 && progress.bytes_read >= progress.total_bytes;
+            let should_emit = phase_changed || last_emit.elapsed() >= Duration::from_millis(200);
+            if !should_emit
+                && !completed
+                && last_update.elapsed() < Duration::from_millis(100)
+            {
+                return;
+            }
+            last_phase = progress.phase;
+            last_update = Instant::now();
             let summary = if let Ok(mut runtime) = state.runtime.lock() {
                 runtime
                     .job
                     .as_mut()
                     .filter(|job| job.summary.job_id == task_id)
                     .and_then(|job| {
-                        job.summary.phase = progress.phase;
+                        if job.summary.phase != progress.phase {
+                            job.summary.phase.clear();
+                            job.summary.phase.push_str(progress.phase);
+                        }
                         job.summary.bytes_read = progress.bytes_read.to_string();
                         job.summary.total_bytes = progress.total_bytes.to_string();
                         job.summary.rows = progress.rows;
-                        if last.elapsed() >= Duration::from_millis(200) {
-                            last = Instant::now();
+                        if should_emit {
+                            last_emit = Instant::now();
                             Some(job.summary.clone())
                         } else {
                             None

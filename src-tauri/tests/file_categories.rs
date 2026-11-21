@@ -46,9 +46,41 @@ fn original_classification_boundaries_and_basename_exceptions() {
         ("x.AIFF", "audio"),
         ("x.opus", "audio"),
         ("x.bin", "other"),
+        (".png", "images"),
+        (".env.txt", "text"),
+        ("照片.JPG", "images"),
+        ("file.Kt", "other"),
+        ("long.svelte", "code"),
+        ("long.sveltex", "other"),
     ] {
         assert_eq!(file_categories::category(name), expected, "{name}");
     }
+}
+
+#[test]
+fn cached_extension_category_matches_direct_classification_for_unicode_and_dotfiles() {
+    let h = "文件名称,大小,分配\n";
+    let csv = format!(
+        "{h}\
+C:\\r\\,0,0\n\
+C:\\r\\.png,10,16\n\
+C:\\r\\.env.txt,11,16\n\
+C:\\r\\照片.JPG,12,16\n\
+C:\\r\\kelvin.Kt,13,16\n\
+C:\\r\\ascii.kt,14,16\n\
+C:\\r\\app.SVELTE,15,16\n\
+C:\\r\\app.sveltex,16,16\n"
+    );
+    let (_dir, c) = build(&csv, &csv);
+    let stats = file_categories::get_file_categories(&c).unwrap();
+    let by_cat = |name: &str| {
+        let item = stats.items.iter().find(|i| i.category == name).unwrap();
+        (item.before.size.as_str(), item.before.files)
+    };
+    assert_eq!(by_cat("images"), ("22", 2)); // .png + 照片.JPG
+    assert_eq!(by_cat("text"), ("11", 1)); // .env.txt
+    assert_eq!(by_cat("code"), ("29", 2)); // file.kt + app.SVELTE
+    assert_eq!(by_cat("other"), ("29", 2)); // file.Kt + app.sveltex
 }
 
 #[test]

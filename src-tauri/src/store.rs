@@ -12,36 +12,37 @@ pub struct TextRef {
     start: u32,
     len: u32,
 }
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct BlobRef {
+    block: u32,
+    start: u32,
+    len: u32,
+}
 #[derive(Default)]
-struct Strings {
+struct BytesArena {
     blocks: Vec<Vec<u8>>,
 }
-impl Strings {
-    fn get(&self, r: TextRef) -> &str {
-        std::str::from_utf8(self.bytes_ref(r)).expect("text references contain UTF-8")
-    }
-    fn bytes_ref(&self, r: TextRef) -> &[u8] {
+impl BytesArena {
+    #[inline]
+    fn get(&self, r: BlobRef) -> &[u8] {
         if r.len == 0 {
             return &[];
         }
         &self.blocks[r.block as usize][r.start as usize..(r.start as usize + r.len as usize)]
     }
-    fn put(&mut self, text: &str) -> Result<TextRef> {
-        self.put_bytes(text.as_bytes())
-    }
-    fn put_bytes(&mut self, text: &[u8]) -> Result<TextRef> {
-        if text.is_empty() {
-            return Ok(TextRef::default());
+    fn put(&mut self, data: &[u8]) -> Result<BlobRef> {
+        if data.is_empty() {
+            return Ok(BlobRef::default());
         }
-        let len = u32::try_from(text.len()).map_err(|_| memory_error())?;
+        let len = u32::try_from(data.len()).map_err(|_| memory_error())?;
         if self
             .blocks
             .last()
-            .is_none_or(|b| b.capacity() - b.len() < text.len())
+            .is_none_or(|b| b.capacity() - b.len() < data.len())
         {
             let mut block = Vec::new();
             block
-                .try_reserve_exact(text.len().max(1024 * 1024))
+                .try_reserve_exact(data.len().max(1024 * 1024))
                 .map_err(|_| memory_error())?;
             self.blocks.try_reserve(1).map_err(|_| memory_error())?;
             self.blocks.push(block);
@@ -49,11 +50,84 @@ impl Strings {
         let block = u32::try_from(self.blocks.len() - 1).map_err(|_| memory_error())?;
         let bytes = self.blocks.last_mut().unwrap();
         let start = bytes.len() as u32;
-        bytes.extend_from_slice(text);
+        bytes.extend_from_slice(data);
+        Ok(BlobRef { block, start, len })
+    }
+    fn bytes(&self) -> usize {
+        self.blocks.iter().map(|b| b.capacity()).sum()
+    }
+}
+/// Append-only arena storing strictly valid UTF-8 slices copied from `&str`.
+#[derive(Default)]
+struct Strings {
+    blocks: Vec<Vec<u8>>,
+}
+impl Strings {
+    #[inline]
+    fn get(&self, r: TextRef) -> &str {
+        if r.len == 0 {
+            return "";
+        }
+        let slice =
+            &self.blocks[r.block as usize][r.start as usize..(r.start as usize + r.len as usize)];
+        // SAFETY: Strings::put only copies bytes from valid &str values, and TextRef fields are private.
+        unsafe { std::str::from_utf8_unchecked(slice) }
+    }
+    fn put(&mut self, text: &str) -> Result<TextRef> {
+        let data = text.as_bytes();
+        if data.is_empty() {
+            return Ok(TextRef::default());
+        }
+        let len = u32::try_from(data.len()).map_err(|_| memory_error())?;
+        if self
+            .blocks
+            .last()
+            .is_none_or(|b| b.capacity() - b.len() < data.len())
+        {
+            let mut block = Vec::new();
+            block
+                .try_reserve_exact(data.len().max(1024 * 1024))
+                .map_err(|_| memory_error())?;
+            self.blocks.try_reserve(1).map_err(|_| memory_error())?;
+            self.blocks.push(block);
+        }
+        let block = u32::try_from(self.blocks.len() - 1).map_err(|_| memory_error())?;
+        let bytes = self.blocks.last_mut().unwrap();
+        let start = bytes.len() as u32;
+        bytes.extend_from_slice(data);
         Ok(TextRef { block, start, len })
     }
     fn bytes(&self) -> usize {
         self.blocks.iter().map(|b| b.capacity()).sum()
+    }
+}
+#[inline]
+fn write_varint(buf: &mut Vec<u8>, mut value: usize) -> Result<()> {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.try_reserve(1).map_err(|_| memory_error())?;
+        buf.push(byte);
+        if value == 0 {
+            return Ok(());
+        }
+    }
+}
+#[inline]
+fn read_varint(bytes: &[u8], offset: &mut usize) -> usize {
+    let mut result = 0usize;
+    let mut shift = 0u32;
+    loop {
+        let byte = bytes[*offset];
+        *offset += 1;
+        result |= ((byte & 0x7f) as usize) << shift;
+        if byte & 0x80 == 0 {
+            return result;
+        }
+        shift += 7;
     }
 }
 fn memory_error() -> ApiError {
@@ -70,32 +144,32 @@ fn push<T>(v: &mut Vec<T>, item: T) -> Result<u32> {
 }
 #[derive(Debug)]
 pub struct Node {
+    prefix: TextRef,
+    basename: TextRef,
     pub parent: NodeId,
     pub before: u32,
     pub after: u32,
     pub depth: u32,
+    pub changed_descendant_count: u32,
+    extension: u32,
+    pub(crate) aggregate: u32,
     pub status: Status,
     pub has_changes: bool,
     pub expandable: bool,
-    pub changed_descendant_count: u64,
-    prefix: TextRef,
-    basename: TextRef,
-    extension: u32,
-    pub(crate) aggregate: u32,
 }
 #[derive(Debug)]
 pub struct SideEntry {
-    pub kind: NodeKind,
     pub size: u64,
     pub allocated: u64,
-    pub hardlink_count: u64,
+    pub hardlink_count: u32,
     details: u32,
+    pub kind: NodeKind,
 }
 struct Details {
     prefix: TextRef,
     suffix: TextRef,
+    data: BlobRef,
     mask: u16,
-    data: TextRef,
 }
 #[derive(Clone, Copy, Default, Debug)]
 pub struct FileAggregate {
@@ -152,6 +226,7 @@ pub struct Comparison {
     pub nodes: Vec<Node>,
     entries: [Vec<SideEntry>; 2],
     strings: Strings,
+    detail_bytes: BytesArena,
     details: Vec<Details>,
     extensions_names: Vec<TextRef>,
     offsets: Vec<u32>,
@@ -222,44 +297,65 @@ impl Comparison {
     pub fn extension(&self, id: NodeId) -> &str {
         self.text(self.extensions_names[self.node(id).extension as usize])
     }
+    #[inline]
+    pub(crate) fn extension_id(&self, id: NodeId) -> u32 {
+        self.node(id).extension
+    }
+    #[inline]
+    pub(crate) fn extension_text(&self, ext_id: u32) -> &str {
+        self.text(self.extensions_names[ext_id as usize])
+    }
     pub fn entry_details<'a>(&'a self, entry: &SideEntry) -> [Option<&'a str>; 14] {
         let d = &self.details[entry.details as usize - 1];
         let mut fields = [None; 14];
-        let mut bytes = self.strings.bytes_ref(d.data);
+        let bytes = self.detail_bytes.get(d.data);
+        let mut offset = 0usize;
         for (i, f) in fields.iter_mut().enumerate() {
             if d.mask & (1 << i) != 0 {
-                let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-                *f = Some(std::str::from_utf8(&bytes[4..4 + len]).expect("details contain UTF-8"));
-                bytes = &bytes[4 + len..];
+                let len = read_varint(bytes, &mut offset);
+                // SAFETY: encoded details only store UTF-8 slices copied from &str CSV fields.
+                *f = Some(unsafe { std::str::from_utf8_unchecked(&bytes[offset..offset + len]) });
+                offset += len;
             }
         }
         fields
     }
     pub(crate) fn entry_field(&self, entry: &SideEntry, index: usize) -> Option<&str> {
-        self.field_ref(entry, index).map(|r| self.text(r))
-    }
-    fn field_ref(&self, entry: &SideEntry, index: usize) -> Option<TextRef> {
         let d = &self.details[entry.details as usize - 1];
-        if d.mask & (1 << index) == 0 {
+        let bit = 1u16 << index;
+        if d.mask & bit == 0 {
             return None;
         }
-        let bytes = self.strings.bytes_ref(d.data);
+        let bytes = self.detail_bytes.get(d.data);
         let mut offset = 0usize;
-        for i in 0..=index {
-            if d.mask & (1 << i) != 0 {
-                let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-                offset += 4;
-                if i == index {
-                    return Some(TextRef {
-                        block: d.data.block,
-                        start: d.data.start + offset as u32,
-                        len,
-                    });
-                }
-                offset += len as usize;
-            }
+        let mut prior = d.mask & (bit - 1);
+        while prior != 0 {
+            let len = read_varint(bytes, &mut offset);
+            offset += len;
+            prior &= prior - 1;
         }
-        None
+        let len = read_varint(bytes, &mut offset);
+        // SAFETY: encoded details only store UTF-8 slices copied from &str CSV fields.
+        Some(unsafe { std::str::from_utf8_unchecked(&bytes[offset..offset + len]) })
+    }
+    fn entry_details_eq(&self, d: &Details, mask: u16, values: &[Option<&str>; 14]) -> bool {
+        if d.mask != mask {
+            return false;
+        }
+        let bytes = self.detail_bytes.get(d.data);
+        let mut offset = 0usize;
+        let mut remaining = mask;
+        while remaining != 0 {
+            let i = remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            let len = read_varint(bytes, &mut offset);
+            let expected = values[i].unwrap().as_bytes();
+            if len != expected.len() || &bytes[offset..offset + len] != expected {
+                return false;
+            }
+            offset += len;
+        }
+        true
     }
     pub fn own_files(&self, id: NodeId) -> FileAggregate {
         let b = self.entry(id, 0).filter(|e| e.kind == NodeKind::File);
@@ -328,6 +424,7 @@ impl Comparison {
     }
     pub fn memory_bytes(&self) -> usize {
         self.strings.bytes()
+            + self.detail_bytes.bytes()
             + self.nodes.capacity() * std::mem::size_of::<Node>()
             + self
                 .entries
@@ -355,8 +452,12 @@ struct Builder {
     hasher: hashbrown::DefaultHashBuilder,
     prefixes: HashTable<TextRef>,
     index: HashTable<NodeId>,
+    last_prefix: TextRef,
+    last_raw_prefix: TextRef,
     extension_ids: HashMap<String, u32>,
+    extension_categories: Vec<u8>,
     extension_values: [Vec<[u64; 3]>; 2],
+    mft_count: [usize; 2],
     totals: [[u64; 2]; 2],
     encoded: Vec<u8>,
 }
@@ -375,7 +476,24 @@ fn empty_summary() -> SourceSummary {
     }
 }
 impl Builder {
-    fn new(id: &str) -> Self {
+    fn new(id: &str, est_before: usize, est_after: usize) -> Self {
+        let mut nodes = Vec::new();
+        let mut entries_before = Vec::new();
+        let mut entries_after = Vec::new();
+        let mut details = Vec::new();
+        let mut index = HashTable::new();
+        let est_union = est_before.max(est_after);
+        if est_union > 1024 {
+            let _ = nodes.try_reserve(est_union);
+            let _ = details.try_reserve(est_union);
+            let _ = index.try_reserve(est_union, |_| 0);
+        }
+        if est_before > 1024 {
+            let _ = entries_before.try_reserve(est_before);
+        }
+        if est_after > 1024 {
+            let _ = entries_after.try_reserve(est_after);
+        }
         Self {
             data: Comparison {
                 summary: ComparisonSummary {
@@ -389,10 +507,11 @@ impl Builder {
                     warnings: Vec::new(),
                     order_warning: None,
                 },
-                nodes: Vec::new(),
-                entries: [Vec::new(), Vec::new()],
+                nodes,
+                entries: [entries_before, entries_after],
                 strings: Strings::default(),
-                details: Vec::new(),
+                detail_bytes: BytesArena::default(),
+                details,
                 extensions_names: vec![TextRef::default()],
                 offsets: Vec::new(),
                 child_ids: Vec::new(),
@@ -406,9 +525,13 @@ impl Builder {
             },
             hasher: Default::default(),
             prefixes: HashTable::new(),
-            index: HashTable::new(),
+            index,
+            last_prefix: TextRef::default(),
+            last_raw_prefix: TextRef::default(),
             extension_ids: HashMap::from([(String::new(), 0)]),
+            extension_categories: vec![7],
             extension_values: [vec![[0; 3]], vec![[0; 3]]],
+            mft_count: [0; 2],
             totals: [[0; 2]; 2],
             encoded: Vec::with_capacity(1024),
         }
@@ -429,6 +552,38 @@ impl Builder {
             .map_err(|_| memory_error())?;
         self.prefixes
             .insert_unique(hash, r, |r| hasher.hash_one(c.text(*r)));
+        Ok(r)
+    }
+    #[inline]
+    fn intern_canonical_prefix(&mut self, value: &str) -> Result<TextRef> {
+        if value.is_empty() {
+            return Ok(TextRef::default());
+        }
+        if self.last_prefix.len as usize == value.len()
+            && self.data.text(self.last_prefix) == value
+        {
+            return Ok(self.last_prefix);
+        }
+        let r = self.intern_prefix(value)?;
+        self.last_prefix = r;
+        Ok(r)
+    }
+    #[inline]
+    fn intern_raw_prefix(&mut self, value: &str, canonical: TextRef) -> Result<TextRef> {
+        if value.is_empty() {
+            return Ok(TextRef::default());
+        }
+        if self.last_raw_prefix.len as usize == value.len()
+            && self.data.text(self.last_raw_prefix) == value
+        {
+            return Ok(self.last_raw_prefix);
+        }
+        if canonical.len as usize == value.len() && self.data.text(canonical) == value {
+            self.last_raw_prefix = canonical;
+            return Ok(canonical);
+        }
+        let r = self.intern_prefix(value)?;
+        self.last_raw_prefix = r;
         Ok(r)
     }
     fn lookup(&self, path: &str) -> Option<NodeId> {
@@ -455,6 +610,12 @@ impl Builder {
         let r = self.data.strings.put(text)?;
         let id = self.data.extensions_names.len() as u32;
         push(&mut self.data.extensions_names, r)?;
+        let cat = if let Some(ext) = text.strip_prefix('.') {
+            crate::file_categories::category_index_for_ext(ext) as u8
+        } else {
+            7
+        };
+        push(&mut self.extension_categories, cat)?;
         self.extension_ids
             .try_reserve(1)
             .map_err(|_| memory_error())?;
@@ -466,7 +627,7 @@ impl Builder {
     }
     fn add(&mut self, side: usize, row: import::ParsedRow<'_>) -> Result<()> {
         let (prefix, basename) = import::canonical_parts(row.key);
-        let prefix = self.intern_prefix(prefix)?;
+        let prefix = self.intern_canonical_prefix(prefix)?;
         let hash = self.hasher.hash_one((prefix, basename));
         let found = self
             .index
@@ -483,18 +644,18 @@ impl Builder {
                 let id = push(
                     &mut self.data.nodes,
                     Node {
+                        prefix,
+                        basename,
                         parent: 0,
                         before: 0,
                         after: 0,
                         depth: row.depth,
+                        changed_descendant_count: 0,
+                        extension,
+                        aggregate: 0,
                         status: Status::Added,
                         has_changes: true,
                         expandable: false,
-                        changed_descendant_count: 0,
-                        prefix,
-                        basename,
-                        extension,
-                        aggregate: 0,
                     },
                 )?;
                 let c = &self.data;
@@ -519,7 +680,7 @@ impl Builder {
             return Err(e);
         }
         // Preserve exact original spelling while sharing the directory prefix.
-        let (raw_prefix, raw_suffix) = if self.data.text(prefix).is_empty() {
+        let (raw_prefix, raw_suffix) = if prefix.len == 0 {
             ("", row.original)
         } else {
             let trimmed = row.original.trim_end_matches(['\\', '/']);
@@ -528,12 +689,19 @@ impl Builder {
                 None => ("", row.original),
             }
         };
-        let raw_prefix = self.intern_prefix(raw_prefix)?;
+        let raw_prefix = self.intern_raw_prefix(raw_prefix, prefix)?;
+        let mut mask = 0u16;
+        for (i, value) in row.values.iter().enumerate() {
+            if value.is_some() {
+                mask |= 1 << i;
+            }
+        }
         let shared = self.data.entry(id, 0).filter(|_| side == 1).and_then(|e| {
             let d = &self.data.details[e.details as usize - 1];
             if d.prefix == raw_prefix
+                && d.mask == mask
                 && self.data.text(d.suffix) == raw_suffix
-                && self.data.entry_details(e) == row.values
+                && self.data.entry_details_eq(d, mask, &row.values)
             {
                 Some(e.details)
             } else {
@@ -549,26 +717,25 @@ impl Builder {
                     self.data.strings.put(raw_suffix)?
                 };
                 self.encoded.clear();
-                let mut mask = 0;
-                for (i, value) in row.values.iter().enumerate() {
-                    if let Some(value) = value {
-                        mask |= 1 << i;
-                        let len = u32::try_from(value.len()).map_err(|_| memory_error())?;
-                        self.encoded
-                            .try_reserve(value.len() + 4)
-                            .map_err(|_| memory_error())?;
-                        self.encoded.extend_from_slice(&len.to_le_bytes());
-                        self.encoded.extend_from_slice(value.as_bytes());
-                    }
+                let mut remaining = mask;
+                while remaining != 0 {
+                    let i = remaining.trailing_zeros() as usize;
+                    remaining &= remaining - 1;
+                    let value = row.values[i].unwrap();
+                    write_varint(&mut self.encoded, value.len())?;
+                    self.encoded
+                        .try_reserve(value.len())
+                        .map_err(|_| memory_error())?;
+                    self.encoded.extend_from_slice(value.as_bytes());
                 }
-                let data = self.data.strings.put_bytes(&self.encoded)?;
+                let data = self.data.detail_bytes.put(&self.encoded)?;
                 push(
                     &mut self.data.details,
                     Details {
                         prefix: raw_prefix,
                         suffix,
-                        mask,
                         data,
+                        mask,
                     },
                 )?
             }
@@ -576,11 +743,11 @@ impl Builder {
         let entry = push(
             &mut self.data.entries[side],
             SideEntry {
-                kind: row.kind,
                 size: row.size,
                 allocated: row.allocated,
                 hardlink_count: 0,
                 details,
+                kind: row.kind,
             },
         )?;
         let node = &mut self.data.nodes[id as usize - 1];
@@ -603,19 +770,38 @@ impl Builder {
         n.status = status;
         n.has_changes = status != Status::Unchanged;
         if row.kind == NodeKind::File {
+            if mask & (1 << 4) != 0 {
+                self.mft_count[side] += 1;
+            }
             self.totals[side][0] = checked_add(self.totals[side][0], row.size, "文件路径大小")?;
             self.totals[side][1] =
                 checked_add(self.totals[side][1], row.allocated, "文件路径分配")?;
-            let category_name = crate::file_categories::category(row.name);
-            let category = crate::file_categories::CATEGORIES
-                .iter()
-                .position(|c| *c == category_name)
-                .unwrap();
+            let ext_id = self.data.node(id).extension as usize;
+            let category = if row.name.starts_with('.') {
+                crate::file_categories::category_index(row.name)
+            } else if ext_id == 0 {
+                if row.name.eq_ignore_ascii_case("README") {
+                    5
+                } else {
+                    7
+                }
+            } else {
+                let ext_len = self.data.extensions_names[ext_id].len as usize;
+                let name_bytes = row.name.as_bytes();
+                if name_bytes.len() >= ext_len
+                    && name_bytes[name_bytes.len() - ext_len] == b'.'
+                    && name_bytes[name_bytes.len() - ext_len..].is_ascii()
+                {
+                    self.extension_categories[ext_id] as usize
+                } else {
+                    crate::file_categories::category_index(row.name)
+                }
+            };
             let values = &mut self.data.categories[side][category];
             values[0] = checked_add(values[0], row.size, "文件类别大小")?;
             values[1] = checked_add(values[1], row.allocated, "文件类别分配")?;
             values[2] += 1;
-            let values = &mut self.extension_values[side][self.data.node(id).extension as usize];
+            let values = &mut self.extension_values[side][ext_id];
             values[0] = checked_add(values[0], row.size, "扩展名大小")?;
             values[1] = checked_add(values[1], row.allocated, "扩展名分配")?;
             values[2] += 1;
@@ -624,33 +810,55 @@ impl Builder {
     }
     fn finish(mut self, control: &JobControl) -> Result<Comparison> {
         let count = self.data.nodes.len();
-        // Resolve each actual immediate parent once; prefix keys are not synthetic nodes.
+        // Resolve each actual immediate parent once; cache by interned prefix TextRef.
+        let mut prefix_parents: hashbrown::HashMap<TextRef, NodeId> = hashbrown::HashMap::new();
+        let mut last_prefix = TextRef::default();
+        let mut last_parent = 0u32;
         for i in 0..count {
             if i % 1024 == 0 {
                 control.check()?;
             }
-            let parent = parent_from_prefix(self.data.text(self.data.nodes[i].prefix))
-                .and_then(|p| self.lookup(p))
-                .unwrap_or(0);
+            let prefix = self.data.nodes[i].prefix;
+            let parent = if prefix.len == 0 {
+                0
+            } else if prefix == last_prefix {
+                last_parent
+            } else {
+                let resolved = if let Some(&p) = prefix_parents.get(&prefix) {
+                    p
+                } else {
+                    let p = parent_from_prefix(self.data.text(prefix))
+                        .and_then(|p| self.lookup(p))
+                        .unwrap_or(0);
+                    prefix_parents.try_reserve(1).map_err(|_| memory_error())?;
+                    prefix_parents.insert(prefix, p);
+                    p
+                };
+                last_prefix = prefix;
+                last_parent = resolved;
+                resolved
+            };
             self.data.nodes[i].parent = parent;
-            for side in 0..2 {
-                if parent != 0
-                    && self.data.entry(i as u32 + 1, side).is_some()
-                    && self
-                        .data
-                        .entry(parent, side)
-                        .is_some_and(|e| e.kind == NodeKind::File)
-                {
-                    return Err(ApiError::new(
-                        "INVALID_HIERARCHY",
-                        format!(
-                            "同侧父路径记录是文件：{}",
-                            self.data.path(i as u32 + 1, side)
-                        ),
-                    ));
+            if parent != 0 {
+                for side in 0..2 {
+                    if self.data.entry(i as u32 + 1, side).is_some()
+                        && self
+                            .data
+                            .entry(parent, side)
+                            .is_some_and(|e| e.kind == NodeKind::File)
+                    {
+                        return Err(ApiError::new(
+                            "INVALID_HIERARCHY",
+                            format!(
+                                "同侧父路径记录是文件：{}",
+                                self.data.path(i as u32 + 1, side)
+                            ),
+                        ));
+                    }
                 }
             }
         }
+        drop(prefix_parents);
         self.data.offsets = filled(count + 2, 0u32)?;
         for n in &self.data.nodes {
             self.data.offsets[n.parent as usize + 1] += 1;
@@ -673,85 +881,24 @@ impl Builder {
             }
             let lo = self.data.offsets[parent] as usize;
             let hi = self.data.offsets[parent + 1] as usize;
-            self.data.child_ids[lo..hi].sort_unstable_by(|a, b| {
-                let (na, nb) = (&nodes[*a as usize - 1], &nodes[*b as usize - 1]);
-                nb.expandable
-                    .cmp(&na.expandable)
-                    .then_with(|| strings.get(na.basename).cmp(strings.get(nb.basename)))
-                    .then(a.cmp(b))
-            });
+            if hi - lo > 1 {
+                self.data.child_ids[lo..hi].sort_unstable_by(|a, b| {
+                    let (na, nb) = (&nodes[*a as usize - 1], &nodes[*b as usize - 1]);
+                    nb.expandable
+                        .cmp(&na.expandable)
+                        .then_with(|| strings.get(na.basename).cmp(strings.get(nb.basename)))
+                        .then(a.cmp(b))
+                });
+            }
         }
-        // Only containers retain aggregates; leaves are calculated directly from side values.
+        // Only containers retain aggregates and participate in bottom-up aggregation;
+        // tally all node statuses in one linear pass and collect containers.
+        let mut containers = Vec::new();
+        let mut max_depth = 0u32;
         for id in 1..=count as u32 {
-            if self.data.container(id) {
-                let index = self.data.aggregates.len() as u32;
-                push(&mut self.data.aggregates, FileAggregate::default())?;
-                self.data.nodes[id as usize - 1].aggregate = index;
-            }
-        }
-        let mut order = Vec::new();
-        order.try_reserve_exact(count).map_err(|_| memory_error())?;
-        order.extend(1..=count as u32);
-        order.sort_unstable_by_key(|id| std::cmp::Reverse(self.data.node(*id).depth));
-        let mut export_counts = filled(self.data.aggregates.len(), [0u64; 4])?;
-        let mut mismatches = 0u64;
-        for (i, id) in order.iter().copied().enumerate() {
-            if i % 1024 == 0 {
-                control.check()?;
-            }
-            let mut aggregate = self.data.own_files(id);
-            let mut changed = 0u64;
-            let mut counts = [0u64; 4];
-            for &child in self.data.children(id) {
-                aggregate.add(self.data.aggregate(child))?;
-                changed += self.data.node(child).changed_descendant_count
-                    + u64::from(self.data.node(child).status != Status::Unchanged);
-                for side in 0..2 {
-                    if self
-                        .data
-                        .entry(id, side)
-                        .is_some_and(|e| e.kind == NodeKind::Directory)
-                    {
-                        if let Some(e) = self.data.entry(child, side) {
-                            if e.kind == NodeKind::File {
-                                counts[side * 2] += 1;
-                            } else {
-                                counts[side * 2 + 1] += 1;
-                                let c = export_counts[self.data.node(child).aggregate as usize];
-                                counts[side * 2] += c[side * 2];
-                                counts[side * 2 + 1] += c[side * 2 + 1];
-                            }
-                        }
-                    }
-                }
-            }
-            let index = self.data.node(id).aggregate;
-            if index != 0 {
-                self.data.aggregates[index as usize] = aggregate;
-                export_counts[index as usize] = counts;
-            }
-            if self.data.node(id).expandable {
-                let n = &mut self.data.nodes[id as usize - 1];
-                n.changed_descendant_count = changed;
-                n.has_changes |= changed > 0;
-                for side in 0..2 {
-                    if let Some(e) = self
-                        .data
-                        .entry(id, side)
-                        .filter(|e| e.kind == NodeKind::Directory)
-                    {
-                        let details = self.data.entry_details(e);
-                        if details[2].is_some_and(|v| v.parse::<u64>().unwrap() != counts[side * 2])
-                            || details[3]
-                                .is_some_and(|v| v.parse::<u64>().unwrap() != counts[side * 2 + 1])
-                        {
-                            mismatches += 1;
-                        }
-                    }
-                }
-            }
+            let expandable = self.data.node(id).expandable;
             let status = self.data.node(id).status;
-            let target = if self.data.node(id).expandable {
+            let target = if expandable {
                 &mut self.data.summary.statuses.folders
             } else {
                 &mut self.data.summary.statuses.files
@@ -763,9 +910,104 @@ impl Builder {
                 Status::Unchanged => target.unchanged += 1,
                 Status::TypeChanged => target.type_changed += 1,
             }
+            if self.data.container(id) {
+                let index = self.data.aggregates.len() as u32;
+                push(&mut self.data.aggregates, FileAggregate::default())?;
+                let n = &mut self.data.nodes[id as usize - 1];
+                n.aggregate = index;
+                if n.depth > max_depth {
+                    max_depth = n.depth;
+                }
+                containers.try_reserve(1).map_err(|_| memory_error())?;
+                containers.push(id);
+            }
+        }
+        if max_depth <= 4096 {
+            let buckets = max_depth as usize + 1;
+            let mut depth_counts = filled(buckets, 0usize)?;
+            for &id in &containers {
+                depth_counts[self.data.node(id).depth as usize] += 1;
+            }
+            let mut depth_offsets = filled(buckets, 0usize)?;
+            let mut running = 0usize;
+            for d in (0..buckets).rev() {
+                depth_offsets[d] = running;
+                running += depth_counts[d];
+            }
+            let mut ordered = filled(containers.len(), 0u32)?;
+            for &id in &containers {
+                let d = self.data.node(id).depth as usize;
+                ordered[depth_offsets[d]] = id;
+                depth_offsets[d] += 1;
+            }
+            containers = ordered;
+        } else {
+            containers.sort_unstable_by_key(|&id| std::cmp::Reverse(self.data.node(id).depth));
+        }
+        let mut export_counts = filled(self.data.aggregates.len(), [0u64; 4])?;
+        let mut mismatches = 0u64;
+        for (i, id) in containers.iter().copied().enumerate() {
+            if i % 1024 == 0 {
+                control.check()?;
+            }
+            let mut aggregate = self.data.own_files(id);
+            let mut changed = 0u32;
+            let mut counts = [0u64; 4];
+            let is_dir_side = [
+                self.data
+                    .entry(id, 0)
+                    .is_some_and(|e| e.kind == NodeKind::Directory),
+                self.data
+                    .entry(id, 1)
+                    .is_some_and(|e| e.kind == NodeKind::Directory),
+            ];
+            for &child in self.data.children(id) {
+                aggregate.add(self.data.aggregate(child))?;
+                let cn = self.data.node(child);
+                changed += cn.changed_descendant_count + u32::from(cn.status != Status::Unchanged);
+                for side in 0..2 {
+                    if is_dir_side[side] {
+                        if let Some(e) = self.data.entry(child, side) {
+                            if e.kind == NodeKind::File {
+                                counts[side * 2] += 1;
+                            } else {
+                                counts[side * 2 + 1] += 1;
+                                let c = export_counts[cn.aggregate as usize];
+                                counts[side * 2] += c[side * 2];
+                                counts[side * 2 + 1] += c[side * 2 + 1];
+                            }
+                        }
+                    }
+                }
+            }
+            let index = self.data.node(id).aggregate;
+            self.data.aggregates[index as usize] = aggregate;
+            export_counts[index as usize] = counts;
+            if self.data.node(id).expandable {
+                let n = &mut self.data.nodes[id as usize - 1];
+                n.changed_descendant_count = changed;
+                n.has_changes |= changed > 0;
+                for side in 0..2 {
+                    if is_dir_side[side] {
+                        if let Some(e) = self.data.entry(id, side) {
+                            if self
+                                .data
+                                .entry_field(e, 2)
+                                .is_some_and(|v| v.parse::<u64>().unwrap() != counts[side * 2])
+                                || self
+                                    .data
+                                    .entry_field(e, 3)
+                                    .is_some_and(|v| v.parse::<u64>().unwrap() != counts[side * 2 + 1])
+                            {
+                                mismatches += 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
         drop(export_counts);
-        drop(order);
+        drop(containers);
         let mut total = FileAggregate::default();
         for &id in self.data.children(0) {
             total.add(self.data.aggregate(id))?;
@@ -797,14 +1039,20 @@ impl Builder {
         self.index = HashTable::new();
         self.prefixes = HashTable::new();
         self.extension_ids = HashMap::new();
+        self.extension_categories = Vec::new();
         self.encoded = Vec::new();
-        // These immutable arrays will never grow again. Compact once, not per row.
-        self.data.nodes.shrink_to_fit();
-        self.data.details.shrink_to_fit();
-        self.data.aggregates.shrink_to_fit();
-        self.data.extensions_names.shrink_to_fit();
+        // Compact immutable arrays when slack is significant, avoiding full-array copies for tight preallocs.
+        fn shrink_if_excess<T>(v: &mut Vec<T>) {
+            if v.capacity() > v.len() + (v.len() >> 4) + 64 {
+                v.shrink_to_fit();
+            }
+        }
+        shrink_if_excess(&mut self.data.nodes);
+        shrink_if_excess(&mut self.data.details);
+        shrink_if_excess(&mut self.data.aggregates);
+        shrink_if_excess(&mut self.data.extensions_names);
         for entries in &mut self.data.entries {
-            entries.shrink_to_fit();
+            shrink_if_excess(entries);
         }
         self.finish_hardlinks(control)?;
         for side in 0..2 {
@@ -923,80 +1171,167 @@ impl Builder {
         Ok(())
     }
     fn finish_hardlinks(&mut self, control: &JobControl) -> Result<()> {
-        // Cache byte spans once. Sorting must not decode all cold CSV fields per comparison.
-        struct Key {
-            node: NodeId,
-            volume: TextRef,
-            mft: TextRef,
+        #[inline]
+        fn parse_u64_fast(s: &str) -> Option<u64> {
+            let bytes = s.as_bytes();
+            if bytes.len() > 20 {
+                return None;
+            }
+            if bytes.len() <= 19 {
+                let mut acc = 0u64;
+                for &b in bytes {
+                    acc = acc * 10 + (b - b'0') as u64;
+                }
+                return Some(acc);
+            }
+            s.parse::<u64>().ok()
         }
         for side in 0..2 {
-            let count = self.data.entries[side]
-                .iter()
-                .filter(|e| {
-                    e.kind == NodeKind::File
-                        && self.data.details[e.details as usize - 1].mask & (1 << 4) != 0
-                })
-                .count();
-            let mut keys = Vec::new();
-            keys.try_reserve_exact(count).map_err(|_| memory_error())?;
-            for id in 1..=self.data.nodes.len() as u32 {
-                if id % 1024 == 0 {
+            let mft_total = self.mft_count[side];
+            if mft_total == 0 {
+                continue;
+            }
+            // Split borrows so large MFT slices can borrow `detail_bytes` while `entries` is mutated.
+            let Comparison {
+                nodes,
+                entries,
+                strings,
+                detail_bytes,
+                details,
+                ..
+            } = &mut self.data;
+            let side_entries = &mut entries[side];
+            let mut small: Vec<(u32, u64, u32)> = Vec::new();
+            small
+                .try_reserve_exact(mft_total)
+                .map_err(|_| memory_error())?;
+            let mut large: Vec<(u32, &str, u32)> = Vec::new();
+            let mut volumes: Vec<&str> = Vec::new();
+            let mut vol_map: hashbrown::HashMap<&str, u32> = hashbrown::HashMap::new();
+            let mut last_prefix = TextRef::default();
+            let mut last_vol_id = 0u32;
+            for (idx, n) in nodes.iter().enumerate() {
+                if idx % 1024 == 0 {
                     control.check()?;
                 }
-                let Some(e) = self
-                    .data
-                    .entry(id, side)
-                    .filter(|e| e.kind == NodeKind::File)
-                else {
+                let entry_idx = if side == 0 { n.before } else { n.after };
+                if entry_idx == 0 {
                     continue;
-                };
-                let Some(mft) = self.data.field_ref(e, 4) else {
+                }
+                let e = &side_entries[entry_idx as usize - 1];
+                if e.kind != NodeKind::File {
                     continue;
-                };
-                let n = self.data.node(id);
-                let mut volume = if n.prefix.len == 0 {
-                    n.basename
+                }
+                let d = &details[e.details as usize - 1];
+                if d.mask & (1 << 4) == 0 {
+                    continue;
+                }
+                // Decode field 4 (MFTRECNO) directly from detail_bytes.
+                let bytes = detail_bytes.get(d.data);
+                let mut offset = 0usize;
+                let mut prior = d.mask & ((1u16 << 4) - 1);
+                while prior != 0 {
+                    let len = read_varint(bytes, &mut offset);
+                    offset += len;
+                    prior &= prior - 1;
+                }
+                let len = read_varint(bytes, &mut offset);
+                // SAFETY: encoded details only store UTF-8 slices copied from &str CSV fields.
+                let mft = unsafe { std::str::from_utf8_unchecked(&bytes[offset..offset + len]) };
+
+                let vol_id = if n.prefix.len != 0 && n.prefix == last_prefix {
+                    last_vol_id
                 } else {
-                    n.prefix
+                    let source = if n.prefix.len == 0 {
+                        strings.get(n.basename)
+                    } else {
+                        strings.get(n.prefix)
+                    };
+                    let vol = import::volume(source);
+                    let id = if volumes.len() <= 8 {
+                        if let Some(pos) = volumes.iter().position(|&v| v == vol) {
+                            pos as u32
+                        } else {
+                            let id = volumes.len() as u32;
+                            volumes.push(vol);
+                            id
+                        }
+                    } else {
+                        if vol_map.is_empty() {
+                            for (i, &v) in volumes.iter().enumerate() {
+                                vol_map.insert(v, i as u32);
+                            }
+                        }
+                        if let Some(&id) = vol_map.get(vol) {
+                            id
+                        } else {
+                            let id = volumes.len() as u32;
+                            volumes.push(vol);
+                            vol_map.try_reserve(1).map_err(|_| memory_error())?;
+                            vol_map.insert(vol, id);
+                            id
+                        }
+                    };
+                    if n.prefix.len != 0 {
+                        last_prefix = n.prefix;
+                        last_vol_id = id;
+                    }
+                    id
                 };
-                volume.len = self.data.volume(id).len() as u32;
-                keys.push(Key {
-                    node: id,
-                    volume,
-                    mft,
-                });
+
+                if let Some(num) = parse_u64_fast(mft) {
+                    small.push((vol_id, num, entry_idx));
+                } else {
+                    large.try_reserve(1).map_err(|_| memory_error())?;
+                    large.push((vol_id, mft, entry_idx));
+                }
             }
             control.check()?;
-            let strings = &self.data.strings;
-            keys.sort_unstable_by(|a, b| {
-                strings
-                    .bytes_ref(a.volume)
-                    .cmp(strings.bytes_ref(b.volume))
-                    .then_with(|| strings.bytes_ref(a.mft).cmp(strings.bytes_ref(b.mft)))
-            });
+            let single_volume = volumes.len() <= 1;
+            drop(vol_map);
+            drop(volumes);
+            if single_volume {
+                small.sort_unstable_by_key(|&(_, mft, _)| mft);
+            } else {
+                small.sort_unstable_by_key(|&(vol, mft, _)| (vol, mft));
+            }
             control.check()?;
             let mut start = 0;
-            while start < keys.len() {
-                control.check()?;
+            while start < small.len() {
+                if start % 1024 == 0 {
+                    control.check()?;
+                }
+                let (vol, mft, _) = small[start];
                 let mut end = start + 1;
-                while end < keys.len()
-                    && self.data.strings.bytes_ref(keys[start].volume)
-                        == self.data.strings.bytes_ref(keys[end].volume)
-                    && self.data.strings.bytes_ref(keys[start].mft)
-                        == self.data.strings.bytes_ref(keys[end].mft)
-                {
-                    if end % 1024 == 0 {
-                        control.check()?;
-                    }
+                while end < small.len() && small[end].0 == vol && small[end].1 == mft {
                     end += 1;
                 }
-                for key in &keys[start..end] {
-                    let n = self.data.node(key.node);
-                    let index = if side == 0 { n.before } else { n.after };
-                    self.data.entries[side][index as usize - 1].hardlink_count =
-                        (end - start) as u64;
+                let count = (end - start) as u32;
+                for &(_, _, entry_idx) in &small[start..end] {
+                    side_entries[entry_idx as usize - 1].hardlink_count = count;
                 }
                 start = end;
+            }
+            drop(small);
+            if !large.is_empty() {
+                large.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+                control.check()?;
+                let mut start = 0;
+                while start < large.len() {
+                    if start % 1024 == 0 {
+                        control.check()?;
+                    }
+                    let (vol, mft, _) = large[start];
+                    let mut end = start + 1;
+                    while end < large.len() && large[end].0 == vol && large[end].1 == mft {
+                        end += 1;
+                    }
+                    let count = (end - start) as u32;
+                    for &(_, _, entry_idx) in &large[start..end] {
+                        side_entries[entry_idx as usize - 1].hardlink_count = count;
+                    }
+                    start = end;
+                }
             }
         }
         Ok(())
@@ -1043,6 +1378,11 @@ fn canonical_cmp(c: &Comparison, a: NodeId, b: NodeId) -> std::cmp::Ordering {
         .chain(c.text(a.basename).bytes())
         .cmp(c.text(b.prefix).bytes().chain(c.text(b.basename).bytes()))
 }
+fn estimate_rows(path: &Path) -> usize {
+    std::fs::metadata(path)
+        .ok()
+        .map_or(0, |m| (m.len() / 180).min(8_000_000) as usize)
+}
 pub fn build_comparison(
     before: &Path,
     after: &Path,
@@ -1050,7 +1390,7 @@ pub fn build_comparison(
     control: &JobControl,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Comparison> {
-    let mut builder = Builder::new(comparison_id);
+    let mut builder = Builder::new(comparison_id, estimate_rows(before), estimate_rows(after));
     builder.data.summary.before =
         import::load(before, 0, control, progress, |row| builder.add(0, row))?;
     builder.data.summary.after =
@@ -1060,7 +1400,7 @@ pub fn build_comparison(
         builder.data.summary.after.description.as_deref(),
     );
     progress(Progress {
-        phase: "finalizing".into(),
+        phase: "finalizing",
         bytes_read: 0,
         total_bytes: 0,
         rows: builder.data.summary.before.rows + builder.data.summary.after.rows,

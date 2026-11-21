@@ -26,7 +26,7 @@ impl JobControl {
     }
 }
 pub struct Progress {
-    pub phase: String,
+    pub phase: &'static str,
     pub bytes_read: u64,
     pub total_bytes: u64,
     pub rows: u64,
@@ -95,9 +95,19 @@ impl PathBuffers {
         if trimmed.is_ascii() {
             self.key.push_str(trimmed);
             self.key.make_ascii_lowercase();
-        } else {
-            // Preserve contextual Unicode lowercase mapping, including Greek sigma.
+        } else if trimmed.contains('Σ') {
+            // Preserve contextual Unicode lowercase mapping for Greek sigma.
             self.key.push_str(&trimmed.to_lowercase());
+        } else {
+            for c in trimmed.chars() {
+                if c.is_ascii() {
+                    self.key.push(c.to_ascii_lowercase());
+                } else {
+                    for lc in c.to_lowercase() {
+                        self.key.push(lc);
+                    }
+                }
+            }
         }
         let key = &mut self.key;
         let drive_root = key.len() == 2 && key.ends_with(':');
@@ -127,7 +137,11 @@ impl PathBuffers {
         } else {
             trimmed.rsplit('\\').next().unwrap_or(trimmed)
         };
-        let depth = key.trim_end_matches('\\').matches('\\').count() as i64;
+        let depth = key
+            .trim_end_matches('\\')
+            .bytes()
+            .filter(|&b| b == b'\\')
+            .count() as i64;
         (key.as_str(), parent, name, depth, kind)
     }
 }
@@ -178,6 +192,70 @@ pub struct ParsedRow<'a> {
     pub record: u64,
 }
 
+#[inline]
+fn trim_leading_zeros(v: &str) -> &str {
+    let bytes = v.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == b'0' {
+        i += 1;
+    }
+    if i == bytes.len() {
+        "0"
+    } else {
+        &v[i..]
+    }
+}
+
+#[inline]
+fn parse_nonneg_i64(path: &Path, rec: u64, column: &str, v: &str) -> Result<u64> {
+    let bytes = v.as_bytes();
+    let mut acc = 0u64;
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if !b.is_ascii_digit() {
+            return Err(field_error(path, rec, column, "必须是非负十进制整数"));
+        }
+        let d = (b - b'0') as u64;
+        match acc.checked_mul(10).and_then(|n| n.checked_add(d)) {
+            Some(n) if n <= i64::MAX as u64 => acc = n,
+            _ => {
+                if !bytes[idx + 1..].iter().all(|b| b.is_ascii_digit()) {
+                    return Err(field_error(path, rec, column, "必须是非负十进制整数"));
+                }
+                return Err(field_error(path, rec, column, "数值超出 i64 范围"));
+            }
+        }
+        idx += 1;
+    }
+    Ok(acc)
+}
+
+#[inline]
+fn canonical_nonneg_i64<'a>(path: &Path, rec: u64, column: &str, v: &'a str) -> Result<&'a str> {
+    if !v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(field_error(path, rec, column, "必须是非负十进制整数"));
+    }
+    let trimmed = trim_leading_zeros(v);
+    if trimmed.len() > 19 || (trimmed.len() == 19 && trimmed > "9223372036854775807") {
+        return Err(field_error(path, rec, column, "数值超出 i64 范围"));
+    }
+    Ok(trimmed)
+}
+
+#[inline]
+fn canonical_nonneg_digits<'a>(
+    path: &Path,
+    rec: u64,
+    column: &str,
+    v: &'a str,
+) -> Result<&'a str> {
+    if !v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(field_error(path, rec, column, "必须是非负十进制整数"));
+    }
+    Ok(trim_leading_zeros(v))
+}
+
 /// Parse with reusable buffers; the consumer must not retain references to a CSV record.
 pub fn load(
     path: &Path,
@@ -192,7 +270,7 @@ pub fn load(
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
-        .buffer_capacity(64 * 1024)
+        .buffer_capacity(256 * 1024)
         .from_reader(StrictCsv::new(file));
     let mut record = csv::StringRecord::new();
     let mut positions = [None; 17];
@@ -200,6 +278,7 @@ pub fn load(
     let mut description = None;
     let (mut rows, mut files, mut folders) = (0u64, 0u64, 0u64);
     let mut paths = PathBuffers::default();
+    let phase = if side == 0 { "before" } else { "after" };
     loop {
         let present = reader.read_record(&mut record).map_err(|e| {
             let mut error = source_error(
@@ -276,52 +355,28 @@ pub fn load(
                 .and_then(|p| record.get(p))
                 .filter(|v| !v.is_empty())
         };
-        let number = |i: usize, required: bool| -> Result<Option<u64>> {
-            match get(i) {
-                None if required => Err(field_error(path, rec, COLUMNS[i], "缺少必需值")),
-                None => Ok(None),
-                Some(v) if !v.bytes().all(|b| b.is_ascii_digit()) => {
-                    Err(field_error(path, rec, COLUMNS[i], "必须是非负十进制整数"))
-                }
-                Some(v) => v
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|v| *v <= i64::MAX as u64)
-                    .map(Some)
-                    .ok_or_else(|| field_error(path, rec, COLUMNS[i], "数值超出 i64 范围")),
-            }
-        };
         let original = get(0).ok_or_else(|| field_error(path, rec, COLUMNS[0], "路径为空"))?;
         let (key, parent, name, depth, kind) = paths.normalize(original);
         if key.is_empty() {
             return Err(field_error(path, rec, COLUMNS[0], "路径为空"));
         }
-        let size = number(1, true)?.unwrap();
-        let allocated = number(2, true)?.unwrap();
+        let size = match get(1) {
+            Some(v) => parse_nonneg_i64(path, rec, COLUMNS[1], v)?,
+            None => return Err(field_error(path, rec, COLUMNS[1], "缺少必需值")),
+        };
+        let allocated = match get(2) {
+            Some(v) => parse_nonneg_i64(path, rec, COLUMNS[2], v)?,
+            None => return Err(field_error(path, rec, COLUMNS[2], "缺少必需值")),
+        };
         let mut values = [None; 14];
         for i in 3..17 {
-            values[i - 3] = if i == 7 || i == 8 {
-                get(i)
-                    .map(|v| {
-                        if !v.bytes().all(|b| b.is_ascii_digit()) {
-                            return Err(field_error(path, rec, COLUMNS[i], "必须是非负十进制整数"));
-                        }
-                        let value = v.trim_start_matches('0');
-                        Ok(if value.is_empty() { "0" } else { value })
-                    })
-                    .transpose()?
-            } else if [5, 6, 11, 12, 13, 14, 15, 16].contains(&i) {
-                number(i, false)?;
-                get(i).map(|v| {
-                    let v = v.trim_start_matches('0');
-                    if v.is_empty() {
-                        "0"
-                    } else {
-                        v
-                    }
-                })
-            } else {
-                get(i)
+            values[i - 3] = match get(i) {
+                None => None,
+                Some(v) => Some(match i {
+                    7 | 8 => canonical_nonneg_digits(path, rec, COLUMNS[i], v)?,
+                    5 | 6 | 11..=16 => canonical_nonneg_i64(path, rec, COLUMNS[i], v)?,
+                    _ => v,
+                }),
             };
         }
         consume(ParsedRow {
@@ -354,7 +409,7 @@ pub fn load(
         if rows % 1000 == 0 {
             control.check()?;
             progress(Progress {
-                phase: if side == 0 { "before" } else { "after" }.into(),
+                phase,
                 bytes_read: reader.position().byte(),
                 total_bytes: initial.len(),
                 rows,
@@ -376,7 +431,7 @@ pub fn load(
         ));
     }
     progress(Progress {
-        phase: if side == 0 { "before" } else { "after" }.into(),
+        phase,
         bytes_read: initial.len(),
         total_bytes: initial.len(),
         rows,

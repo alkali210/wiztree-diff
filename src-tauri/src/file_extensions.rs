@@ -130,7 +130,7 @@ fn scope(
     } else if node == 0 {
         Arc::new(Statistics::Global)
     } else {
-        let mut aggregated: HashMap<&str, [u64; 3]> = HashMap::new();
+        let mut aggregated: hashbrown::HashMap<u32, [u64; 3]> = hashbrown::HashMap::new();
         let mut pending = Vec::new();
         if comparison
             .entry(node, side)
@@ -149,7 +149,7 @@ fn scope(
             if entry.kind == NodeKind::Directory {
                 pending.push(comparison.children(id).iter());
             } else {
-                let total = aggregated.entry(comparison.extension(id)).or_default();
+                let total = aggregated.entry(comparison.extension_id(id)).or_default();
                 for (sum, value) in total.iter_mut().zip([entry.size, entry.allocated, 1]) {
                     *sum = store::checked_add(*sum, value, "扩展名目录汇总")?;
                 }
@@ -157,8 +157,8 @@ fn scope(
         }
         let stats: Vec<_> = aggregated
             .into_iter()
-            .map(|(extension, [size, allocated, files])| ExtensionStat {
-                extension: extension.into(),
+            .map(|(ext_id, [size, allocated, files])| ExtensionStat {
+                extension: comparison.extension_text(ext_id).into(),
                 size,
                 allocated,
                 files,

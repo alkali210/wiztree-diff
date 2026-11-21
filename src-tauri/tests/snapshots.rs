@@ -1565,3 +1565,67 @@ C:\\s\\plain,100,200,,\n"
         );
     }
 }
+
+#[test]
+fn varint_long_detail_fields_mixed_mft_widths_and_unicode_paths_stay_exact() {
+    let long_modified = "2026/10/1 12:00:00 ".to_owned() + &"x".repeat(300);
+    let long_attr = "A".repeat(150);
+    let header = "文件名称,大小,分配,修改时间,属性,MFTRECNO\n";
+    let csv = format!(
+        "{header}\
+C:\\中文目录\\子目录\\,100,200,{long_modified},{long_attr},1\n\
+C:\\中文目录\\子目录\\Ä文件.TXT,10,16,{long_modified},{long_attr},00042\n\
+C:\\中文目录\\子目录\\link.txt,10,16,,,42\n\
+C:\\中文目录\\子目录\\max64a.bin,10,16,,,18446744073709551615\n\
+C:\\中文目录\\子目录\\max64b.bin,10,16,,,018446744073709551615\n\
+C:\\中文目录\\子目录\\big1.bin,10,16,,,18446744073709551616\n\
+C:\\中文目录\\子目录\\big2.bin,10,16,,,00018446744073709551616\n\
+D:\\中文目录\\other.txt,10,16,,,42\n\
+\\\\Server\\Share\\ΟΣ,10,16,,,18446744073709551616\n"
+    );
+    let (_dir, conn) = comparison(&csv, &csv);
+
+    // Multi-byte varint cold detail fields round-trip identically.
+    let ä = diff::get_details(&conn, &id(&conn, "C:\\中文目录\\子目录\\Ä文件.TXT")).unwrap();
+    let before_ä = ä.before.as_ref().unwrap();
+    assert_eq!(before_ä.modified.as_deref(), Some(long_modified.as_str()));
+    assert_eq!(before_ä.attributes.as_deref(), Some(long_attr.as_str()));
+    assert_eq!(before_ä.mft.as_deref(), Some("42"));
+    assert_eq!(before_ä.hardlink_count, 2);
+
+    // u64::MAX and u64::MAX + 1 hardlink groups stay separate and volume-scoped.
+    assert_eq!(
+        diff::get_details(&conn, &id(&conn, "C:\\中文目录\\子目录\\max64a.bin"))
+            .unwrap()
+            .before
+            .unwrap()
+            .hardlink_count,
+        2
+    );
+    assert_eq!(
+        diff::get_details(&conn, &id(&conn, "C:\\中文目录\\子目录\\big1.bin"))
+            .unwrap()
+            .before
+            .unwrap()
+            .hardlink_count,
+        2
+    );
+    assert_eq!(
+        diff::get_details(&conn, &id(&conn, "D:\\中文目录\\other.txt"))
+            .unwrap()
+            .before
+            .unwrap()
+            .hardlink_count,
+        1
+    );
+    let unc = diff::get_details(&conn, &id(&conn, "\\\\Server\\Share\\ΟΣ")).unwrap();
+    assert_eq!(unc.before.unwrap().hardlink_count, 1);
+    assert_eq!(
+        import::normalize("\\\\Server\\Share\\ΟΣ").0,
+        "\\\\server\\share\\ος"
+    );
+    assert_eq!(
+        import::normalize("C:\\中文目录\\ÄÖÜİ").0,
+        "c:\\中文目录\\äöüi\u{307}"
+    );
+}

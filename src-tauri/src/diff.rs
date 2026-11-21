@@ -39,15 +39,12 @@ fn kind(entry: &SideEntry) -> String {
     .into()
 }
 fn side(comparison: &Comparison, id: NodeId, index: usize) -> Option<SideValue> {
-    comparison.entry(id, index).map(|entry| {
-        let fields = comparison.entry_details(entry);
-        SideValue {
-            kind: kind(entry),
-            size: entry.size.to_string(),
-            allocated: entry.allocated.to_string(),
-            modified: fields[0].map(str::to_owned),
-            attributes: fields[1].map(str::to_owned),
-        }
+    comparison.entry(id, index).map(|entry| SideValue {
+        kind: kind(entry),
+        size: entry.size.to_string(),
+        allocated: entry.allocated.to_string(),
+        modified: comparison.entry_field(entry, 0).map(str::to_owned),
+        attributes: comparison.entry_field(entry, 1).map(str::to_owned),
     })
 }
 fn deltas(comparison: &Comparison, id: NodeId) -> (String, String) {
@@ -68,7 +65,7 @@ fn child(comparison: &Comparison, id: NodeId) -> ChildRow {
         expandable: node.expandable,
         status: node.status.clone(),
         has_changes: node.has_changes,
-        changed_descendant_count: node.changed_descendant_count,
+        changed_descendant_count: node.changed_descendant_count as u64,
         child_count: comparison.children(id).len() as u64,
         before: side(comparison, id, 0),
         after: side(comparison, id, 1),
@@ -456,7 +453,7 @@ pub fn get_details(comparison: &Comparison, node_id: &str) -> Result<NodeDetails
         Entry {
             path: comparison.path(id, index), kind: kind(e), size: e.size.to_string(), allocated: e.allocated.to_string(),
             modified, attributes, files, folders, mft, parent_mft, accessed, created, direct_size, direct_allocated,
-            drive_capacity, free_space, used_space, reserved_space, hardlink_count: e.hardlink_count,
+            drive_capacity, free_space, used_space, reserved_space, hardlink_count: e.hardlink_count as u64,
         }
     })
     };
