@@ -102,7 +102,7 @@ impl Strings {
     }
 }
 #[inline]
-fn write_varint(buf: &mut Vec<u8>, mut value: usize) -> Result<()> {
+pub(crate) fn write_varint(buf: &mut Vec<u8>, mut value: usize) -> Result<()> {
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
@@ -338,25 +338,6 @@ impl Comparison {
         // SAFETY: encoded details only store UTF-8 slices copied from &str CSV fields.
         Some(unsafe { std::str::from_utf8_unchecked(&bytes[offset..offset + len]) })
     }
-    fn entry_details_eq(&self, d: &Details, mask: u16, values: &[Option<&str>; 14]) -> bool {
-        if d.mask != mask {
-            return false;
-        }
-        let bytes = self.detail_bytes.get(d.data);
-        let mut offset = 0usize;
-        let mut remaining = mask;
-        while remaining != 0 {
-            let i = remaining.trailing_zeros() as usize;
-            remaining &= remaining - 1;
-            let len = read_varint(bytes, &mut offset);
-            let expected = values[i].unwrap().as_bytes();
-            if len != expected.len() || &bytes[offset..offset + len] != expected {
-                return false;
-            }
-            offset += len;
-        }
-        true
-    }
     pub fn own_files(&self, id: NodeId) -> FileAggregate {
         let b = self.entry(id, 0).filter(|e| e.kind == NodeKind::File);
         let a = self.entry(id, 1).filter(|e| e.kind == NodeKind::File);
@@ -459,7 +440,6 @@ struct Builder {
     extension_values: [Vec<[u64; 3]>; 2],
     mft_count: [usize; 2],
     totals: [[u64; 2]; 2],
-    encoded: Vec<u8>,
 }
 fn empty_summary() -> SourceSummary {
     SourceSummary {
@@ -533,7 +513,6 @@ impl Builder {
             extension_values: [vec![[0; 3]], vec![[0; 3]]],
             mft_count: [0; 2],
             totals: [[0; 2]; 2],
-            encoded: Vec::with_capacity(1024),
         }
     }
     fn intern_prefix(&mut self, value: &str) -> Result<TextRef> {
@@ -625,186 +604,199 @@ impl Builder {
         }
         Ok(id)
     }
-    fn add(&mut self, side: usize, row: import::ParsedRow<'_>) -> Result<()> {
-        let (prefix, basename) = import::canonical_parts(row.key);
-        let prefix = self.intern_canonical_prefix(prefix)?;
-        let hash = self.hasher.hash_one((prefix, basename));
-        let found = self
-            .index
-            .find(hash, |id| {
-                let n = self.data.node(*id);
-                n.prefix == prefix && self.data.text(n.basename) == basename
-            })
-            .copied();
-        let id = match found {
-            Some(id) => id,
-            None => {
-                let extension = self.extension_id(crate::file_extensions::extension(basename))?;
-                let basename = self.data.strings.put(basename)?;
-                let id = push(
-                    &mut self.data.nodes,
-                    Node {
-                        prefix,
-                        basename,
-                        parent: 0,
-                        before: 0,
-                        after: 0,
-                        depth: row.depth,
-                        changed_descendant_count: 0,
-                        extension,
-                        aggregate: 0,
-                        status: Status::Added,
-                        has_changes: true,
-                        expandable: false,
-                    },
-                )?;
-                let c = &self.data;
-                let h = &self.hasher;
-                self.index
-                    .try_reserve(1, |id| {
+    fn add_batch(&mut self, side: usize, batch: &import::ParsedBatch) -> Result<()> {
+        for row in &batch.rows {
+            let original = batch.str(row.original);
+            let key = batch.str(row.key);
+            let name = batch.str(row.name);
+            let encoded_details = batch.bytes(row.details);
+            let mask = row.details_mask;
+            let (prefix, basename) = import::canonical_parts(key);
+            let prefix = self.intern_canonical_prefix(prefix)?;
+            let hash = self.hasher.hash_one((prefix, basename));
+            let found = self
+                .index
+                .find(hash, |id| {
+                    let n = self.data.node(*id);
+                    n.prefix == prefix && self.data.text(n.basename) == basename
+                })
+                .copied();
+            let id = match found {
+                Some(id) => id,
+                None => {
+                    let extension =
+                        self.extension_id(crate::file_extensions::extension(basename))?;
+                    let basename = self.data.strings.put(basename)?;
+                    let id = push(
+                        &mut self.data.nodes,
+                        Node {
+                            prefix,
+                            basename,
+                            parent: 0,
+                            before: 0,
+                            after: 0,
+                            depth: row.depth,
+                            changed_descendant_count: 0,
+                            extension,
+                            aggregate: 0,
+                            status: Status::Added,
+                            has_changes: true,
+                            expandable: false,
+                        },
+                    )?;
+                    let c = &self.data;
+                    let h = &self.hasher;
+                    self.index
+                        .try_reserve(1, |id| {
+                            let n = c.node(*id);
+                            h.hash_one((n.prefix, c.text(n.basename)))
+                        })
+                        .map_err(|_| memory_error())?;
+                    self.index.insert_unique(hash, id, |id| {
                         let n = c.node(*id);
                         h.hash_one((n.prefix, c.text(n.basename)))
-                    })
-                    .map_err(|_| memory_error())?;
-                self.index.insert_unique(hash, id, |id| {
-                    let n = c.node(*id);
-                    h.hash_one((n.prefix, c.text(n.basename)))
-                });
-                id
-            }
-        };
-        if self.data.entry(id, side).is_some() {
-            let mut e = ApiError::new("INVALID_FIELD", "重复或大小写规范化冲突路径");
-            e.record = Some(row.record);
-            e.column = Some(import::COLUMNS[0].into());
-            return Err(e);
-        }
-        // Preserve exact original spelling while sharing the directory prefix.
-        let (raw_prefix, raw_suffix) = if prefix.len == 0 {
-            ("", row.original)
-        } else {
-            let trimmed = row.original.trim_end_matches(['\\', '/']);
-            match trimmed.rfind(['\\', '/']) {
-                Some(i) => row.original.split_at(i + 1),
-                None => ("", row.original),
-            }
-        };
-        let raw_prefix = self.intern_raw_prefix(raw_prefix, prefix)?;
-        let mut mask = 0u16;
-        for (i, value) in row.values.iter().enumerate() {
-            if value.is_some() {
-                mask |= 1 << i;
-            }
-        }
-        let shared = self.data.entry(id, 0).filter(|_| side == 1).and_then(|e| {
-            let d = &self.data.details[e.details as usize - 1];
-            if d.prefix == raw_prefix
-                && d.mask == mask
-                && self.data.text(d.suffix) == raw_suffix
-                && self.data.entry_details_eq(d, mask, &row.values)
-            {
-                Some(e.details)
-            } else {
-                None
-            }
-        });
-        let details = match shared {
-            Some(id) => id,
-            None => {
-                let suffix = if raw_suffix == self.data.basename(id) {
-                    self.data.node(id).basename
-                } else {
-                    self.data.strings.put(raw_suffix)?
-                };
-                self.encoded.clear();
-                let mut remaining = mask;
-                while remaining != 0 {
-                    let i = remaining.trailing_zeros() as usize;
-                    remaining &= remaining - 1;
-                    let value = row.values[i].unwrap();
-                    write_varint(&mut self.encoded, value.len())?;
-                    self.encoded
-                        .try_reserve(value.len())
-                        .map_err(|_| memory_error())?;
-                    self.encoded.extend_from_slice(value.as_bytes());
-                }
-                let data = self.data.detail_bytes.put(&self.encoded)?;
-                push(
-                    &mut self.data.details,
-                    Details {
-                        prefix: raw_prefix,
-                        suffix,
-                        data,
-                        mask,
-                    },
-                )?
-            }
-        };
-        let entry = push(
-            &mut self.data.entries[side],
-            SideEntry {
-                size: row.size,
-                allocated: row.allocated,
-                hardlink_count: 0,
-                details,
-                kind: row.kind,
-            },
-        )?;
-        let node = &mut self.data.nodes[id as usize - 1];
-        if side == 0 {
-            node.before = entry;
-        } else {
-            node.after = entry;
-        }
-        node.expandable |= row.kind == NodeKind::Directory;
-        let status = match (self.data.entry(id, 0), self.data.entry(id, 1)) {
-            (None, Some(_)) => Status::Added,
-            (Some(_), None) => Status::Removed,
-            (Some(b), Some(a)) if b.kind != a.kind => Status::TypeChanged,
-            (Some(b), Some(a)) if b.size != a.size || b.allocated != a.allocated => {
-                Status::Modified
-            }
-            _ => Status::Unchanged,
-        };
-        let n = &mut self.data.nodes[id as usize - 1];
-        n.status = status;
-        n.has_changes = status != Status::Unchanged;
-        if row.kind == NodeKind::File {
-            if mask & (1 << 4) != 0 {
-                self.mft_count[side] += 1;
-            }
-            self.totals[side][0] = checked_add(self.totals[side][0], row.size, "文件路径大小")?;
-            self.totals[side][1] =
-                checked_add(self.totals[side][1], row.allocated, "文件路径分配")?;
-            let ext_id = self.data.node(id).extension as usize;
-            let category = if row.name.starts_with('.') {
-                crate::file_categories::category_index(row.name)
-            } else if ext_id == 0 {
-                if row.name.eq_ignore_ascii_case("README") {
-                    5
-                } else {
-                    7
-                }
-            } else {
-                let ext_len = self.data.extensions_names[ext_id].len as usize;
-                let name_bytes = row.name.as_bytes();
-                if name_bytes.len() >= ext_len
-                    && name_bytes[name_bytes.len() - ext_len] == b'.'
-                    && name_bytes[name_bytes.len() - ext_len..].is_ascii()
-                {
-                    self.extension_categories[ext_id] as usize
-                } else {
-                    crate::file_categories::category_index(row.name)
+                    });
+                    id
                 }
             };
-            let values = &mut self.data.categories[side][category];
-            values[0] = checked_add(values[0], row.size, "文件类别大小")?;
-            values[1] = checked_add(values[1], row.allocated, "文件类别分配")?;
-            values[2] += 1;
-            let values = &mut self.extension_values[side][ext_id];
-            values[0] = checked_add(values[0], row.size, "扩展名大小")?;
-            values[1] = checked_add(values[1], row.allocated, "扩展名分配")?;
-            values[2] += 1;
+            if self.data.entry(id, side).is_some() {
+                let mut e = ApiError::new("INVALID_FIELD", "重复或大小写规范化冲突路径");
+                e.record = Some(row.record);
+                e.column = Some(import::COLUMNS[0].into());
+                return Err(e);
+            }
+            // Preserve exact original spelling while sharing the directory prefix.
+            let (raw_prefix, raw_suffix) = if prefix.len == 0 {
+                ("", original)
+            } else {
+                let trimmed = original.trim_end_matches(['\\', '/']);
+                match trimmed.rfind(['\\', '/']) {
+                    Some(i) => original.split_at(i + 1),
+                    None => ("", original),
+                }
+            };
+            let raw_prefix = self.intern_raw_prefix(raw_prefix, prefix)?;
+            let shared = self.data.entry(id, 0).filter(|_| side == 1).and_then(|e| {
+                let d = &self.data.details[e.details as usize - 1];
+                if d.prefix == raw_prefix
+                    && d.mask == mask
+                    && self.data.text(d.suffix) == raw_suffix
+                    && self.data.detail_bytes.get(d.data) == encoded_details
+                {
+                    Some(e.details)
+                } else {
+                    None
+                }
+            });
+            let details = match shared {
+                Some(id) => id,
+                None => {
+                    let suffix = if raw_suffix == self.data.basename(id) {
+                        self.data.node(id).basename
+                    } else {
+                        self.data.strings.put(raw_suffix)?
+                    };
+                    let data = self.data.detail_bytes.put(encoded_details)?;
+                    push(
+                        &mut self.data.details,
+                        Details {
+                            prefix: raw_prefix,
+                            suffix,
+                            data,
+                            mask,
+                        },
+                    )?
+                }
+            };
+            let entry = push(
+                &mut self.data.entries[side],
+                SideEntry {
+                    size: row.size,
+                    allocated: row.allocated,
+                    hardlink_count: 0,
+                    details,
+                    kind: row.kind,
+                },
+            )?;
+            let node = &mut self.data.nodes[id as usize - 1];
+            if side == 0 {
+                node.before = entry;
+            } else {
+                node.after = entry;
+            }
+            node.expandable |= row.kind == NodeKind::Directory;
+            let status = match (self.data.entry(id, 0), self.data.entry(id, 1)) {
+                (None, Some(_)) => Status::Added,
+                (Some(_), None) => Status::Removed,
+                (Some(b), Some(a)) if b.kind != a.kind => Status::TypeChanged,
+                (Some(b), Some(a)) if b.size != a.size || b.allocated != a.allocated => {
+                    Status::Modified
+                }
+                _ => Status::Unchanged,
+            };
+            let n = &mut self.data.nodes[id as usize - 1];
+            n.status = status;
+            n.has_changes = status != Status::Unchanged;
+            if row.kind == NodeKind::File {
+                if mask & (1 << 4) != 0 {
+                    self.mft_count[side] += 1;
+                }
+                self.totals[side][0] = checked_add(self.totals[side][0], row.size, "文件路径大小")
+                    .map_err(|mut e| {
+                        e.record.get_or_insert(row.record);
+                        e
+                    })?;
+                self.totals[side][1] =
+                    checked_add(self.totals[side][1], row.allocated, "文件路径分配").map_err(
+                        |mut e| {
+                            e.record.get_or_insert(row.record);
+                            e
+                        },
+                    )?;
+                let ext_id = self.data.node(id).extension as usize;
+                let category = if name.starts_with('.') {
+                    crate::file_categories::category_index(name)
+                } else if ext_id == 0 {
+                    if name.eq_ignore_ascii_case("README") {
+                        5
+                    } else {
+                        7
+                    }
+                } else {
+                    let ext_len = self.data.extensions_names[ext_id].len as usize;
+                    let name_bytes = name.as_bytes();
+                    if name_bytes.len() >= ext_len
+                        && name_bytes[name_bytes.len() - ext_len] == b'.'
+                        && name_bytes[name_bytes.len() - ext_len..].is_ascii()
+                    {
+                        self.extension_categories[ext_id] as usize
+                    } else {
+                        crate::file_categories::category_index(name)
+                    }
+                };
+                let values = &mut self.data.categories[side][category];
+                values[0] = checked_add(values[0], row.size, "文件类别大小").map_err(|mut e| {
+                    e.record.get_or_insert(row.record);
+                    e
+                })?;
+                values[1] =
+                    checked_add(values[1], row.allocated, "文件类别分配").map_err(|mut e| {
+                        e.record.get_or_insert(row.record);
+                        e
+                    })?;
+                values[2] += 1;
+                let values = &mut self.extension_values[side][ext_id];
+                values[0] = checked_add(values[0], row.size, "扩展名大小").map_err(|mut e| {
+                    e.record.get_or_insert(row.record);
+                    e
+                })?;
+                values[1] =
+                    checked_add(values[1], row.allocated, "扩展名分配").map_err(|mut e| {
+                        e.record.get_or_insert(row.record);
+                        e
+                    })?;
+                values[2] += 1;
+            }
         }
         Ok(())
     }
@@ -1040,7 +1032,6 @@ impl Builder {
         self.prefixes = HashTable::new();
         self.extension_ids = HashMap::new();
         self.extension_categories = Vec::new();
-        self.encoded = Vec::new();
         // Compact immutable arrays when slack is significant, avoiding full-array copies for tight preallocs.
         fn shrink_if_excess<T>(v: &mut Vec<T>) {
             if v.capacity() > v.len() + (v.len() >> 4) + 64 {
@@ -1391,10 +1382,20 @@ pub fn build_comparison(
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Comparison> {
     let mut builder = Builder::new(comparison_id, estimate_rows(before), estimate_rows(after));
-    builder.data.summary.before =
-        import::load(before, 0, control, progress, |row| builder.add(0, row))?;
-    builder.data.summary.after =
-        import::load(after, 1, control, progress, |row| builder.add(1, row))?;
+    builder.data.summary.before = import::load_batched(
+        before,
+        0,
+        control,
+        progress,
+        |batch| builder.add_batch(0, batch),
+    )?;
+    builder.data.summary.after = import::load_batched(
+        after,
+        1,
+        control,
+        progress,
+        |batch| builder.add_batch(1, batch),
+    )?;
     builder.data.summary.order_warning = import::snapshot_order_warning(
         builder.data.summary.before.description.as_deref(),
         builder.data.summary.after.description.as_deref(),

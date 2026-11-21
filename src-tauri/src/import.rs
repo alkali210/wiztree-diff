@@ -3,7 +3,10 @@ use std::{
     fs::File,
     io::{self, Read},
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Mutex,
+    },
 };
 
 #[derive(Default)]
@@ -256,6 +259,750 @@ fn canonical_nonneg_digits<'a>(
     Ok(trim_leading_zeros(v))
 }
 
+fn memory_error() -> ApiError {
+    ApiError::new(
+        "MEMORY_LIMIT",
+        "内存不足或记录数超出运行时容量；未截断输入，也未写入磁盘缓存",
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TextSpan {
+    start: u32,
+    len: u32,
+}
+
+pub(crate) struct PackedRow {
+    pub original: TextSpan,
+    pub key: TextSpan,
+    pub name: TextSpan,
+    pub details: TextSpan,
+    pub details_mask: u16,
+    pub kind: NodeKind,
+    pub depth: u32,
+    pub size: u64,
+    pub allocated: u64,
+    pub record: u64,
+}
+
+pub(crate) struct ParsedBatch {
+    chunk: Vec<u8>,
+    text: String,
+    encoded: Vec<u8>,
+    pub rows: Vec<PackedRow>,
+    pub files: u64,
+    pub folders: u64,
+    pub end_byte: u64,
+}
+
+impl ParsedBatch {
+    fn with_capacity() -> Self {
+        Self {
+            chunk: Vec::with_capacity(CHUNK_TARGET + 4096),
+            text: String::with_capacity(CHUNK_TARGET),
+            encoded: Vec::with_capacity(64 * 1024),
+            rows: Vec::with_capacity(2048),
+            files: 0,
+            folders: 0,
+            end_byte: 0,
+        }
+    }
+    fn clear(&mut self) {
+        self.chunk.clear();
+        self.text.clear();
+        self.encoded.clear();
+        self.rows.clear();
+        self.files = 0;
+        self.folders = 0;
+        self.end_byte = 0;
+    }
+    #[inline]
+    pub(crate) fn str(&self, span: TextSpan) -> &str {
+        &self.text[span.start as usize..span.start as usize + span.len as usize]
+    }
+    #[inline]
+    pub(crate) fn bytes(&self, span: TextSpan) -> &[u8] {
+        &self.encoded[span.start as usize..span.start as usize + span.len as usize]
+    }
+    #[inline]
+    fn push_str(&mut self, s: &str) -> Result<TextSpan> {
+        let start = u32::try_from(self.text.len()).map_err(|_| memory_error())?;
+        let len = u32::try_from(s.len()).map_err(|_| memory_error())?;
+        self.text.try_reserve(s.len()).map_err(|_| memory_error())?;
+        self.text.push_str(s);
+        Ok(TextSpan { start, len })
+    }
+}
+
+struct HeaderSpec {
+    positions: [Option<usize>; 17],
+    width: Option<usize>,
+    description: Option<String>,
+}
+
+impl Default for HeaderSpec {
+    fn default() -> Self {
+        Self {
+            positions: [None; 17],
+            width: None,
+            description: None,
+        }
+    }
+}
+
+fn parse_header_record(
+    path: &Path,
+    rec: u64,
+    record: &csv::StringRecord,
+    header: &mut HeaderSpec,
+) -> Result<bool> {
+    if record
+        .iter()
+        .any(|s| s.trim_start_matches('\u{feff}') == COLUMNS[0])
+    {
+        for (i, column) in COLUMNS.iter().enumerate() {
+            let mut matches = record
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.trim_start_matches('\u{feff}') == *column);
+            header.positions[i] = matches.next().map(|(p, _)| p);
+            if matches.next().is_some() {
+                return Err(field_error(path, rec, column, "重复表头"));
+            }
+        }
+        for i in 0..3 {
+            if header.positions[i].is_none() {
+                return Err(source_error(
+                    path,
+                    ApiError::new(
+                        "UNSUPPORTED_HEADER",
+                        format!("缺少 {}；请按样本选项导出 UTF-8 WizTree CSV", COLUMNS[i]),
+                    ),
+                ));
+            }
+        }
+        header.width = Some(record.len());
+        Ok(true)
+    } else if header.description.is_none() {
+        header.description = Some(
+            record
+                .iter()
+                .collect::<Vec<_>>()
+                .join(",")
+                .trim_start_matches('\u{feff}')
+                .to_owned(),
+        );
+        Ok(false)
+    } else {
+        Err(source_error(
+            path,
+            ApiError::new("UNSUPPORTED_HEADER", "请按样本选项导出 UTF-8 WizTree CSV"),
+        ))
+    }
+}
+
+fn parse_data_record<'a>(
+    path: &Path,
+    rec: u64,
+    header: &HeaderSpec,
+    record: &'a csv::StringRecord,
+    paths: &'a mut PathBuffers,
+) -> Result<ParsedRow<'a>> {
+    if record.len() > header.width.unwrap() {
+        return Err(field_error(path, rec, "CSV", "记录包含无表头列"));
+    }
+    let get = |i: usize| {
+        header.positions[i]
+            .and_then(|p| record.get(p))
+            .filter(|v| !v.is_empty())
+    };
+    let original = get(0).ok_or_else(|| field_error(path, rec, COLUMNS[0], "路径为空"))?;
+    let (key, parent, name, depth, kind) = paths.normalize(original);
+    if key.is_empty() {
+        return Err(field_error(path, rec, COLUMNS[0], "路径为空"));
+    }
+    let size = match get(1) {
+        Some(v) => parse_nonneg_i64(path, rec, COLUMNS[1], v)?,
+        None => return Err(field_error(path, rec, COLUMNS[1], "缺少必需值")),
+    };
+    let allocated = match get(2) {
+        Some(v) => parse_nonneg_i64(path, rec, COLUMNS[2], v)?,
+        None => return Err(field_error(path, rec, COLUMNS[2], "缺少必需值")),
+    };
+    let mut values = [None; 14];
+    for i in 3..17 {
+        values[i - 3] = match get(i) {
+            None => None,
+            Some(v) => Some(match i {
+                7 | 8 => canonical_nonneg_digits(path, rec, COLUMNS[i], v)?,
+                5 | 6 | 11..=16 => canonical_nonneg_i64(path, rec, COLUMNS[i], v)?,
+                _ => v,
+            }),
+        };
+    }
+    Ok(ParsedRow {
+        original,
+        key,
+        parent,
+        name,
+        depth: depth as u32,
+        kind: if kind == "file" {
+            NodeKind::File
+        } else {
+            NodeKind::Directory
+        },
+        size,
+        allocated,
+        values,
+        record: rec,
+    })
+}
+
+const CHUNK_TARGET: usize = 256 * 1024;
+const PARALLEL_MIN_BYTES: u64 = 64 * 1024;
+const WORKER_THREADS: usize = 2;
+const BATCH_POOL: usize = 6;
+
+fn lexical_api_error(path: &Path, record: u64) -> ApiError {
+    let mut error = source_error(
+        path,
+        ApiError::new(
+            "CSV_ERROR",
+            format!("{}；请导出 UTF-8 CSV", LexicalError { record }),
+        ),
+    );
+    error.record = Some(record);
+    error.column = Some("CSV".into());
+    error
+}
+
+/// Streams a CSV file into record-aligned byte chunks while enforcing StrictCsv lexical rules.
+struct ChunkReader {
+    file: File,
+    buf: Vec<u8>,
+    pos: usize,
+    filled: usize,
+    eof: bool,
+    state: u8,
+    offset: u64,
+    record: u64,
+    csv_records: u64,
+    record_has_bytes: bool,
+    cr: bool,
+    next_seq: u64,
+}
+
+impl ChunkReader {
+    fn new(file: File) -> Self {
+        Self {
+            file,
+            buf: vec![0u8; CHUNK_TARGET],
+            pos: 0,
+            filled: 0,
+            eof: false,
+            state: 0,
+            offset: 0,
+            record: 1,
+            csv_records: 0,
+            record_has_bytes: false,
+            cr: false,
+            next_seq: 0,
+        }
+    }
+
+    fn next_chunk(
+        &mut self,
+        path: &Path,
+        out: &mut Vec<u8>,
+        single_record: bool,
+    ) -> Result<Option<(u64, u64, u64)>> {
+        out.clear();
+        let first_csv_record = self.csv_records;
+        loop {
+            if self.pos == self.filled {
+                if self.eof {
+                    if self.state == 2 {
+                        return Err(lexical_api_error(path, self.record));
+                    }
+                    if self.record_has_bytes {
+                        self.csv_records += 1;
+                        self.record_has_bytes = false;
+                    }
+                    if out.is_empty() {
+                        return Ok(None);
+                    }
+                    let seq = self.next_seq;
+                    self.next_seq += 1;
+                    return Ok(Some((seq, first_csv_record, self.offset)));
+                }
+                let n = self
+                    .file
+                    .read(&mut self.buf)
+                    .map_err(|e| source_error(path, e.into()))?;
+                if n == 0 {
+                    self.eof = true;
+                    continue;
+                }
+                self.pos = 0;
+                self.filled = n;
+            }
+
+            let slice_start = self.pos;
+            let mut cut = false;
+            while self.pos < self.filled {
+                if self.cr {
+                    if self.buf[self.pos] == b'\n' {
+                        self.pos += 1;
+                        self.offset += 1;
+                    }
+                    self.cr = false;
+                    let ready = if single_record {
+                        self.csv_records > first_csv_record
+                    } else {
+                        out.len() + (self.pos - slice_start) >= CHUNK_TARGET
+                    };
+                    if ready {
+                        cut = true;
+                        break;
+                    }
+                    continue;
+                }
+                if self.offset >= 3 && (self.state == 1 || self.state == 2) {
+                    let skipped = ordinary_prefix(&self.buf[self.pos..self.filled], self.state == 2);
+                    if skipped != 0 {
+                        self.pos += skipped;
+                        self.offset += skipped as u64;
+                        self.record_has_bytes = true;
+                        if self.pos == self.filled {
+                            break;
+                        }
+                    }
+                }
+                let byte = self.buf[self.pos];
+                self.pos += 1;
+                self.offset += 1;
+                if self.offset <= 3 && byte == [0xef, 0xbb, 0xbf][self.offset as usize - 1] {
+                    continue;
+                }
+                if self.state == 2 {
+                    if byte == b'"' {
+                        self.state = 3;
+                    }
+                    continue;
+                }
+                if self.state == 3 && byte == b'"' {
+                    self.state = 2;
+                    continue;
+                }
+                if byte == b',' {
+                    self.state = 0;
+                    self.record_has_bytes = true;
+                    continue;
+                }
+                if byte == b'\r' {
+                    self.record += 1;
+                    if self.record_has_bytes {
+                        self.csv_records += 1;
+                        self.record_has_bytes = false;
+                    }
+                    self.cr = true;
+                    self.state = 0;
+                    continue;
+                }
+                if byte == b'\n' {
+                    self.record += 1;
+                    if self.record_has_bytes {
+                        self.csv_records += 1;
+                        self.record_has_bytes = false;
+                    }
+                    self.state = 0;
+                    let ready = if single_record {
+                        self.csv_records > first_csv_record
+                    } else {
+                        out.len() + (self.pos - slice_start) >= CHUNK_TARGET
+                    };
+                    if ready {
+                        cut = true;
+                        break;
+                    }
+                    continue;
+                }
+                self.record_has_bytes = true;
+                match (self.state, byte) {
+                    (0, b'"') => self.state = 2,
+                    (0, _) => self.state = 1,
+                    (1, b'"') | (3, _) => return Err(lexical_api_error(path, self.record)),
+                    _ => {}
+                }
+            }
+            let chunk_len = self.pos - slice_start;
+            if chunk_len > 0 {
+                out.try_reserve(chunk_len).map_err(|_| memory_error())?;
+                out.extend_from_slice(&self.buf[slice_start..self.pos]);
+            }
+            if cut {
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                return Ok(Some((seq, first_csv_record, self.offset)));
+            }
+        }
+    }
+}
+
+fn parse_chunk_into_batch(
+    path: &Path,
+    header: &HeaderSpec,
+    first_csv_record: u64,
+    end_byte: u64,
+    batch: &mut ParsedBatch,
+    record: &mut csv::StringRecord,
+    paths: &mut PathBuffers,
+    control: &JobControl,
+) -> Result<()> {
+    batch.text.clear();
+    batch.encoded.clear();
+    batch.rows.clear();
+    batch.files = 0;
+    batch.folders = 0;
+    batch.end_byte = end_byte;
+    let chunk = std::mem::take(&mut batch.chunk);
+    let result = (|| -> Result<()> {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .buffer_capacity(64 * 1024)
+            .from_reader(chunk.as_slice());
+        let mut local_rows = 0u64;
+        loop {
+            if local_rows % 1024 == 0 {
+                control.check()?;
+            }
+            let present = reader.read_record(record).map_err(|e| {
+                let mut error = source_error(
+                    path,
+                    ApiError::new("CSV_ERROR", format!("{e}；请导出 UTF-8 CSV")),
+                );
+                error.record = Some(
+                    first_csv_record
+                        + e.position()
+                            .map_or(reader.position().record() + 1, |p| p.record() + 1),
+                );
+                error.column = Some("CSV".into());
+                error
+            })?;
+            if !present {
+                break;
+            }
+            let rec = first_csv_record
+                + record
+                    .position()
+                    .map_or(reader.position().record(), |p| p.record() + 1);
+            let parsed = parse_data_record(path, rec, header, record, paths)?;
+            let original = batch.push_str(parsed.original)?;
+            let key = batch.push_str(parsed.key)?;
+            let name = batch.push_str(parsed.name)?;
+            let details_start = u32::try_from(batch.encoded.len()).map_err(|_| memory_error())?;
+            let mut details_mask = 0u16;
+            for (i, value) in parsed.values.iter().enumerate() {
+                if let Some(value) = value {
+                    details_mask |= 1 << i;
+                    crate::store::write_varint(&mut batch.encoded, value.len())?;
+                    batch
+                        .encoded
+                        .try_reserve(value.len())
+                        .map_err(|_| memory_error())?;
+                    batch.encoded.extend_from_slice(value.as_bytes());
+                }
+            }
+            let details_len = u32::try_from(batch.encoded.len() - details_start as usize)
+                .map_err(|_| memory_error())?;
+            batch.rows.try_reserve(1).map_err(|_| memory_error())?;
+            batch.rows.push(PackedRow {
+                original,
+                key,
+                name,
+                details: TextSpan {
+                    start: details_start,
+                    len: details_len,
+                },
+                details_mask,
+                kind: parsed.kind,
+                depth: parsed.depth,
+                size: parsed.size,
+                allocated: parsed.allocated,
+                record: parsed.record,
+            });
+            if parsed.kind == NodeKind::Directory {
+                batch.folders += 1;
+            } else {
+                batch.files += 1;
+            }
+            local_rows += 1;
+        }
+        Ok(())
+    })();
+    batch.chunk = chunk;
+    result
+}
+
+/// Stream CSV rows in recycled batches; uses two parallel parser workers for files >= 64 KiB
+/// while preserving strictly deterministic record order, error precedence, and bounded memory.
+pub(crate) fn load_batched(
+    path: &Path,
+    side: usize,
+    control: &JobControl,
+    progress: &mut dyn FnMut(Progress),
+    mut consume_batch: impl FnMut(&ParsedBatch) -> Result<()>,
+) -> Result<SourceSummary> {
+    control.check()?;
+    let initial = std::fs::metadata(path).map_err(|e| source_error(path, e.into()))?;
+    let file = File::open(path).map_err(|e| source_error(path, e.into()))?;
+    let mut reader = ChunkReader::new(file);
+    let mut header = HeaderSpec::default();
+    let mut header_chunk = Vec::with_capacity(4096);
+    let mut header_record = csv::StringRecord::new();
+    while header.width.is_none() {
+        let Some((_, first_csv_record, _)) = reader.next_chunk(path, &mut header_chunk, true)?
+        else {
+            break;
+        };
+        let mut csv_reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(header_chunk.as_slice());
+        if csv_reader
+            .read_record(&mut header_record)
+            .map_err(|e| {
+                let mut error = source_error(
+                    path,
+                    ApiError::new("CSV_ERROR", format!("{e}；请导出 UTF-8 CSV")),
+                );
+                error.record = Some(first_csv_record + 1);
+                error.column = Some("CSV".into());
+                error
+            })?
+        {
+            parse_header_record(path, first_csv_record + 1, &header_record, &mut header)?;
+        }
+    }
+    if header.width.is_none() {
+        return Err(source_error(
+            path,
+            ApiError::new("EMPTY_SNAPSHOT", "CSV 没有数据记录"),
+        ));
+    }
+    reader.next_seq = 0;
+
+    let phase = if side == 0 { "before" } else { "after" };
+    let (mut rows, mut files, mut folders) = (0u64, 0u64, 0u64);
+    let use_parallel = initial.len() >= PARALLEL_MIN_BYTES
+        && std::thread::available_parallelism().map_or(1, |n| n.get()) >= 2;
+
+    if !use_parallel {
+        let mut batch = ParsedBatch::with_capacity();
+        let mut record = csv::StringRecord::new();
+        let mut paths = PathBuffers::default();
+        while let Some((_, first_csv_record, end_byte)) =
+            reader.next_chunk(path, &mut batch.chunk, false)?
+        {
+            control.check()?;
+            parse_chunk_into_batch(
+                path,
+                &header,
+                first_csv_record,
+                end_byte,
+                &mut batch,
+                &mut record,
+                &mut paths,
+                control,
+            )?;
+            consume_batch(&batch).map_err(|mut e| {
+                e.source = Some(path.display().to_string());
+                e
+            })?;
+            rows += batch.rows.len() as u64;
+            files += batch.files;
+            folders += batch.folders;
+            if rows > 0 {
+                progress(Progress {
+                    phase,
+                    bytes_read: batch.end_byte,
+                    total_bytes: initial.len(),
+                    rows,
+                });
+            }
+            batch.clear();
+        }
+    } else {
+        let reader = Mutex::new(reader);
+        let stop = AtomicBool::new(false);
+        let min_err_seq = AtomicU64::new(u64::MAX);
+        let header_ref = &header;
+        let (free_tx, free_rx) = mpsc::sync_channel::<ParsedBatch>(BATCH_POOL);
+        for _ in 0..BATCH_POOL {
+            let _ = free_tx.send(ParsedBatch::with_capacity());
+        }
+        let free_rx = Mutex::new(free_rx);
+        std::thread::scope(|scope| -> Result<()> {
+            let free_tx = free_tx;
+            let (done_tx, done_rx) = mpsc::sync_channel::<(u64, Result<ParsedBatch>)>(BATCH_POOL);
+            for _ in 0..WORKER_THREADS {
+                let done_tx = done_tx.clone();
+                let reader = &reader;
+                let free_rx = &free_rx;
+                let stop = &stop;
+                let min_err_seq = &min_err_seq;
+                scope.spawn(move || {
+                    let mut record = csv::StringRecord::new();
+                    let mut paths = PathBuffers::default();
+                    loop {
+                        if stop.load(Ordering::Relaxed)
+                            || control.cancelled.load(Ordering::Relaxed)
+                        {
+                            break;
+                        }
+                        let mut batch = {
+                            let Ok(rx) = free_rx.lock() else { break };
+                            match rx.recv() {
+                                Ok(b) => b,
+                                Err(_) => break,
+                            }
+                        };
+                        let chunk_meta = {
+                            let Ok(mut r) = reader.lock() else { break };
+                            if stop.load(Ordering::Relaxed)
+                                || control.cancelled.load(Ordering::Relaxed)
+                                || r.next_seq >= min_err_seq.load(Ordering::Relaxed)
+                            {
+                                break;
+                            }
+                            match r.next_chunk(path, &mut batch.chunk, false) {
+                                Ok(Some(meta)) => Ok(meta),
+                                Ok(None) => break,
+                                Err(err) => {
+                                    let seq = r.next_seq;
+                                    r.next_seq += 1;
+                                    min_err_seq.fetch_min(seq, Ordering::Relaxed);
+                                    Err((seq, err))
+                                }
+                            }
+                        };
+                        match chunk_meta {
+                            Err((seq, err)) => {
+                                let _ = done_tx.send((seq, Err(err)));
+                                break;
+                            }
+                            Ok((seq, first_csv_record, end_byte)) => {
+                                let parsed = parse_chunk_into_batch(
+                                    path,
+                                    header_ref,
+                                    first_csv_record,
+                                    end_byte,
+                                    &mut batch,
+                                    &mut record,
+                                    &mut paths,
+                                    control,
+                                );
+                                match parsed {
+                                    Ok(()) => {
+                                        if done_tx.send((seq, Ok(batch))).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        min_err_seq.fetch_min(seq, Ordering::Relaxed);
+                                        let _ = done_tx.send((seq, Err(err)));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            drop(done_tx);
+
+            let consume_result = (|| -> Result<()> {
+                let mut next_seq = 0u64;
+                let mut pending: Vec<(u64, Result<ParsedBatch>)> = Vec::with_capacity(BATCH_POOL);
+                let mut drain_ready = |pending: &mut Vec<(u64, Result<ParsedBatch>)>,
+                                       next_seq: &mut u64|
+                 -> Result<()> {
+                    while let Some(pos) = pending.iter().position(|(s, _)| *s == *next_seq) {
+                        let (_, res) = pending.swap_remove(pos);
+                        *next_seq += 1;
+                        control.check()?;
+                        let mut batch = res?;
+                        consume_batch(&batch).map_err(|mut e| {
+                            e.source = Some(path.display().to_string());
+                            e
+                        })?;
+                        rows += batch.rows.len() as u64;
+                        files += batch.files;
+                        folders += batch.folders;
+                        if rows > 0 {
+                            progress(Progress {
+                                phase,
+                                bytes_read: batch.end_byte,
+                                total_bytes: initial.len(),
+                                rows,
+                            });
+                        }
+                        batch.clear();
+                        let _ = free_tx.send(batch);
+                    }
+                    Ok(())
+                };
+                while let Ok(item) = done_rx.recv() {
+                    pending.push(item);
+                    drain_ready(&mut pending, &mut next_seq)?;
+                }
+                drain_ready(&mut pending, &mut next_seq)?;
+                Ok(())
+            })();
+
+            // Always unblock workers before `std::thread::scope` joins them.
+            stop.store(true, Ordering::Relaxed);
+            drop(done_rx);
+            drop(free_tx);
+            consume_result
+        })?;
+    }
+
+    control.check()?;
+    if rows == 0 {
+        return Err(source_error(
+            path,
+            ApiError::new("EMPTY_SNAPSHOT", "CSV 没有数据记录"),
+        ));
+    }
+    let current = std::fs::metadata(path).map_err(|e| source_error(path, e.into()))?;
+    if initial.len() != current.len() || initial.modified()? != current.modified()? {
+        return Err(source_error(
+            path,
+            ApiError::new("SOURCE_CHANGED", "导入期间源文件发生变化"),
+        ));
+    }
+    progress(Progress {
+        phase,
+        bytes_read: initial.len(),
+        total_bytes: initial.len(),
+        rows,
+    });
+    Ok(SourceSummary {
+        path: path.display().to_string(),
+        description: header.description,
+        rows,
+        files,
+        folders,
+        roots: Vec::new(),
+        root_count: 0,
+        roots_truncated: false,
+        size: "0".into(),
+        allocated: "0".into(),
+    })
+}
+
 /// Parse with reusable buffers; the consumer must not retain references to a CSV record.
 pub fn load(
     path: &Path,
@@ -273,9 +1020,7 @@ pub fn load(
         .buffer_capacity(256 * 1024)
         .from_reader(StrictCsv::new(file));
     let mut record = csv::StringRecord::new();
-    let mut positions = [None; 17];
-    let mut header_width = None;
-    let mut description = None;
+    let mut header = HeaderSpec::default();
     let (mut rows, mut files, mut folders) = (0u64, 0u64, 0u64);
     let mut paths = PathBuffers::default();
     let phase = if side == 0 { "before" } else { "after" };
@@ -303,105 +1048,19 @@ pub fn load(
         let rec = record
             .position()
             .map_or(reader.position().record(), |p| p.record() + 1);
-        if header_width.is_none() {
-            if record
-                .iter()
-                .any(|s| s.trim_start_matches('\u{feff}') == COLUMNS[0])
-            {
-                for (i, column) in COLUMNS.iter().enumerate() {
-                    let mut matches = record
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, s)| s.trim_start_matches('\u{feff}') == *column);
-                    positions[i] = matches.next().map(|(p, _)| p);
-                    if matches.next().is_some() {
-                        return Err(field_error(path, rec, column, "重复表头"));
-                    }
-                }
-                for i in 0..3 {
-                    if positions[i].is_none() {
-                        return Err(source_error(
-                            path,
-                            ApiError::new(
-                                "UNSUPPORTED_HEADER",
-                                format!("缺少 {}；请按样本选项导出 UTF-8 WizTree CSV", COLUMNS[i]),
-                            ),
-                        ));
-                    }
-                }
-                header_width = Some(record.len());
-            } else if description.is_none() {
-                description = Some(
-                    record
-                        .iter()
-                        .collect::<Vec<_>>()
-                        .join(",")
-                        .trim_start_matches('\u{feff}')
-                        .to_owned(),
-                );
-            } else {
-                return Err(source_error(
-                    path,
-                    ApiError::new("UNSUPPORTED_HEADER", "请按样本选项导出 UTF-8 WizTree CSV"),
-                ));
-            }
+        if header.width.is_none() {
+            parse_header_record(path, rec, &record, &mut header)?;
             continue;
         }
-        if record.len() > header_width.unwrap() {
-            return Err(field_error(path, rec, "CSV", "记录包含无表头列"));
-        }
-        let get = |i: usize| {
-            positions[i]
-                .and_then(|p| record.get(p))
-                .filter(|v| !v.is_empty())
-        };
-        let original = get(0).ok_or_else(|| field_error(path, rec, COLUMNS[0], "路径为空"))?;
-        let (key, parent, name, depth, kind) = paths.normalize(original);
-        if key.is_empty() {
-            return Err(field_error(path, rec, COLUMNS[0], "路径为空"));
-        }
-        let size = match get(1) {
-            Some(v) => parse_nonneg_i64(path, rec, COLUMNS[1], v)?,
-            None => return Err(field_error(path, rec, COLUMNS[1], "缺少必需值")),
-        };
-        let allocated = match get(2) {
-            Some(v) => parse_nonneg_i64(path, rec, COLUMNS[2], v)?,
-            None => return Err(field_error(path, rec, COLUMNS[2], "缺少必需值")),
-        };
-        let mut values = [None; 14];
-        for i in 3..17 {
-            values[i - 3] = match get(i) {
-                None => None,
-                Some(v) => Some(match i {
-                    7 | 8 => canonical_nonneg_digits(path, rec, COLUMNS[i], v)?,
-                    5 | 6 | 11..=16 => canonical_nonneg_i64(path, rec, COLUMNS[i], v)?,
-                    _ => v,
-                }),
-            };
-        }
-        consume(ParsedRow {
-            original,
-            key,
-            parent,
-            name,
-            depth: depth as u32,
-            kind: if kind == "file" {
-                NodeKind::File
-            } else {
-                NodeKind::Directory
-            },
-            size,
-            allocated,
-            values,
-            record: rec,
-        })
-        .map_err(|mut e| {
+        let parsed = parse_data_record(path, rec, &header, &record, &mut paths)?;
+        let is_dir = parsed.kind == NodeKind::Directory;
+        consume(parsed).map_err(|mut e| {
             e.source = Some(path.display().to_string());
             e.record.get_or_insert(rec);
             e
         })?;
         rows += 1;
-        if kind == "directory" {
+        if is_dir {
             folders += 1;
         } else {
             files += 1;
@@ -438,7 +1097,7 @@ pub fn load(
     });
     Ok(SourceSummary {
         path: path.display().to_string(),
-        description,
+        description: header.description,
         rows,
         files,
         folders,

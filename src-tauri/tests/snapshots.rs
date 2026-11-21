@@ -1629,3 +1629,150 @@ D:\\中文目录\\other.txt,10,16,,,42\n\
         "c:\\中文目录\\äöüi\u{307}"
     );
 }
+
+#[test]
+fn parallel_chunked_import_preserves_multiline_quotes_error_precedence_and_cancellation() {
+    let dir = TempDir::new().unwrap();
+    let header = "\u{feff}生成由 WizTree 4.33 2026/10/1 12:00:00\r\n文件名称,大小,分配,修改时间,属性,MFTRECNO\r\n";
+
+    // Build a >600 KiB CSV spanning multiple 256 KiB chunks, with quoted multiline fields across boundaries.
+    let mut valid = String::from(header);
+    valid.push_str("C:\\中文根\\,0,0,2026/10/1 00:00:00,D,1\r\n");
+    for i in 0..8000u64 {
+        if i % 250 == 0 {
+            valid.push_str(&format!(
+                "\"C:\\中文根\\多行\r\n名称,\"\"引\"\"_{i:05}.txt\",{},{},2026/10/1 08:00:00,A,{}\r\n",
+                i + 1,
+                (i + 1) * 2,
+                100 + ((i / 250) % 8)
+            ));
+        } else {
+            valid.push_str(&format!(
+                "C:\\中文根\\子目录_{:02}\\文件_{i:05}.bin,{},{},2026/10/1 08:00:00,A,{}\r\n",
+                i % 32,
+                i + 1,
+                (i + 1) * 2,
+                1000 + i
+            ));
+        }
+    }
+    assert!(valid.len() > 512 * 1024);
+    let valid_path = source(&dir, "valid.csv", &valid);
+    let conn = store::build_comparison(
+        &valid_path,
+        &valid_path,
+        "parallel",
+        &JobControl::new(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(conn.summary.before.rows, 8001);
+    assert_eq!(conn.summary.before.files, 8000);
+    assert_eq!(conn.summary.before.folders, 1);
+    let quoted_details = diff::get_details(
+        &conn,
+        &id(&conn, "C:\\中文根\\多行\r\n名称,\"引\"_00000.txt"),
+    )
+    .unwrap();
+    assert_eq!(quoted_details.before.as_ref().unwrap().size, "1");
+    assert_eq!(quoted_details.before.as_ref().unwrap().hardlink_count, 4);
+
+    // Deterministic error precedence: errors in both chunk 0 and chunk 2 must always report chunk 0's record.
+    let mut two_errors = String::from(header);
+    for i in 0..8000u64 {
+        let size = if i == 100 || i == 7000 {
+            "-1".to_owned()
+        } else {
+            "1".to_owned()
+        };
+        two_errors.push_str(&format!(
+            "C:\\中文根\\dir_{:02}\\file_{i:05}.bin,{size},2,2026/10/1 08:00:00,A,{}\r\n",
+            i % 32,
+            1000 + i
+        ));
+    }
+    let err_path = source(&dir, "two_errors.csv", &two_errors);
+    for _ in 0..4 {
+        let err = store::build_comparison(
+            &err_path,
+            &valid_path,
+            "err",
+            &JobControl::new(),
+            &mut |_| {},
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.code, "INVALID_FIELD");
+        // description=1, header=2, i=0 is record 3, so i=100 is record 103.
+        assert_eq!(err.record, Some(103));
+        assert_eq!(err.column.as_deref(), Some("大小"));
+    }
+
+    // Late bad UTF-8 in chunk 2 reports exact CSV_ERROR record number.
+    let mut bad_utf8 = valid.as_bytes().to_vec();
+    bad_utf8.extend_from_slice(b"C:\\bad\xff.bin,1,2,2026/10/1 08:00:00,A,99999\r\n");
+    let bad_utf8_path = dir.path().join("bad_utf8.csv");
+    fs::write(&bad_utf8_path, &bad_utf8).unwrap();
+    let err = store::build_comparison(
+        &bad_utf8_path,
+        &valid_path,
+        "utf8",
+        &JobControl::new(),
+        &mut |_| {},
+    )
+    .err()
+    .unwrap();
+    assert_eq!(err.code, "CSV_ERROR");
+    assert_eq!(err.record, Some(8004));
+
+    // Late malformed quote in chunk 2 reports exact CSV_ERROR record number.
+    let mut bad_quote = valid.clone();
+    bad_quote.push_str("\"C:\\unclosed,1,2\r\n");
+    let bad_quote_path = source(&dir, "bad_quote.csv", &bad_quote);
+    let err = store::build_comparison(
+        &bad_quote_path,
+        &valid_path,
+        "quote",
+        &JobControl::new(),
+        &mut |_| {},
+    )
+    .err()
+    .unwrap();
+    assert_eq!(err.code, "CSV_ERROR");
+    assert_eq!(err.record, Some(8004));
+
+    // Mid-import cancellation during multi-chunk parallel parsing exits cleanly with CANCELLED.
+    let control = JobControl::new();
+    let err = store::build_comparison(&valid_path, &valid_path, "cancel", &control, &mut |p| {
+        if p.rows > 0 {
+            control.cancel();
+        }
+    })
+    .err()
+    .unwrap();
+    assert_eq!(err.code, "CANCELLED");
+
+    // Source mutation during multi-chunk parallel parsing returns SOURCE_CHANGED.
+    let mutable_path = source(&dir, "mutable.csv", &valid);
+    let mut mutated = false;
+    let err = store::build_comparison(
+        &mutable_path,
+        &valid_path,
+        "mutated",
+        &JobControl::new(),
+        &mut |p| {
+            if !mutated && p.rows > 0 {
+                mutated = true;
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&mutable_path)
+                    .unwrap()
+                    .write_all(b"\r\n")
+                    .unwrap();
+            }
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(err.code, "SOURCE_CHANGED");
+}
