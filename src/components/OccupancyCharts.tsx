@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { bytes, errorText, signed } from "../format";
 import type {
@@ -86,6 +86,7 @@ export function OccupancyCharts({
       y: number;
     } | null>(null);
   const canvas = useRef<HTMLCanvasElement>(null),
+    tooltipRef = useRef<HTMLElement>(null),
     displayed = useRef<LayoutLease | null>(null),
     cancellation = useRef<Promise<void>>(Promise.resolve()),
     mounted = useRef(false),
@@ -282,6 +283,22 @@ export function OccupancyCharts({
     );
   }
   const shownHover = interactive && hover?.layoutId === data?.layoutId ? hover : null;
+  useLayoutEffect(() => {
+    const el = tooltipRef.current;
+    if (!shownHover || !el) return;
+    const tipW = el.offsetWidth || 280;
+    const tipH = el.offsetHeight || 72;
+    const viewW = canvas.current?.clientWidth || 300;
+    const viewH = canvas.current?.clientHeight || 100;
+    let left = shownHover.x + 12;
+    if (left + tipW > viewW - 4) left = shownHover.x - tipW - 12;
+    left = Math.max(4, Math.min(left, Math.max(4, viewW - tipW - 4)));
+    let top = shownHover.y + 14;
+    if (top + tipH > viewH - 4) top = shownHover.y - tipH - 12;
+    top = Math.max(4, Math.min(top, Math.max(4, viewH - tipH - 4)));
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+  }, [shownHover]);
   return (
     <section className="charts-panel" style={active ? undefined : { display: "none" }}>
       <header className="charts-heading">
@@ -403,20 +420,21 @@ export function OccupancyCharts({
           )}
           {shownHover && (
             <aside
+              ref={tooltipRef}
               className="treemap-tooltip"
               style={{
                 left: Math.max(
                   4,
                   Math.min(
                     shownHover.x + 12,
-                    (canvas.current?.clientWidth || 300) - 290,
+                    Math.max(4, (canvas.current?.clientWidth || 300) - 290),
                   ),
                 ),
                 top: Math.max(
                   4,
                   Math.min(
                     shownHover.y + 14,
-                    (canvas.current?.clientHeight || 100) - 85,
+                    Math.max(4, (canvas.current?.clientHeight || 100) - 85),
                   ),
                 ),
               }}

@@ -841,17 +841,53 @@ main {
   height: 100%;
 }
 .chart-status {
+  position: relative;
   font-size: 10px;
   color: #8893a1;
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
   gap: 10px;
   margin-top: 4px;
   flex: none;
 }
-.chart-tooltip {
+.scope-note {
+  color: #5b697a;
+  background: #eef3f8;
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+.chart-warnings {
+  margin-left: auto;
+}
+.chart-warnings summary {
+  cursor: pointer;
+  user-select: none;
+}
+.chart-warnings > div {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 12;
+  width: min(420px, 100%);
+  max-height: 180px;
+  overflow: auto;
+  padding: 8px 10px;
+  background: #fff;
+  color: #263247;
+  border: 1px solid #ccd7e2;
+  border-radius: 4px;
+  box-shadow: 0 4px 16px #24364a26;
+}
+.chart-warnings > div p + p {
+  margin-top: 6px;
+}
+.treemap-tooltip {
   position: absolute;
   background: #fffffff2;
+  color: #263247;
+  font-size: 11px;
+  line-height: 1.4;
   border: 1px solid #c7d2df;
   border-radius: 3px;
   box-shadow: 0 3px 12px #0002;
@@ -860,11 +896,15 @@ main {
   z-index: 4;
   max-width: 320px;
 }
-.chart-tooltip strong,
-.chart-tooltip span,
-.chart-tooltip small {
+.treemap-tooltip b,
+.treemap-tooltip span,
+.treemap-tooltip small {
   display: block;
   overflow-wrap: anywhere;
+}
+.treemap-tooltip small {
+  color: #697386;
+  margin-top: 2px;
 }
 .canvas-empty {
   position: absolute;

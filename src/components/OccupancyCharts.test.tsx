@@ -251,3 +251,45 @@ it("updates selection overlay without redrawing the bitmap and ignores late sele
   await flush();
   expect(view.container.querySelector(".treemap-highlight")).toBeNull();
 });
+
+it("positions the treemap tooltip inside bounds when hovering near edges and renders warnings in chart-warnings", async () => {
+  const frameWithWarnings: FullTreemapData = {
+    ...frame("tip", 5),
+    warnings: ["测试范围提示"],
+  };
+  vi.mocked(api.getFullTreemap).mockResolvedValue(frameWithWarnings);
+  vi.mocked(api.hitTestTreemap).mockResolvedValue({
+    nodeId: "n5",
+    name: "big.bin",
+    path: "C:\\data\\big.bin",
+    extension: ".bin",
+    weight: "1024",
+    value: "1024",
+    status: "unchanged",
+    kind: "file",
+    collapsed: false,
+    rect: { x: 0.8, y: 0.8, width: 0.2, height: 0.2 },
+  });
+  const view = render(chart("one", "after"));
+  await flush();
+  await load();
+  const c = canvas() as HTMLCanvasElement;
+  Object.defineProperty(c, "clientWidth", { configurable: true, value: 400 });
+  Object.defineProperty(c, "clientHeight", { configurable: true, value: 200 });
+  const offsetWidthSpy = vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(220);
+  const offsetHeightSpy = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(64);
+  vi.useFakeTimers();
+  fireEvent.mouseMove(c, { clientX: 390, clientY: 190 });
+  await act(async () => vi.advanceTimersByTime(65));
+  const tip = view.container.querySelector(".treemap-tooltip") as HTMLElement;
+  expect(tip).toBeTruthy();
+  expect(tip.textContent).toContain("C:\\data\\big.bin");
+  expect(tip.textContent).toContain("1.00 KiB");
+  expect(tip.style.left).toBe("158px");
+  expect(tip.style.top).toBe("114px");
+  const warnings = view.container.querySelector(".chart-warnings");
+  expect(warnings).toBeTruthy();
+  expect(warnings!.textContent).toContain("测试范围提示");
+  offsetWidthSpy.mockRestore();
+  offsetHeightSpy.mockRestore();
+});
