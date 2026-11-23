@@ -53,6 +53,7 @@ interface Page {
   cursor: string | null;
   total: number;
   loading: boolean;
+  inFlight: Promise<boolean> | null;
   error: string;
   stamp: number;
 }
@@ -240,10 +241,18 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     }
     return count + add <= CACHE_LIMIT;
   }
-  async function load(parent: string, more = false) {
+  function runPageLoad(
+    parent: string,
+    retryMore: boolean,
+    fetchPage: (own: Page) => Promise<{
+      start: number;
+      rows: ChildRow[];
+      nextCursor: string | null;
+      totalChildren: number;
+    } | null>,
+  ): Promise<boolean> {
     const generation = epoch.current;
     let p = pages.current.get(parent);
-    if (p?.loading || (more && p && !p.cursor)) return false;
     if (!p) {
       p = {
         rows: [],
@@ -253,19 +262,82 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
         cursor: null,
         total: 0,
         loading: false,
+        inFlight: null,
         error: "",
         stamp: ++clock.current,
       };
       pages.current.set(parent, p);
     }
     const own = p;
-    const start = more ? own.through : 0;
     own.loading = true;
-    own.retryMore = more;
+    own.retryMore = retryMore;
     own.error = "";
     own.stamp = ++clock.current;
+    let promise: Promise<boolean> | null = null;
+    promise = (async () => {
+      try {
+        const result = await fetchPage(own);
+        if (
+          generation !== epoch.current ||
+          pages.current.get(parent) !== own ||
+          (parent && !expanded.current.has(parent))
+        )
+          return false;
+        if (!result) {
+          setHint("此项目不在当前过滤结果中，请关闭“仅变化”后定位。");
+          if (parent && own.rows.length === 0 && own.through === 0) {
+            pages.current.delete(parent);
+            expanded.current.delete(parent);
+          }
+          return false;
+        }
+        const incoming = new Set(result.rows.map((row) => row.nodeId));
+        const add = result.rows.filter(
+          (row) => !own.positions.has(row.nodeId),
+        ).length;
+        if (!makeRoom(add, parent, incoming)) {
+          own.error = "可释放的非可见缓存不足，请收起目录后重试。";
+          return false;
+        }
+        const existing = new Set(own.rows.map((row) => row.nodeId));
+        result.rows.forEach((row, index) => {
+          own.positions.set(row.nodeId, result.start + index);
+          if (!existing.has(row.nodeId)) own.rows.push(row);
+        });
+        own.rows.sort(
+          (a, b) => own.positions.get(a.nodeId)! - own.positions.get(b.nodeId)!,
+        );
+        const end = result.start + result.rows.length;
+        if (end >= own.through) {
+          own.through = end;
+          own.cursor = result.nextCursor;
+        }
+        own.total = result.totalChildren;
+        return true;
+      } catch (e) {
+        if (
+          generation === epoch.current &&
+          pages.current.get(parent) === own
+        )
+          own.error = errorText(e);
+        return false;
+      } finally {
+        if (own.inFlight === promise) {
+          own.loading = false;
+          own.inFlight = null;
+        }
+        if (generation === epoch.current) redraw();
+      }
+    })();
+    own.inFlight = promise;
     redraw();
-    try {
+    return promise;
+  }
+  async function load(parent: string, more = false) {
+    const p = pages.current.get(parent);
+    if (p?.loading || (more && p && !p.cursor)) return false;
+    const start = more ? (p?.through ?? 0) : 0;
+    return runPageLoad(parent, more, async (own) => {
       const result = await api.listChildren(
         comparisonId,
         parent || null,
@@ -273,45 +345,26 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
         currentSort.current,
         more ? own.cursor : null,
       );
-      if (
-        generation !== epoch.current ||
-        pages.current.get(parent) !== own ||
-        (parent && !expanded.current.has(parent))
-      )
-        return false;
-      const incoming = new Set(result.rows.map((row) => row.nodeId));
-      const add = result.rows.filter(
-        (row) => !own.positions.has(row.nodeId),
-      ).length;
-      if (!makeRoom(add, parent, incoming)) {
-        own.error = "可释放的非可见缓存不足，请收起目录后重试。";
-        return false;
-      }
-      const existing = new Set(own.rows.map((row) => row.nodeId));
-      result.rows.forEach((row, index) => {
-        own.positions.set(row.nodeId, start + index);
-        if (!existing.has(row.nodeId)) own.rows.push(row);
-      });
-      own.rows.sort(
-        (a, b) => own.positions.get(a.nodeId)! - own.positions.get(b.nodeId)!,
-      );
-      own.through = start + result.rows.length;
-      own.cursor = result.nextCursor;
-      own.total = result.totalChildren;
-      return true;
-    } catch (e) {
-      if (
-        generation === epoch.current &&
-        pages.current.get(parent) === own
-      )
-        own.error = errorText(e);
-      return false;
-    } finally {
-      if (generation === epoch.current && pages.current.get(parent) === own) {
-        own.loading = false;
-        redraw();
-      }
-    }
+      return {
+        start,
+        rows: result.rows,
+        nextCursor: result.nextCursor,
+        totalChildren: result.totalChildren,
+      };
+    });
+  }
+  async function loadLocated(parent: string, targetNodeId: string) {
+    const p = pages.current.get(parent);
+    if (p?.loading) return false;
+    return runPageLoad(parent, false, (own) =>
+      api.locateChildPage(
+        comparisonId,
+        parent || null,
+        targetNodeId,
+        changesOnly,
+        currentSort.current,
+      ),
+    );
   }
   function select(id: string) {
     navigation.current++;
@@ -357,32 +410,39 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
       const existing = pages.current.get(node);
       if (existing) existing.stamp = ++clock.current;
       redraw();
-      if (!existing || existing.error) {
+      if (existing?.loading && existing.inFlight) {
+        if (!(await existing.inFlight)) return false;
+      } else if (!existing || existing.error) {
         if (!(await load(node, false))) return false;
       }
       return live() && expanded.current.has(node);
     }
     async function locate(node: string, parent: string) {
-      let page = pages.current.get(parent);
-      if (!page) {
-        if (!(await load(parent, false))) return false;
-        page = pages.current.get(parent);
-      }
-      if (!page || page.loading || !live()) return false;
-      // Evicted pages can contain the target: restart once, then seek forward.
-      if (!find(node) && page.rows.length < page.through) {
-        if (!(await load(parent, false))) return false;
-      }
-      while (!find(node)) {
+      while (true) {
         const current = pages.current.get(parent);
-        if (!current?.cursor || !live()) {
-          if (live())
-            setHint("此项目不在当前过滤结果中，请关闭“仅变化”后定位。");
-          return false;
-        }
-        if (!(await load(parent, true)) || !live()) return false;
+        if (!current?.loading || !current.inFlight) break;
+        await current.inFlight;
+        if (!live()) return false;
       }
-      return true;
+      if (find(node)) return true;
+      if (!(await loadLocated(parent, node)) || !live()) return false;
+      return Boolean(find(node));
+    }
+    async function locateUnder(node: string, parent: string) {
+      let addedExpand = false;
+      if (parent) {
+        if (!find(parent)?.expandable || !live()) return false;
+        addedExpand = !expanded.current.has(parent);
+        expanded.current.add(parent);
+        const existing = pages.current.get(parent);
+        if (existing) existing.stamp = ++clock.current;
+      }
+      const ok = await locate(node, parent);
+      if (!ok && addedExpand && !pages.current.has(parent)) {
+        expanded.current.delete(parent);
+        if (live()) redraw();
+      }
+      return ok;
     }
     try {
       // A root in one export can have a shared-tree parent present only in the
@@ -395,23 +455,10 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
         chain.push({ node: cursor, parent: details.parentId });
         cursor = details.parentId;
       }
-      if (cursor && chain.length && !(await expand(cursor))) return;
       for (const step of chain.reverse()) {
-        if (!(await locate(step.node, step.parent || ""))) return;
-        if (
-          (step.node !== id || expandTarget) &&
-          find(step.node)?.expandable &&
-          !(await expand(step.node))
-        )
-          return;
+        if (!(await locateUnder(step.node, step.parent || ""))) return;
       }
-      if (
-        !chain.length &&
-        expandTarget &&
-        find(id)?.expandable &&
-        !(await expand(id))
-      )
-        return;
+      if (expandTarget && find(id)?.expandable && !(await expand(id))) return;
     } catch (error) {
       if (live()) setHint(errorText(error));
       return;
@@ -455,7 +502,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     const wasScope = preserveExpanded ? scope.current : null;
     epoch.current++;
     const generation = epoch.current;
-    navigation.current++;
+    let expectedNav = ++navigation.current;
     anchor.current = null;
     scrollTarget.current = null;
     viewport.current = [];
@@ -496,14 +543,25 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
         return;
       }
       if (!(await load(""))) return;
-      if (!changesOnly && reveal?.comparisonId === comparisonId) {
+      if (
+        !changesOnly &&
+        reveal?.comparisonId === comparisonId &&
+        generation === epoch.current &&
+        navigation.current === expectedNav
+      ) {
         setHint("已关闭“仅变化”，以定位占用图中的项目。");
         for (const p of reveal.path) {
-          if (generation !== epoch.current) return;
+          if (generation !== epoch.current || navigation.current !== expectedNav)
+            return;
+          expectedNav++;
           await revealNode(p.nodeId, true, false);
-          if (scope.current.at(-1)?.nodeId !== p.nodeId) return;
+          if (
+            navigation.current !== expectedNav ||
+            scope.current.at(-1)?.nodeId !== p.nodeId
+          )
+            return;
         }
-        if (generation === epoch.current)
+        if (generation === epoch.current && navigation.current === expectedNav)
           await revealNode(reveal.nodeId, reveal.expand ?? true, true);
       }
     })();
@@ -567,16 +625,20 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     // React’s layout lifecycle, and discard an anchor from a superseded view.
     queueMicrotask(() => {
       if (generation !== epoch.current || nav !== navigation.current) return;
+      if (target) {
+        const index = currentVisible.current.findIndex(
+          (v) => "row" in v && v.row.nodeId === target,
+        );
+        if (index >= 0) {
+          virtual.scrollToIndex(index, { align: "center" });
+          return;
+        }
+      }
       if (saved) {
         const index = currentVisible.current.findIndex(
           (v) => visibleKey(v) === saved.key,
         );
         if (index >= 0) virtual.scrollToOffset(index * 28 + saved.offset);
-      } else if (target) {
-        const index = currentVisible.current.findIndex(
-          (v) => "row" in v && v.row.nodeId === target,
-        );
-        if (index >= 0) virtual.scrollToIndex(index, { align: "center" });
       }
     });
   });

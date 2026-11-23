@@ -188,6 +188,19 @@ it("reveals treemap-clicked items in the diff tree and turns off changesOnly for
       rect: { x: 0, y: 0, width: 0.5, height: 0.5 },
     })
     .mockResolvedValueOnce({
+      nodeId: "n88",
+      name: "MetaChangedDir",
+      path: "C:\\MetaChangedDir\\",
+      extension: "",
+      weight: "50",
+      value: "50",
+      status: "unchanged",
+      hasChanges: true,
+      kind: "directory",
+      collapsed: false,
+      rect: { x: 0.25, y: 0, width: 0.25, height: 0.5 },
+    })
+    .mockResolvedValueOnce({
       nodeId: "n99",
       name: "Docs",
       path: "C:\\Docs\\",
@@ -211,6 +224,12 @@ it("reveals treemap-clicked items in the diff tree and turns off changesOnly for
   expect(treeMocks.reveal).toHaveBeenCalledWith("n42", false);
 
   fireEvent.click(screen.getByLabelText("仅变化"));
+  fireEvent.click(canvas, { clientX: 300, clientY: 100 });
+  await act(async () => {});
+  expect((screen.getByLabelText("仅变化") as HTMLInputElement).checked).toBe(true);
+  expect(treeMocks.lastProps?.changesOnly).toBe(true);
+  expect(treeMocks.reveal).toHaveBeenCalledWith("n88", true);
+
   fireEvent.click(canvas, { clientX: 600, clientY: 100 });
   await act(async () => {});
   expect(treeMocks.lastProps?.changesOnly).toBe(false);

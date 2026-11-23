@@ -294,3 +294,51 @@ it("positions the treemap tooltip inside bounds when hovering near edges and ren
   offsetWidthSpy.mockRestore();
   offsetHeightSpy.mockRestore();
 });
+
+it("invalidates pending treemap clicks when changesOnly changes while hitTestTreemap is in flight", async () => {
+  const pendingHit = deferred<TreemapHit | null>();
+  const onSelect = vi.fn();
+  vi.mocked(api.getFullTreemap).mockResolvedValue(frame("layout", 10));
+  vi.mocked(api.hitTestTreemap).mockReturnValueOnce(pendingHit.promise);
+
+  const view = render(
+    <OccupancyCharts
+      comparisonId="one"
+      metric="size"
+      mode="after"
+      changesOnly={false}
+      selectedId={null}
+      onSelect={onSelect}
+    />,
+  );
+  await flush();
+  await load();
+
+  fireEvent.click(canvas(), { clientX: 200, clientY: 100 });
+  view.rerender(
+    <OccupancyCharts
+      comparisonId="one"
+      metric="size"
+      mode="after"
+      changesOnly={true}
+      selectedId={null}
+      onSelect={onSelect}
+    />,
+  );
+  await act(async () => {
+    pendingHit.resolve({
+      nodeId: "n1",
+      name: "same.txt",
+      path: "C:\\same.txt",
+      extension: ".txt",
+      weight: "10",
+      value: "10",
+      status: "unchanged",
+      hasChanges: false,
+      kind: "file",
+      collapsed: false,
+      rect: { x: 0, y: 0, width: 1, height: 1 },
+    });
+  });
+  expect(onSelect).not.toHaveBeenCalled();
+});

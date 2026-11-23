@@ -10,21 +10,27 @@ import {
 import { afterEach, expect, it, vi } from "vitest";
 import { api } from "../api";
 import { resetSystemIconCacheForTest } from "../systemIcons";
-import type { ChildPage, ChildRow, ChildSort, Metric, NodeDetails } from "../types";
+import type { ChildPage, ChildRow, ChildSort, LocatedChildPage, Metric, NodeDetails } from "../types";
 import { DiffTree, type TreeHandle } from "./DiffTree";
 
 const virtualMocks = vi.hoisted(() => ({
   scrollToIndex: vi.fn(),
   scrollToOffset: vi.fn(),
+  maxItems: Infinity,
 }));
 vi.mock("../api", () => ({
-  api: { listChildren: vi.fn(), getSystemIcons: vi.fn(), getDetails: vi.fn() },
+  api: {
+    listChildren: vi.fn(),
+    locateChildPage: vi.fn(),
+    getSystemIcons: vi.fn(),
+    getDetails: vi.fn(),
+  },
 }));
 // Keep every row in this small viewport; exercise the real cache/navigation state.
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
     getVirtualItems: () =>
-      Array.from({ length: count }, (_, index) => ({
+      Array.from({ length: Math.min(count, virtualMocks.maxItems) }, (_, index) => ({
         index,
         start: index * 28,
       })),
@@ -35,6 +41,7 @@ vi.mock("@tanstack/react-virtual", () => ({
 }));
 afterEach(() => {
   cleanup();
+  virtualMocks.maxItems = Infinity;
   resetSystemIconCacheForTest();
   vi.clearAllMocks();
 });
@@ -329,13 +336,20 @@ function details(nodeId: string, parentId: string | null): NodeDetails {
     allocatedDelta: "0",
   };
 }
+function located(start: number, totalChildren: number, ...rows: ChildRow[]): LocatedChildPage {
+  return { start, rows, nextCursor: null, totalChildren };
+}
 
 it("reveals and scrolls to nested files without expanding them, and expands directories when requested", async () => {
   vi.mocked(api.listChildren).mockImplementation(async (_id, parent) => {
     if (!parent) return page(row("n1", "Root", true));
-    if (parent === "n1") return page(row("n2", "Sub", true));
     if (parent === "n2") return page(row("n3", "target.bin", false));
     return page();
+  });
+  vi.mocked(api.locateChildPage).mockImplementation(async (_id, parent, target) => {
+    if (parent === "n1" && target === "n2") return located(0, 1, row("n2", "Sub", true));
+    if (parent === "n2" && target === "n3") return located(0, 1, row("n3", "target.bin", false));
+    return null;
   });
   vi.mocked(api.getDetails).mockImplementation(async (_id, nodeId) => {
     if (nodeId === "n3") return details("n3", "n2");
@@ -397,10 +411,13 @@ it("cancels an in-flight reveal when superseded by a newer reveal", async () => 
     });
     return { promise, resolve };
   })();
-  vi.mocked(api.listChildren).mockImplementation(async (_id, parent) => {
-    if (!parent) return page(row("n1", "Alpha", true), row("n2", "Beta", true));
-    if (parent === "n2") return page(row("n4", "new.txt", false));
-    return page(row("n3", "old.txt", false));
+  vi.mocked(api.listChildren).mockResolvedValueOnce(
+    page(row("n1", "Alpha", true), row("n2", "Beta", true)),
+  );
+  vi.mocked(api.locateChildPage).mockImplementation(async (_id, parent, target) => {
+    if (parent === "n2" && target === "n4") return located(0, 1, row("n4", "new.txt", false));
+    if (parent === "n1" && target === "n3") return located(0, 1, row("n3", "old.txt", false));
+    return null;
   });
   vi.mocked(api.getDetails).mockImplementation(async (_id, nodeId) => {
     if (nodeId === "n3") return firstDetails.promise;
@@ -439,4 +456,182 @@ it("cancels an in-flight reveal when superseded by a newer reveal", async () => 
   });
   expect(screen.queryByText("old.txt")).toBeNull();
   expect(screen.getByText("new.txt")).toBeTruthy();
+});
+
+it("jumps directly to the target page via locateChildPage without sequential scanning", async () => {
+  vi.mocked(api.listChildren).mockResolvedValueOnce(page(row("n1", "Wide", true)));
+  vi.mocked(api.getDetails).mockResolvedValueOnce(details("n420", "n1"));
+  vi.mocked(api.locateChildPage).mockResolvedValueOnce(
+    located(400, 450, row("n420", "item_420.bin", false)),
+  );
+
+  let handle: TreeHandle | null = null;
+  function Host() {
+    const [selected, onSelect] = useState<string | null>(null);
+    return (
+      <DiffTree
+        ref={(v) => {
+          handle = v;
+        }}
+        comparisonId="c-one"
+        metric="size"
+        changesOnly={false}
+        selected={selected}
+        onSelect={onSelect}
+        onScope={() => {}}
+      />
+    );
+  }
+
+  render(<Host />);
+  await screen.findByText("Wide");
+  const initialListCalls = vi.mocked(api.listChildren).mock.calls.length;
+
+  await act(async () => {
+    handle!.reveal("n420", false);
+  });
+  await screen.findByText("item_420.bin");
+  expect(api.locateChildPage).toHaveBeenCalledTimes(1);
+  expect(api.locateChildPage).toHaveBeenCalledWith(
+    "c-one",
+    "n1",
+    "n420",
+    false,
+    { by: "name", direction: "asc", metric: "size" },
+  );
+  expect(api.listChildren).toHaveBeenCalledTimes(initialListCalls);
+  expect(virtualMocks.scrollToIndex).toHaveBeenCalled();
+});
+
+it("waits for an in-flight child page when revealing a node under an already-expanding folder", async () => {
+  const inflight = pending();
+  vi.mocked(api.listChildren)
+    .mockResolvedValueOnce(page(row("n1", "Folder", true)))
+    .mockReturnValueOnce(inflight.promise);
+  vi.mocked(api.getDetails).mockResolvedValueOnce(details("n2", "n1"));
+
+  let handle: TreeHandle | null = null;
+  function Host() {
+    const [selected, onSelect] = useState<string | null>(null);
+    return (
+      <DiffTree
+        ref={(v) => {
+          handle = v;
+        }}
+        comparisonId="c-one"
+        metric="size"
+        changesOnly={false}
+        selected={selected}
+        onSelect={onSelect}
+        onScope={() => {}}
+      />
+    );
+  }
+
+  render(<Host />);
+  await screen.findByText("Folder");
+
+  fireEvent.click(disclosure("Folder"));
+  await act(async () => {
+    handle!.reveal("n2", false);
+  });
+  expect(api.locateChildPage).not.toHaveBeenCalled();
+
+  await act(async () => {
+    inflight.resolve(page(row("n2", "arrived.txt", false)));
+  });
+  await screen.findByText("arrived.txt");
+  expect(virtualMocks.scrollToIndex).toHaveBeenCalledWith(1, { align: "center" });
+});
+
+it("cancels a deferred reveal if a newer reveal occurs while reloading the unfiltered root", async () => {
+  const rootReload = pending();
+  vi.mocked(api.listChildren)
+    .mockResolvedValueOnce(page(row("n1", "Changed", true)))
+    .mockReturnValueOnce(rootReload.promise);
+  vi.mocked(api.getDetails).mockResolvedValue(details("n2", null));
+  vi.mocked(api.locateChildPage).mockResolvedValue(located(0, 2, row("n2", "NewRoot", false)));
+
+  let handle: TreeHandle | null = null;
+  function Host({ changesOnly }: { changesOnly: boolean }) {
+    const [selected, onSelect] = useState<string | null>(null);
+    return (
+      <>
+        <output aria-label="选中">{selected ?? ""}</output>
+        <DiffTree
+          ref={(v) => {
+            handle = v;
+          }}
+          comparisonId="c-one"
+          metric="size"
+          changesOnly={changesOnly}
+          selected={selected}
+          onSelect={onSelect}
+          onScope={() => {}}
+          reveal={{ comparisonId: "c-one", path: [], nodeId: "n_old", expand: false }}
+        />
+      </>
+    );
+  }
+
+  const view = render(<Host changesOnly={true} />);
+  await screen.findByText("Changed");
+  view.rerender(<Host changesOnly={false} />);
+  await act(async () => {
+    handle!.reveal("n2", false);
+  });
+  await act(async () => {
+    rootReload.resolve(page(row("n1", "Changed", true), row("n_old", "OldRoot", false)));
+  });
+  await act(async () => {});
+  expect(screen.getByLabelText("选中").textContent).toBe("n2");
+});
+
+it("prioritizes reveal scrollToIndex over cache-eviction anchor restoration", async () => {
+  virtualMocks.maxItems = 20;
+  const bulk = Array.from({ length: 9900 }, (_, i) => row(`b${i}`, `bulk_${i}`, false));
+  const extra = Array.from({ length: 200 }, (_, i) => row(`t${i}`, `target_${i}`, false));
+  vi.mocked(api.listChildren).mockImplementation(async (_id, parent) => {
+    if (!parent) return page(row("n_old", "Old", true), row("n_new", "Target", true));
+    if (parent === "n_old") return page(...bulk);
+    return page();
+  });
+  vi.mocked(api.getDetails).mockResolvedValueOnce(details("t150", "n_new"));
+  vi.mocked(api.locateChildPage).mockResolvedValueOnce(located(0, 200, ...extra));
+
+  let handle: TreeHandle | null = null;
+  function Host() {
+    const [selected, onSelect] = useState<string | null>(null);
+    return (
+      <DiffTree
+        ref={(v) => {
+          handle = v;
+        }}
+        comparisonId="c-one"
+        metric="size"
+        changesOnly={false}
+        selected={selected}
+        onSelect={onSelect}
+        onScope={() => {}}
+      />
+    );
+  }
+
+  render(<Host />);
+  await screen.findByText("Old");
+  fireEvent.click(disclosure("Old"));
+  await screen.findByText("bulk_0");
+
+  virtualMocks.scrollToIndex.mockClear();
+  virtualMocks.scrollToOffset.mockClear();
+  await act(async () => {
+    handle!.reveal("t150", false);
+  });
+  await waitFor(() =>
+    expect(virtualMocks.scrollToIndex).toHaveBeenCalledWith(9951, {
+      align: "center",
+    }),
+  );
+  const lastOffsetOrder = virtualMocks.scrollToOffset.mock.invocationCallOrder.at(-1) ?? 0;
+  expect(lastOffsetOrder).toBeLessThan(virtualMocks.scrollToIndex.mock.invocationCallOrder[0]);
 });

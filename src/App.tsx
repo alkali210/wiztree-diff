@@ -118,7 +118,7 @@ export default function App() {
         });
       }
       const expandTarget = hit ? hit.kind === "directory" : false;
-      if (changesOnly && hit?.status === "unchanged") {
+      if (changesOnly && hit && !hit.hasChanges) {
         setReveal({
           comparisonId: comparison.comparisonId,
           path: [],
@@ -127,6 +127,7 @@ export default function App() {
         });
         setChangesOnly(false);
       } else {
+        setReveal(null);
         tree.current?.reveal(nodeId, expandTarget);
       }
     },
@@ -425,6 +426,7 @@ export default function App() {
                 <div id="workspace-treemap" className="treemap-panel">
                   <OccupancyCharts
                     active={!treemapCollapsed}
+                    changesOnly={changesOnly}
                     metric={metric}
                     mode={mode}
                     selectedId={selected}

@@ -19,6 +19,7 @@ function release(lease: LayoutLease | null) {
 }
 interface Props {
   active?: boolean;
+  changesOnly?: boolean;
   comparisonId: string;
   metric: Metric;
   mode: ChartMode;
@@ -48,6 +49,7 @@ function fitCaption(
 }
 export function OccupancyCharts({
   active = true,
+  changesOnly = false,
   comparisonId,
   metric,
   mode,
@@ -65,6 +67,8 @@ export function OccupancyCharts({
   const requestKey = requested.current.started ? key : null;
   const visible = useRef(active);
   visible.current = active;
+  const onSelectRef = useRef(onSelect);
+  onSelectRef.current = onSelect;
   const epoch = useRef({ key, value: 0 });
   if (epoch.current.key !== key) epoch.current = { key, value: epoch.current.value + 1 };
   const [frame, setFrame] = useState<{ key: string; lease: LayoutLease } | null>(null),
@@ -151,6 +155,9 @@ export function OccupancyCharts({
       setHover(null);
     }
   }, [active]);
+  useEffect(() => {
+    clickSeq.current++;
+  }, [changesOnly]);
   useEffect(() => {
     let live = true;
     const token = epoch.current.value;
@@ -274,7 +281,7 @@ export function OccupancyCharts({
     const valid = () => mounted.current && visible.current && epoch.current.value === token &&
       seq === clickSeq.current && displayed.current === lease && !lease.released;
     void api.hitTestTreemap(data.comparisonId, data.layoutId, p.x, p.y).then(
-      (hit) => { if (valid() && hit) onSelect(hit.nodeId, hit); },
+      (hit) => { if (valid() && hit) onSelectRef.current(hit.nodeId, hit); },
       (e) => { if (valid()) setError(errorText(e)); },
     );
   }
