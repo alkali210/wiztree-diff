@@ -357,8 +357,10 @@ export default function App() {
                           onSelect={(root) => {
                             if (!allowed || loading) return;
                             setRootReview(null);
-                            if (root.kind === "file") setSelected(root.nodeId);
-                            else if (changesOnly) {
+                            if (root.kind === "file") {
+                              setReveal(null);
+                              setSelected(root.nodeId);
+                            } else if (changesOnly) {
                               setReveal({
                                 comparisonId: comparison.comparisonId,
                                 path: [],

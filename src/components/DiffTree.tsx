@@ -78,11 +78,19 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     scroll = useRef<HTMLDivElement>(null);
   const navigation = useRef(0),
     currentSelected = useRef(selected),
+    prevSelected = useRef(selected),
     viewport = useRef<Visible[]>([]),
     currentVisible = useRef<Visible[]>([]),
     anchor = useRef<{ key: string; offset: number } | null>(null),
     scrollTarget = useRef<string | null>(null);
-  currentSelected.current = selected;
+  if (prevSelected.current !== selected) {
+    prevSelected.current = selected;
+    if (selected !== currentSelected.current) {
+      navigation.current++;
+      scrollTarget.current = null;
+    }
+    currentSelected.current = selected;
+  }
   const [, render] = useState(0),
     [hint, setHint] = useState(""),
     [sortState, setSortState] = useState<{
@@ -250,7 +258,9 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
       nextCursor: string | null;
       totalChildren: number;
     } | null>,
+    options: { resetPaging?: boolean; isLive?: () => boolean } = {},
   ): Promise<boolean> {
+    const { resetPaging = false, isLive } = options;
     const generation = epoch.current;
     let p = pages.current.get(parent);
     if (!p) {
@@ -277,6 +287,19 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     promise = (async () => {
       try {
         const result = await fetchPage(own);
+        if (isLive && !isLive()) {
+          if (
+            generation === epoch.current &&
+            pages.current.get(parent) === own &&
+            parent &&
+            own.rows.length === 0 &&
+            own.through === 0
+          ) {
+            pages.current.delete(parent);
+            expanded.current.delete(parent);
+          }
+          return false;
+        }
         if (
           generation !== epoch.current ||
           pages.current.get(parent) !== own ||
@@ -308,13 +331,26 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
           (a, b) => own.positions.get(a.nodeId)! - own.positions.get(b.nodeId)!,
         );
         const end = result.start + result.rows.length;
-        if (end >= own.through) {
+        if (resetPaging || end >= own.through) {
           own.through = end;
           own.cursor = result.nextCursor;
         }
         own.total = result.totalChildren;
         return true;
       } catch (e) {
+        if (isLive && !isLive()) {
+          if (
+            generation === epoch.current &&
+            pages.current.get(parent) === own &&
+            parent &&
+            own.rows.length === 0 &&
+            own.through === 0
+          ) {
+            pages.current.delete(parent);
+            expanded.current.delete(parent);
+          }
+          return false;
+        }
         if (
           generation === epoch.current &&
           pages.current.get(parent) === own
@@ -337,33 +373,46 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     const p = pages.current.get(parent);
     if (p?.loading || (more && p && !p.cursor)) return false;
     const start = more ? (p?.through ?? 0) : 0;
-    return runPageLoad(parent, more, async (own) => {
-      const result = await api.listChildren(
-        comparisonId,
-        parent || null,
-        changesOnly,
-        currentSort.current,
-        more ? own.cursor : null,
-      );
-      return {
-        start,
-        rows: result.rows,
-        nextCursor: result.nextCursor,
-        totalChildren: result.totalChildren,
-      };
-    });
+    return runPageLoad(
+      parent,
+      more,
+      async (own) => {
+        const result = await api.listChildren(
+          comparisonId,
+          parent || null,
+          changesOnly,
+          currentSort.current,
+          more ? own.cursor : null,
+        );
+        return {
+          start,
+          rows: result.rows,
+          nextCursor: result.nextCursor,
+          totalChildren: result.totalChildren,
+        };
+      },
+      { resetPaging: !more },
+    );
   }
-  async function loadLocated(parent: string, targetNodeId: string) {
+  async function loadLocated(
+    parent: string,
+    targetNodeId: string,
+    isLive: () => boolean,
+  ) {
     const p = pages.current.get(parent);
     if (p?.loading) return false;
-    return runPageLoad(parent, false, (own) =>
-      api.locateChildPage(
-        comparisonId,
-        parent || null,
-        targetNodeId,
-        changesOnly,
-        currentSort.current,
-      ),
+    return runPageLoad(
+      parent,
+      false,
+      () =>
+        api.locateChildPage(
+          comparisonId,
+          parent || null,
+          targetNodeId,
+          changesOnly,
+          currentSort.current,
+        ),
+      { resetPaging: false, isLive },
     );
   }
   function select(id: string) {
@@ -425,7 +474,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
         if (!live()) return false;
       }
       if (find(node)) return true;
-      if (!(await loadLocated(parent, node)) || !live()) return false;
+      if (!(await loadLocated(parent, node, live)) || !live()) return false;
       return Boolean(find(node));
     }
     async function locateUnder(node: string, parent: string) {

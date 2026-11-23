@@ -635,3 +635,152 @@ it("prioritizes reveal scrollToIndex over cache-eviction anchor restoration", as
   const lastOffsetOrder = virtualMocks.scrollToOffset.mock.invocationCallOrder.at(-1) ?? 0;
   expect(lastOffsetOrder).toBeLessThan(virtualMocks.scrollToIndex.mock.invocationCallOrder[0]);
 });
+
+it("restores forward paging cursor after reloading the first page following a tail locateChildPage jump", async () => {
+  vi.mocked(api.listChildren)
+    .mockResolvedValueOnce(page(row("n_dir", "WideDir", true)))
+    .mockResolvedValueOnce({
+      rows: [row("f0", "first_0", false)],
+      nextCursor: "c-200",
+      totalChildren: 850,
+    })
+    .mockResolvedValueOnce({
+      rows: [row("f200", "item_200", false)],
+      nextCursor: "c-400",
+      totalChildren: 850,
+    });
+  vi.mocked(api.getDetails).mockResolvedValueOnce(details("f820", "n_dir"));
+  vi.mocked(api.locateChildPage).mockResolvedValueOnce({
+    start: 800,
+    rows: [row("f820", "tail_820", false)],
+    nextCursor: null,
+    totalChildren: 850,
+  });
+
+  let handle: TreeHandle | null = null;
+  function Host() {
+    const [selected, onSelect] = useState<string | null>(null);
+    return (
+      <DiffTree
+        ref={(v) => {
+          handle = v;
+        }}
+        comparisonId="c-one"
+        metric="size"
+        changesOnly={false}
+        selected={selected}
+        onSelect={onSelect}
+        onScope={() => {}}
+      />
+    );
+  }
+
+  render(<Host />);
+  await screen.findByText("WideDir");
+  await act(async () => {
+    handle!.reveal("f820", false);
+  });
+  await screen.findByText("tail_820");
+
+  fireEvent.click(screen.getByRole("button", { name: "从首页重新加载子项" }));
+  await screen.findByText("first_0");
+  const loadMore = screen.getByRole("button", { name: "加载更多子项" });
+  expect(loadMore).toBeTruthy();
+  fireEvent.click(loadMore);
+  await screen.findByText("item_200");
+  expect(api.listChildren).toHaveBeenLastCalledWith(
+    "c-one",
+    "n_dir",
+    false,
+    { by: "name", direction: "asc", metric: "size" },
+    "c-200",
+  );
+});
+
+it("discards a superseded locateChildPage response before mutating rows or collapsing open folders", async () => {
+  const staleLocate = (() => {
+    let resolve!: (value: LocatedChildPage | null) => void;
+    const promise = new Promise<LocatedChildPage | null>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  })();
+  vi.mocked(api.listChildren).mockResolvedValueOnce(
+    page(row("n_a", "Alpha", true), row("n_b", "Beta", false)),
+  );
+  vi.mocked(api.getDetails).mockResolvedValueOnce(details("a_child", "n_a"));
+  vi.mocked(api.locateChildPage).mockReturnValueOnce(staleLocate.promise);
+
+  let handle: TreeHandle | null = null;
+  function Host() {
+    const [selected, onSelect] = useState<string | null>(null);
+    return (
+      <DiffTree
+        ref={(v) => {
+          handle = v;
+        }}
+        comparisonId="c-one"
+        metric="size"
+        changesOnly={false}
+        selected={selected}
+        onSelect={onSelect}
+        onScope={() => {}}
+      />
+    );
+  }
+
+  render(<Host />);
+  await screen.findByText("Alpha");
+
+  await act(async () => {
+    handle!.reveal("a_child", false);
+  });
+  // User clicks another row before locateChildPage returns.
+  fireEvent.click(screen.getByText("Beta"));
+  await act(async () => {
+    staleLocate.resolve(located(0, 1, row("a_child", "stale_leaf", false)));
+  });
+
+  expect(screen.queryByText("stale_leaf")).toBeNull();
+  expect(
+    screen.getByText("Alpha").closest('[role="treeitem"]')?.getAttribute("aria-expanded"),
+  ).toBe("false");
+});
+
+it("cancels a deferred filter reveal when selection changes externally outside the tree", async () => {
+  const rootReload = pending();
+  vi.mocked(api.listChildren)
+    .mockResolvedValueOnce(page(row("n_changed", "Changed", false)))
+    .mockReturnValueOnce(rootReload.promise);
+
+  const onSelect = vi.fn();
+  function Host({
+    changesOnly,
+    selected,
+  }: {
+    changesOnly: boolean;
+    selected: string | null;
+  }) {
+    return (
+      <DiffTree
+        comparisonId="c-one"
+        metric="size"
+        changesOnly={changesOnly}
+        selected={selected}
+        onSelect={onSelect}
+        onScope={() => {}}
+        reveal={{ comparisonId: "c-one", path: [], nodeId: "old", expand: false }}
+      />
+    );
+  }
+
+  const view = render(<Host changesOnly={true} selected={null} />);
+  await screen.findByText("Changed");
+  view.rerender(<Host changesOnly={false} selected="old" />);
+  // External selection (e.g., RootList file click) updates selected prop while root reload is pending.
+  view.rerender(<Host changesOnly={false} selected="new" />);
+  await act(async () => {
+    rootReload.resolve(page(row("old", "Old", false), row("new", "New", false)));
+  });
+  expect(onSelect).not.toHaveBeenCalledWith("old");
+});
