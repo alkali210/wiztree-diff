@@ -119,6 +119,14 @@ pub struct ChildPage {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LocatedChildPage {
+    pub start: u64,
+    pub rows: Vec<ChildRow>,
+    pub next_cursor: Option<String>,
+    pub total_children: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Entry {
     pub path: String,
     pub kind: String,
@@ -314,6 +322,7 @@ pub struct TreemapHit {
     pub weight: String,
     pub value: String,
     pub status: Status,
+    pub has_changes: bool,
     pub kind: NodeKind,
     pub collapsed: bool,
     pub rect: TreemapRect,

@@ -5,6 +5,7 @@ import type {
   ChildSort,
   ComparisonSummary,
   JobSummary,
+  LocatedChildPage,
   Metric,
   NodeDetails,
   RootPage,
@@ -41,6 +42,20 @@ export const api = {
       changesOnly,
       sort,
       cursor,
+    }),
+  locateChildPage: (
+    comparisonId: string,
+    parentId: string | null,
+    targetNodeId: string,
+    changesOnly: boolean,
+    sort: ChildSort,
+  ) =>
+    invoke<LocatedChildPage | null>("locate_child_page", {
+      comparisonId,
+      parentId,
+      targetNodeId,
+      changesOnly,
+      sort,
     }),
   getDetails: (comparisonId: string, nodeId: string) =>
     invoke<NodeDetails>("get_details", { comparisonId, nodeId }),

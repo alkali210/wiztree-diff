@@ -727,6 +727,7 @@ impl TreemapLayout {
             weight: item.weight.to_string(),
             value,
             status,
+            has_changes: c.node(item.node).has_changes,
             kind: if is_directory {
                 NodeKind::Directory
             } else {

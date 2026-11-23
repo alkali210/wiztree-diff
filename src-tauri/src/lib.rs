@@ -18,6 +18,7 @@ pub fn run() {
             commands::get_job,
             commands::get_comparison,
             commands::list_children,
+            commands::locate_child_page,
             commands::get_details,
             commands::list_roots,
             commands::list_extensions,

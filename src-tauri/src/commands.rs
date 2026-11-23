@@ -461,6 +461,29 @@ pub async fn list_children(
     .await
 }
 #[tauri::command]
+pub async fn locate_child_page(
+    state: State<'_, AppState>,
+    comparison_id: String,
+    parent_id: Option<String>,
+    target_node_id: String,
+    changes_only: bool,
+    sort: ChildSort,
+) -> Result<Option<LocatedChildPage>> {
+    let state = state.inner().clone();
+    blocking(move || {
+        let comparison = state.comparison(&comparison_id)?;
+        diff::locate_child_page(
+            &comparison,
+            &comparison_id,
+            parent_id.as_deref(),
+            &target_node_id,
+            changes_only,
+            sort,
+        )
+    })
+    .await
+}
+#[tauri::command]
 pub async fn get_details(
     state: State<'_, AppState>,
     comparison_id: String,

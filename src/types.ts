@@ -74,6 +74,12 @@ export interface ChildPage {
   nextCursor: string | null;
   totalChildren: number;
 }
+export interface LocatedChildPage {
+  start: number;
+  rows: ChildRow[];
+  nextCursor: string | null;
+  totalChildren: number;
+}
 export interface NodeDetails {
   nodeId: string;
   parentId: string | null;
@@ -187,6 +193,7 @@ export interface TreemapHit {
   weight: string;
   value: string;
   status: Status;
+  hasChanges: boolean;
   kind: "file" | "directory";
   collapsed: boolean;
   rect: TreemapRect;

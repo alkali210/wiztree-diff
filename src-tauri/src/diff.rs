@@ -374,6 +374,37 @@ fn sorted_children(comparison: &Comparison, children: &[NodeId], sort: ChildSort
     ordered
 }
 
+fn build_child_page_slice(
+    comparison: &Comparison,
+    comparison_id: &str,
+    parent: Option<&str>,
+    changes_only: bool,
+    sort: ChildSort,
+    children: &[NodeId],
+    start: usize,
+) -> Result<(Vec<ChildRow>, Option<String>)> {
+    let end = (start + 200).min(children.len());
+    let rows = children[start..end]
+        .iter()
+        .map(|&id| child(comparison, id))
+        .collect();
+    let next_cursor = if end < children.len() {
+        let node = children[end - 1];
+        Some(encode(&Cursor {
+            comparison: comparison_id.into(),
+            parent: parent.map(str::to_owned),
+            changes: changes_only,
+            sort,
+            directory: comparison.node(node).expandable,
+            rank: end as u64,
+            node,
+        })?)
+    } else {
+        None
+    };
+    Ok((rows, next_cursor))
+}
+
 pub fn list_children(
     comparison: &Comparison,
     comparison_id: &str,
@@ -418,30 +449,73 @@ pub fn list_children(
     } else {
         0
     };
-    let end = (start + 200).min(children.len());
-    let rows = children[start..end]
-        .iter()
-        .map(|&id| child(comparison, id))
-        .collect();
-    let next_cursor = if end < children.len() {
-        let node = children[end - 1];
-        Some(encode(&Cursor {
-            comparison: comparison_id.into(),
-            parent: parent.map(str::to_owned),
-            changes: changes_only,
-            sort,
-            directory: comparison.node(node).expandable,
-            rank: end as u64,
-            node,
-        })?)
-    } else {
-        None
-    };
+    let (rows, next_cursor) = build_child_page_slice(
+        comparison,
+        comparison_id,
+        parent,
+        changes_only,
+        sort,
+        children,
+        start,
+    )?;
     Ok(ChildPage {
         rows,
         next_cursor,
         total_children: children.len() as u64,
     })
+}
+
+/// Resolve the 200-row page containing `target_node_id` under `parent` in the requested order.
+pub fn locate_child_page(
+    comparison: &Comparison,
+    comparison_id: &str,
+    parent: Option<&str>,
+    target_node_id: &str,
+    changes_only: bool,
+    sort: ChildSort,
+) -> Result<Option<LocatedChildPage>> {
+    comparison.check_id(comparison_id)?;
+    let parent_id = parent_number(comparison, parent)?;
+    let target_id = checked_node(comparison, target_node_id)?;
+    if comparison.node(target_id).parent != parent_id {
+        return Ok(None);
+    }
+    let base = if changes_only {
+        comparison.changed_children(parent_id)
+    } else {
+        comparison.children(parent_id)
+    };
+    let Ok(base_pos) = base.binary_search_by(|&id| default_cmp(comparison, id, target_id)) else {
+        return Ok(None);
+    };
+    let owned;
+    let (children, position) =
+        if sort.by == ChildSortBy::Name && sort.direction == SortDirection::Asc {
+            (base, base_pos)
+        } else {
+            owned = sorted_children(comparison, base, sort);
+            let pos = owned
+                .iter()
+                .position(|&id| id == target_id)
+                .expect("target verified in base");
+            (&owned[..], pos)
+        };
+    let start = (position / 200) * 200;
+    let (rows, next_cursor) = build_child_page_slice(
+        comparison,
+        comparison_id,
+        parent,
+        changes_only,
+        sort,
+        children,
+        start,
+    )?;
+    Ok(Some(LocatedChildPage {
+        start: start as u64,
+        rows,
+        next_cursor,
+        total_children: children.len() as u64,
+    }))
 }
 
 pub fn get_details(comparison: &Comparison, node_id: &str) -> Result<NodeDetails> {

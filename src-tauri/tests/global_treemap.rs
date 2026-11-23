@@ -1530,3 +1530,41 @@ fn independently_requested_layouts_are_read_only_and_bound_to_comparison() {
         "STALE_COMPARISON"
     );
 }
+
+#[test]
+fn hit_test_reports_node_has_changes_even_when_directory_files_are_unchanged() {
+    let before = "文件名称,大小,分配\n\
+        C:\\root\\,300,300\n\
+        C:\\root\\meta_changed\\,100,100\n\
+        C:\\root\\meta_changed\\same.txt,100,100\n\
+        C:\\root\\fully_unchanged\\,200,200\n\
+        C:\\root\\fully_unchanged\\still.txt,200,200\n";
+    let after = before.replace("C:\\root\\meta_changed\\,100,100", "C:\\root\\meta_changed\\,150,150");
+    let (_dir, c) = build(before, &after);
+    let frame = request_frame(&c, Metric::Size, ChartMode::After, 0).unwrap();
+
+    for (path, expected_has_changes) in [
+        ("C:\\root\\meta_changed", true),
+        ("C:\\root\\fully_unchanged", false),
+    ] {
+        let id = node(&c, path);
+        let label = frame
+            .labels
+            .iter()
+            .find(|l| l.node_id == id && l.kind == NodeKind::Directory)
+            .unwrap();
+        let hit = request_hit(
+            &c,
+            Metric::Size,
+            ChartMode::After,
+            label.x + label.width / 2.0,
+            label.y + label.height / 2.0,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(hit.node_id, id);
+        assert_eq!(hit.status, Status::Unchanged);
+        assert_eq!(hit.has_changes, expected_has_changes);
+    }
+}

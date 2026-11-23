@@ -191,7 +191,7 @@ it("rejects stale click, hover, and selection bounds responses when the displaye
   await flush(); await load();
   await act(async () => {
     hit.resolve({ nodeId: "old-node", name: "old", path: "C:\\old", extension: ".txt", weight: "1", value: "1",
-      status: "unchanged", kind: "file", collapsed: false, rect: { x: 0, y: 0, width: 1, height: 1 } });
+      status: "unchanged", hasChanges: false, kind: "file", collapsed: false, rect: { x: 0, y: 0, width: 1, height: 1 } });
     bounds.resolve({ x: 0, y: 0, width: 1, height: 1 });
   });
   expect(onSelect).not.toHaveBeenCalled();
@@ -266,6 +266,7 @@ it("positions the treemap tooltip inside bounds when hovering near edges and ren
     weight: "1024",
     value: "1024",
     status: "unchanged",
+    hasChanges: false,
     kind: "file",
     collapsed: false,
     rect: { x: 0.8, y: 0.8, width: 0.2, height: 0.2 },

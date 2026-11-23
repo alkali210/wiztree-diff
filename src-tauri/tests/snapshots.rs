@@ -1776,3 +1776,68 @@ fn parallel_chunked_import_preserves_multiline_quotes_error_precedence_and_cance
     .unwrap();
     assert_eq!(err.code, "SOURCE_CHANGED");
 }
+
+#[test]
+fn locate_child_page_jumps_directly_to_target_page_and_preserves_cursor_continuity() {
+    let mut before = "文件名称,大小,分配\nC:\\wide\\,0,0\nC:\\other\\,0,0\nC:\\other\\alien.bin,10,10\n".to_owned();
+    let mut after = before.clone();
+    for i in 0..450u64 {
+        let size_b = i * 10;
+        let size_a = if i == 420 { i * 10 + 5 } else { i * 10 };
+        before.push_str(&format!("C:\\wide\\item_{i:03},{size_b},{size_b}\n"));
+        after.push_str(&format!("C:\\wide\\item_{i:03},{size_a},{size_a}\n"));
+    }
+    let (_dir, conn) = comparison(&before, &after);
+    let wide = id(&conn, "C:\\wide\\");
+    let target = id(&conn, "C:\\wide\\item_420");
+    let unchanged = id(&conn, "C:\\wide\\item_005");
+    let alien = id(&conn, "C:\\other\\alien.bin");
+
+    // Default sort (Name Asc): item_420 is at index 420 -> page starting at 400.
+    let default_sort = ChildSort::default();
+    let located = diff::locate_child_page(&conn, "test", Some(&wide), &target, false, default_sort)
+        .unwrap()
+        .unwrap();
+    assert_eq!(located.start, 400);
+    assert_eq!(located.total_children, 450);
+    assert_eq!(located.rows.len(), 50);
+    assert!(located.rows.iter().any(|r| r.node_id == target));
+    assert!(located.next_cursor.is_none());
+
+    // Non-default sort (After Desc): item_210 is at index 239 (449 - 210) -> start 200, with valid next_cursor.
+    let mid_target = id(&conn, "C:\\wide\\item_210");
+    let desc_sort = ChildSort {
+        by: ChildSortBy::After,
+        direction: SortDirection::Desc,
+        metric: Metric::Size,
+    };
+    let page2 = diff::locate_child_page(&conn, "test", Some(&wide), &mid_target, false, desc_sort)
+        .unwrap()
+        .unwrap();
+    assert_eq!(page2.start, 200);
+    assert_eq!(page2.rows.len(), 200);
+    assert!(page2.rows.iter().any(|r| r.node_id == mid_target));
+    let next_cursor = page2.next_cursor.as_deref().unwrap();
+    let page3 = diff::list_children(&conn, "test", Some(&wide), false, desc_sort, Some(next_cursor))
+        .unwrap();
+    assert_eq!(page3.rows.len(), 50);
+    assert_eq!(page3.rows[0].name, "item_049");
+
+    // Filtered out under changes_only, or belonging to a different parent, returns None.
+    assert!(
+        diff::locate_child_page(&conn, "test", Some(&wide), &unchanged, true, default_sort)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        diff::locate_child_page(&conn, "test", Some(&wide), &alien, false, default_sort)
+            .unwrap()
+            .is_none()
+    );
+    let filtered = diff::locate_child_page(&conn, "test", Some(&wide), &target, true, default_sort)
+        .unwrap()
+        .unwrap();
+    assert_eq!(filtered.start, 0);
+    assert_eq!(filtered.total_children, 1);
+    assert_eq!(filtered.rows[0].node_id, target);
+}
