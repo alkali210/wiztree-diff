@@ -50,7 +50,11 @@ export default function App() {
   } | null>(null);
   const [metric, setMetric] = useState<Metric>("size"),
     [mode, setMode] = useState<ChartMode>("after");
-  const [selectedName, setSelectedName] = useState("");
+  const [selectedLabel, setSelectedLabel] = useState<{
+    comparisonId: string;
+    nodeId: string;
+    name: string;
+  } | null>(null);
   const [rootReview, setRootReview] = useState<SnapshotSide | null>(null);
   const [comparison, setComparison] = useState<ComparisonSummary | null>(null),
     [error, setError] = useState(""),
@@ -99,26 +103,6 @@ export default function App() {
       generation.current++;
     };
   }, []);
-  useEffect(() => {
-    let live = true;
-    setSelectedName("");
-    if (comparison && selected)
-      void api.getDetails(comparison.comparisonId, selected).then(
-        (data) => {
-          if (live)
-            setSelectedName(
-              (data.after ?? data.before)?.path
-                .replace(/[\\/]+$/, "")
-                .split(/[\\/]/)
-                .pop() ?? "",
-            );
-        },
-        () => {},
-      );
-    return () => {
-      live = false;
-    };
-  }, [comparison, selected]);
   const allowed =
     comparison &&
     (!comparison.warnings.length || confirmed === comparison.comparisonId);
@@ -126,6 +110,13 @@ export default function App() {
     (nodeId: string, hit?: TreemapHit) => {
       if (!comparison || !allowed) return;
       setSelected(nodeId);
+      if (hit?.name) {
+        setSelectedLabel({
+          comparisonId: comparison.comparisonId,
+          nodeId,
+          name: hit.name,
+        });
+      }
       const expandTarget = hit ? hit.kind === "directory" : false;
       if (changesOnly && hit?.status === "unchanged") {
         setReveal({
@@ -141,6 +132,13 @@ export default function App() {
     },
     [allowed, changesOnly, comparison],
   );
+  const selectedName =
+    comparison &&
+    selected &&
+    selectedLabel?.comparisonId === comparison.comparisonId &&
+    selectedLabel.nodeId === selected
+      ? selectedLabel.name
+      : "";
   const largeComparison = !!comparison &&
     comparison.before.rows + comparison.after.rows >= DEFER_TREEMAP_ROWS;
   const treemapCollapsed = treemapPreference && treemapPreference.comparisonId === comparison?.comparisonId
@@ -304,6 +302,28 @@ export default function App() {
                   comparisonId={comparison.comparisonId}
                   nodeId={selected}
                   metric={metric}
+                  onDetails={(data) => {
+                    if (!data) {
+                      setSelectedLabel((prev) =>
+                        prev &&
+                        prev.comparisonId === comparison.comparisonId &&
+                        prev.nodeId !== selected
+                          ? null
+                          : prev,
+                      );
+                      return;
+                    }
+                    const name =
+                      (data.after ?? data.before)?.path
+                        .replace(/[\\/]+$/, "")
+                        .split(/[\\/]/)
+                        .pop() ?? "";
+                    setSelectedLabel({
+                      comparisonId: comparison.comparisonId,
+                      nodeId: data.nodeId,
+                      name,
+                    });
+                  }}
                 />
               )}
             </aside>

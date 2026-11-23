@@ -215,3 +215,38 @@ it("shows finalization progress and accepts completion only once after manual st
   expect(onReady).toHaveBeenCalledTimes(1);
   expect(onReady).toHaveBeenCalledWith("complete");
 });
+
+it("shows indeterminate progress without 0 B / 0 B during finalizing, and resets to 0 on failure", async () => {
+  render(<ImportPanel onReady={() => {}} />);
+  await waitFor(() => expect(native.handler).not.toBeNull());
+  drop(["C:\\before.csv"], 400);
+  drop(["C:\\after.csv"], 1200);
+  vi.mocked(api.getJob).mockResolvedValueOnce({
+    jobId: "pending-import",
+    state: "running",
+    phase: "finalizing",
+    bytesRead: "0",
+    totalBytes: "0",
+    rows: 12345,
+  });
+  await start();
+  const progressBar = screen.getByLabelText("导入进度") as HTMLProgressElement;
+  expect(progressBar.hasAttribute("value")).toBe(false);
+  expect(screen.getByText("共 12,345 条记录")).toBeTruthy();
+  expect(screen.queryByText(/0 B \/ 0 B/)).toBeNull();
+
+  act(() =>
+    native.progress!({
+      payload: {
+        jobId: "pending-import",
+        state: "failed",
+        phase: "finalizing",
+        bytesRead: "0",
+        totalBytes: "0",
+        rows: 12345,
+        error: { code: "INVALID_CSV", message: "boom" },
+      },
+    }),
+  );
+  expect(screen.getByLabelText("导入进度").getAttribute("value")).toBe("0");
+});

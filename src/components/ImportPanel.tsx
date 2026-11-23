@@ -218,43 +218,51 @@ export function ImportPanel({ onReady }: {
           </button>
         )}
       </div>
-      {job && job.state !== "ready" && (
-        <div className="progress-line">
-          <span>
-            {
+      {job && job.state !== "ready" && (() => {
+        const totalBytes = BigInt(job.totalBytes);
+        const indeterminate =
+          job.state === "running" &&
+          (job.phase === "finalizing" || totalBytes === 0n);
+        return (
+          <div className="progress-line">
+            <span>
               {
-                before: "导入之前",
-                after: "导入之后",
-                finalizing: "完成删除、层级与汇总",
-              }[job.phase]
-            }{" "}
-            ·{" "}
-            {
+                {
+                  before: "导入之前",
+                  after: "导入之后",
+                  finalizing: "完成删除、层级与汇总",
+                }[job.phase]
+              }{" "}
+              ·{" "}
               {
-                running: "处理中",
-                ready: "已完成",
-                cancelled: "已取消",
-                failed: "失败",
-              }[job.state]
-            }
-          </span>
-          <progress
-            aria-label="导入进度"
-            max={10000}
-            value={
-              BigInt(job.totalBytes) > 0n
-                ? Number(
-                    (BigInt(job.bytesRead) * 10000n) / BigInt(job.totalBytes),
-                  )
-                : 0
-            }
-          />
-          <span>
-            {bytes(job.bytesRead)} / {bytes(job.totalBytes)} ·{" "}
-            {job.rows.toLocaleString()} 条
-          </span>
-        </div>
-      )}
+                {
+                  running: "处理中",
+                  ready: "已完成",
+                  cancelled: "已取消",
+                  failed: "失败",
+                }[job.state]
+              }
+            </span>
+            <progress
+              aria-label="导入进度"
+              {...(indeterminate
+                ? {}
+                : {
+                    max: 10000,
+                    value:
+                      totalBytes > 0n
+                        ? Number((BigInt(job.bytesRead) * 10000n) / totalBytes)
+                        : 0,
+                  })}
+            />
+            <span>
+              {job.phase === "finalizing" || totalBytes === 0n
+                ? `共 ${job.rows.toLocaleString()} 条记录`
+                : `${bytes(job.bytesRead)} / ${bytes(job.totalBytes)} · ${job.rows.toLocaleString()} 条`}
+            </span>
+          </div>
+        );
+      })()}
       {error && <p className="error">{error}</p>}
     </section>
   );

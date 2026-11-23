@@ -75,3 +75,31 @@ it("ignores an old comparison response when the node ID is reused", async () => 
   expect(screen.queryByText("C:\\outdated.txt")).toBeNull();
   expect(screen.getByText("D:\\current.txt")).toBeTruthy();
 });
+
+it("notifies onDetails with null on reset and only delivers the latest resolved details", async () => {
+  const old = deferred<NodeDetails>(),
+    current = deferred<NodeDetails>();
+  vi.mocked(api.getDetails)
+    .mockReturnValueOnce(old.promise)
+    .mockReturnValueOnce(current.promise);
+  const onDetails = vi.fn();
+  const view = render(
+    <DetailsPanel comparisonId="one" nodeId="old" onDetails={onDetails} />,
+  );
+  expect(onDetails).toHaveBeenCalledWith(null);
+  onDetails.mockClear();
+
+  view.rerender(
+    <DetailsPanel comparisonId="one" nodeId="new" onDetails={onDetails} />,
+  );
+  expect(onDetails).toHaveBeenCalledWith(null);
+  onDetails.mockClear();
+
+  const latest = detail("new", "C:\\latest.txt");
+  await act(async () => current.resolve(latest));
+  expect(onDetails).toHaveBeenCalledTimes(1);
+  expect(onDetails).toHaveBeenCalledWith(latest);
+
+  await act(async () => old.resolve(detail("old", "C:\\stale.txt")));
+  expect(onDetails).toHaveBeenCalledTimes(1);
+});

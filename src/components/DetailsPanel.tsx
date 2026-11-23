@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { bytes, errorText, signed } from "../format";
 import type { Entry, Metric, NodeDetails } from "../types";
@@ -27,10 +27,12 @@ export function DetailsPanel({
   comparisonId,
   nodeId,
   metric = "size",
+  onDetails,
 }: {
   comparisonId: string;
   nodeId: string | null;
   metric?: Metric;
+  onDetails?: (details: NodeDetails | null) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [result, setResult] = useState<{
@@ -39,15 +41,21 @@ export function DetailsPanel({
       data: NodeDetails;
     } | null>(null),
     [error, setError] = useState("");
+  const onDetailsRef = useRef(onDetails);
+  onDetailsRef.current = onDetails;
   useEffect(() => {
     let live = true;
     setExpanded(false);
     setResult(null);
     setError("");
+    onDetailsRef.current?.(null);
     if (nodeId)
       void api.getDetails(comparisonId, nodeId).then(
         (data) => {
-          if (live) setResult({ id: nodeId, comparison: comparisonId, data });
+          if (live) {
+            setResult({ id: nodeId, comparison: comparisonId, data });
+            onDetailsRef.current?.(data);
+          }
         },
         (e) => {
           if (live) setError(errorText(e));
