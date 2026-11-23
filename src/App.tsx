@@ -9,6 +9,7 @@ import type {
   Metric,
   SnapshotSide,
   Status,
+  TreemapHit,
 } from "./types";
 import { ImportPanel } from "./components/ImportPanel";
 import {
@@ -65,6 +66,7 @@ export default function App() {
     comparisonId: string;
     path: Breadcrumb[];
     nodeId: string;
+    expand?: boolean;
   } | null>(null);
   const refresh = useCallback((comparisonId: string) => {
     requestedComparison.current = comparisonId;
@@ -120,6 +122,25 @@ export default function App() {
   const allowed =
     comparison &&
     (!comparison.warnings.length || confirmed === comparison.comparisonId);
+  const handleTreemapSelect = useCallback(
+    (nodeId: string, hit?: TreemapHit) => {
+      if (!comparison || !allowed) return;
+      setSelected(nodeId);
+      const expandTarget = hit ? hit.kind === "directory" : false;
+      if (changesOnly && hit?.status === "unchanged") {
+        setReveal({
+          comparisonId: comparison.comparisonId,
+          path: [],
+          nodeId,
+          expand: expandTarget,
+        });
+        setChangesOnly(false);
+      } else {
+        tree.current?.reveal(nodeId, expandTarget);
+      }
+    },
+    [allowed, changesOnly, comparison],
+  );
   const largeComparison = !!comparison &&
     comparison.before.rows + comparison.after.rows >= DEFER_TREEMAP_ROWS;
   const treemapCollapsed = treemapPreference && treemapPreference.comparisonId === comparison?.comparisonId
@@ -388,7 +409,7 @@ export default function App() {
                     mode={mode}
                     selectedId={selected}
                     comparisonId={comparison.comparisonId}
-                    onSelect={setSelected}
+                    onSelect={handleTreemapSelect}
                   />
                 </div>
               ) : null}

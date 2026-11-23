@@ -1,17 +1,50 @@
+import { forwardRef, useImperativeHandle } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import App from "./App";
 import { api } from "./api";
 import type { ComparisonSummary } from "./types";
 
-vi.mock("./api", () => ({api: {getComparison: vi.fn(), getFullTreemap: vi.fn(() => new Promise(() => {})), releaseTreemap: vi.fn(() => Promise.resolve())}}));
+const treeMocks = vi.hoisted(() => ({
+  reveal: vi.fn(),
+  navigate: vi.fn(),
+  lastProps: null as null | {
+    changesOnly: boolean;
+    reveal?: { comparisonId: string; nodeId: string; expand?: boolean } | null;
+  },
+}));
+vi.mock("./api", () => ({
+  api: {
+    getComparison: vi.fn(),
+    getFullTreemap: vi.fn(() => new Promise(() => {})),
+    releaseTreemap: vi.fn(() => Promise.resolve()),
+    hitTestTreemap: vi.fn(),
+    getTreemapBounds: vi.fn(() => Promise.resolve(null)),
+    getDetails: vi.fn(() => new Promise(() => {})),
+  },
+}));
 vi.mock("./components/ImportPanel", () => ({ImportPanel: ({onReady}: {onReady: (id: string) => void}) => <>
   <button onClick={() => onReady("small")}>small</button><button onClick={() => onReady("large")}>large</button>
 </>}));
 vi.mock("./components/CategoryPanel", () => ({CategoryPanel: () => null}));
 vi.mock("./components/DetailsPanel", () => ({DetailsPanel: () => null}));
 vi.mock("./components/FileTypePanel", () => ({FileTypePanel: () => null}));
-vi.mock("./components/DiffTree", () => ({DiffTree: () => <div>tree</div>}));
+vi.mock("./components/DiffTree", () => ({
+  DiffTree: forwardRef(function MockDiffTree(
+    props: {
+      changesOnly: boolean;
+      reveal?: { comparisonId: string; nodeId: string; expand?: boolean } | null;
+    },
+    ref,
+  ) {
+    treeMocks.lastProps = { changesOnly: props.changesOnly, reveal: props.reveal };
+    useImperativeHandle(ref, () => ({
+      reveal: treeMocks.reveal,
+      navigate: treeMocks.navigate,
+    }));
+    return <div>tree</div>;
+  }),
+}));
 
 function summary(comparisonId: string, rows: number, warnings: string[] = []): ComparisonSummary {
   const source = {path: "fixture.csv", description: null, rows, files: rows, folders: 0, roots: [], rootCount: 0, rootsTruncated: false, size: "0", allocated: "0"};
@@ -19,7 +52,14 @@ function summary(comparisonId: string, rows: number, warnings: string[] = []): C
   return {comparisonId, before: {...source, rows: 499999}, after: source, statuses: {files: counts, folders: counts}, warnings};
 }
 async function choose(id: string) { fireEvent.click(screen.getByText(id)); await act(async () => {}); }
-afterEach(async () => { cleanup(); await act(async () => {}); vi.clearAllMocks(); });
+afterEach(async () => {
+  cleanup();
+  await act(async () => {});
+  treeMocks.lastProps = null;
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  vi.clearAllMocks();
+});
 
 it("defers at the combined record threshold, loads on expand, and resets for a new comparison", async () => {
   vi.mocked(api.getComparison).mockImplementation(async id => summary(id, id === "large" ? 500001 : 500000));
@@ -94,4 +134,88 @@ it("allows switching global mode and metric from the top toolbar even while tree
   await act(async () => {});
   expect(api.getFullTreemap).toHaveBeenCalledTimes(1);
   expect(api.getFullTreemap).toHaveBeenLastCalledWith("large", "allocated", "delta", 0);
+});
+
+it("reveals treemap-clicked items in the diff tree and turns off changesOnly for unchanged hits", async () => {
+  class FakeBitmap {
+    complete = true;
+    naturalWidth = 4096;
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    set src(_v: string) {
+      queueMicrotask(() => this.onload?.());
+    }
+  }
+  vi.stubGlobal("Image", FakeBitmap);
+  vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+  vi.spyOn(HTMLCanvasElement.prototype, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 800, 400));
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+    scale: vi.fn(), clearRect: vi.fn(), drawImage: vi.fn(), strokeRect: vi.fn(),
+  } as unknown as CanvasRenderingContext2D);
+
+  vi.mocked(api.getComparison).mockResolvedValue(summary("small", 100));
+  vi.mocked(api.getFullTreemap).mockResolvedValue({
+    layoutId: "lay-1",
+    comparisonId: "small",
+    imageDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+    atlasWidth: 4096,
+    atlasHeight: 1024,
+    fileCount: 10,
+    visibleFileCount: 10,
+    renderedBlockCount: 10,
+    maxDepth: 0,
+    addedFileCount: 0,
+    weightTotal: "100",
+    positiveTotal: "0",
+    negativeTotal: "0",
+    netDelta: "0",
+    exportedTotal: "100",
+    labels: [],
+    warnings: [],
+  });
+  vi.mocked(api.hitTestTreemap)
+    .mockResolvedValueOnce({
+      nodeId: "n42",
+      name: "report.log",
+      path: "C:\\logs\\report.log",
+      extension: ".log",
+      weight: "50",
+      value: "50",
+      status: "modified",
+      kind: "file",
+      collapsed: false,
+      rect: { x: 0, y: 0, width: 0.5, height: 0.5 },
+    })
+    .mockResolvedValueOnce({
+      nodeId: "n99",
+      name: "Docs",
+      path: "C:\\Docs\\",
+      extension: "",
+      weight: "50",
+      value: "50",
+      status: "unchanged",
+      kind: "directory",
+      collapsed: false,
+      rect: { x: 0.5, y: 0, width: 0.5, height: 0.5 },
+    });
+
+  render(<App />);
+  await choose("small");
+  await act(async () => {});
+
+  const canvas = screen.getByLabelText("全部文件层级占用图");
+  fireEvent.click(canvas, { clientX: 200, clientY: 100 });
+  await act(async () => {});
+  expect(treeMocks.reveal).toHaveBeenCalledWith("n42", false);
+
+  fireEvent.click(screen.getByLabelText("仅变化"));
+  fireEvent.click(canvas, { clientX: 600, clientY: 100 });
+  await act(async () => {});
+  expect(treeMocks.lastProps?.changesOnly).toBe(false);
+  expect(treeMocks.lastProps?.reveal).toEqual({
+    comparisonId: "small",
+    path: [],
+    nodeId: "n99",
+    expand: true,
+  });
 });

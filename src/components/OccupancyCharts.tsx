@@ -23,7 +23,7 @@ interface Props {
   metric: Metric;
   mode: ChartMode;
   selectedId: string | null;
-  onSelect: (id: string) => void;
+  onSelect: (id: string, hit?: TreemapHit) => void;
 }
 function fitCaption(
   ctx: CanvasRenderingContext2D,
@@ -274,7 +274,7 @@ export function OccupancyCharts({
     const valid = () => mounted.current && visible.current && epoch.current.value === token &&
       seq === clickSeq.current && displayed.current === lease && !lease.released;
     void api.hitTestTreemap(data.comparisonId, data.layoutId, p.x, p.y).then(
-      (hit) => { if (valid() && hit) onSelect(hit.nodeId); },
+      (hit) => { if (valid() && hit) onSelect(hit.nodeId, hit); },
       (e) => { if (valid()) setError(errorText(e)); },
     );
   }

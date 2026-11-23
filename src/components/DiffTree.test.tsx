@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   act,
   cleanup,
@@ -10,11 +10,15 @@ import {
 import { afterEach, expect, it, vi } from "vitest";
 import { api } from "../api";
 import { resetSystemIconCacheForTest } from "../systemIcons";
-import type { ChildPage, ChildRow, ChildSort, Metric } from "../types";
-import { DiffTree } from "./DiffTree";
+import type { ChildPage, ChildRow, ChildSort, Metric, NodeDetails } from "../types";
+import { DiffTree, type TreeHandle } from "./DiffTree";
 
+const virtualMocks = vi.hoisted(() => ({
+  scrollToIndex: vi.fn(),
+  scrollToOffset: vi.fn(),
+}));
 vi.mock("../api", () => ({
-  api: { listChildren: vi.fn(), getSystemIcons: vi.fn() },
+  api: { listChildren: vi.fn(), getSystemIcons: vi.fn(), getDetails: vi.fn() },
 }));
 // Keep every row in this small viewport; exercise the real cache/navigation state.
 vi.mock("@tanstack/react-virtual", () => ({
@@ -25,8 +29,8 @@ vi.mock("@tanstack/react-virtual", () => ({
         start: index * 28,
       })),
     getTotalSize: () => count * 28,
-    scrollToIndex: vi.fn(),
-    scrollToOffset: vi.fn(),
+    scrollToIndex: virtualMocks.scrollToIndex,
+    scrollToOffset: virtualMocks.scrollToOffset,
   }),
 }));
 afterEach(() => {
@@ -313,4 +317,126 @@ it("toggles folder expansion on row double-click and prevents rapid disclosure c
   await act(async () => {});
   expect(screen.queryByText("BuildingBlocks")).toBeNull();
   expect(folderRow.getAttribute("aria-expanded")).toBe("false");
+});
+
+function details(nodeId: string, parentId: string | null): NodeDetails {
+  return {
+    nodeId,
+    parentId,
+    before: null,
+    after: null,
+    sizeDelta: "0",
+    allocatedDelta: "0",
+  };
+}
+
+it("reveals and scrolls to nested files without expanding them, and expands directories when requested", async () => {
+  vi.mocked(api.listChildren).mockImplementation(async (_id, parent) => {
+    if (!parent) return page(row("n1", "Root", true));
+    if (parent === "n1") return page(row("n2", "Sub", true));
+    if (parent === "n2") return page(row("n3", "target.bin", false));
+    return page();
+  });
+  vi.mocked(api.getDetails).mockImplementation(async (_id, nodeId) => {
+    if (nodeId === "n3") return details("n3", "n2");
+    if (nodeId === "n2") return details("n2", "n1");
+    return details(nodeId, null);
+  });
+
+  let handle: TreeHandle | null = null;
+  function Host() {
+    const ref = useRef<TreeHandle>(null);
+    const [selected, onSelect] = useState<string | null>(null);
+    const [scope, setScope] = useState("");
+    handle = ref.current;
+    return (
+      <>
+        <output aria-label="目录范围">{scope}</output>
+        <output aria-label="当前选中">{selected ?? ""}</output>
+        <DiffTree
+          ref={(v) => {
+            ref.current = v;
+            handle = v;
+          }}
+          comparisonId="c-one"
+          metric="size"
+          changesOnly={false}
+          selected={selected}
+          onSelect={onSelect}
+          onScope={(path) => setScope(path.map((item) => item.nodeId).join("/"))}
+        />
+      </>
+    );
+  }
+
+  render(<Host />);
+  await screen.findByText("Root");
+
+  await act(async () => {
+    handle!.reveal("n3", false);
+  });
+  await screen.findByText("target.bin");
+  expect(screen.getByLabelText("当前选中").textContent).toBe("n3");
+  expect(screen.getByLabelText("目录范围").textContent).toBe("n1/n2");
+  expect(virtualMocks.scrollToIndex).toHaveBeenCalledWith(2, { align: "center" });
+
+  virtualMocks.scrollToIndex.mockClear();
+  await act(async () => {
+    handle!.reveal("n2", true);
+  });
+  expect(screen.getByLabelText("当前选中").textContent).toBe("n2");
+  expect(screen.getByLabelText("目录范围").textContent).toBe("n1/n2");
+  expect(virtualMocks.scrollToIndex).toHaveBeenCalledWith(1, { align: "center" });
+});
+
+it("cancels an in-flight reveal when superseded by a newer reveal", async () => {
+  const firstDetails = (() => {
+    let resolve!: (value: NodeDetails) => void;
+    const promise = new Promise<NodeDetails>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  })();
+  vi.mocked(api.listChildren).mockImplementation(async (_id, parent) => {
+    if (!parent) return page(row("n1", "Alpha", true), row("n2", "Beta", true));
+    if (parent === "n2") return page(row("n4", "new.txt", false));
+    return page(row("n3", "old.txt", false));
+  });
+  vi.mocked(api.getDetails).mockImplementation(async (_id, nodeId) => {
+    if (nodeId === "n3") return firstDetails.promise;
+    if (nodeId === "n4") return details("n4", "n2");
+    return details(nodeId, null);
+  });
+
+  let handle: TreeHandle | null = null;
+  function Host() {
+    const [selected, onSelect] = useState<string | null>(null);
+    return (
+      <DiffTree
+        ref={(v) => {
+          handle = v;
+        }}
+        comparisonId="c-one"
+        metric="size"
+        changesOnly={false}
+        selected={selected}
+        onSelect={onSelect}
+        onScope={() => {}}
+      />
+    );
+  }
+
+  render(<Host />);
+  await screen.findByText("Alpha");
+
+  act(() => {
+    handle!.reveal("n3", false);
+    handle!.reveal("n4", false);
+  });
+  await screen.findByText("new.txt");
+  await act(async () => {
+    firstDetails.resolve(details("n3", "n1"));
+  });
+  expect(screen.queryByText("old.txt")).toBeNull();
+  expect(screen.getByText("new.txt")).toBeTruthy();
 });

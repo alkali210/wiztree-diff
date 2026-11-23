@@ -27,6 +27,7 @@ export interface Breadcrumb {
 }
 export interface TreeHandle {
   navigate: (nodeId: string, expandable: boolean) => void;
+  reveal: (nodeId: string, expandTarget: boolean) => void;
 }
 interface Props {
   comparisonId: string;
@@ -35,7 +36,12 @@ interface Props {
   selected: string | null;
   onSelect: (id: string) => void;
   onScope: (path: Breadcrumb[]) => void;
-  reveal?: { comparisonId: string; path: Breadcrumb[]; nodeId: string } | null;
+  reveal?: {
+    comparisonId: string;
+    path: Breadcrumb[];
+    nodeId: string;
+    expand?: boolean;
+  } | null;
 }
 interface Page {
   rows: ChildRow[];
@@ -73,7 +79,8 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     currentSelected = useRef(selected),
     viewport = useRef<Visible[]>([]),
     currentVisible = useRef<Visible[]>([]),
-    anchor = useRef<{ key: string; offset: number } | null>(null);
+    anchor = useRef<{ key: string; offset: number } | null>(null),
+    scrollTarget = useRef<string | null>(null);
   currentSelected.current = selected;
   const [, render] = useState(0),
     [hint, setHint] = useState(""),
@@ -144,7 +151,10 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     expanded.current.delete(id);
   }
   function collapse(id: string, invalidate = true) {
-    if (invalidate) navigation.current++;
+    if (invalidate) {
+      navigation.current++;
+      scrollTarget.current = null;
+    }
     drop(id);
     const index = scope.current.findIndex((x) => x.nodeId === id);
     if (index >= 0) {
@@ -329,12 +339,16 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
       onScope(scope.current);
     }
   }
-  async function navigate(id: string, expandable: boolean) {
+  async function revealNode(
+    id: string,
+    expandTarget: boolean,
+    scrollToTarget: boolean,
+  ) {
     currentSelected.current = id;
     onSelect(id);
     const generation = epoch.current,
       nav = ++navigation.current;
-    if (!expandable) return;
+    if (!expandTarget && !scrollToTarget) return;
     const live = () =>
       generation === epoch.current && nav === navigation.current;
     async function expand(node: string) {
@@ -363,7 +377,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
         const current = pages.current.get(parent);
         if (!current?.cursor || !live()) {
           if (live())
-            setHint("此目录不在当前过滤结果中，请关闭“仅变化”后定位。");
+            setHint("此项目不在当前过滤结果中，请关闭“仅变化”后定位。");
           return false;
         }
         if (!(await load(parent, true)) || !live()) return false;
@@ -383,20 +397,33 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
       }
       if (cursor && chain.length && !(await expand(cursor))) return;
       for (const step of chain.reverse()) {
+        if (!(await locate(step.node, step.parent || ""))) return;
         if (
-          !(await locate(step.node, step.parent || "")) ||
+          (step.node !== id || expandTarget) &&
+          find(step.node)?.expandable &&
           !(await expand(step.node))
         )
           return;
       }
-      if (!chain.length && !(await expand(id))) return;
+      if (
+        !chain.length &&
+        expandTarget &&
+        find(id)?.expandable &&
+        !(await expand(id))
+      )
+        return;
     } catch (error) {
       if (live()) setHint(errorText(error));
       return;
     }
     if (!live()) return;
-    scope.current = ancestors(id);
+    const chainScope = ancestors(id);
+    scope.current =
+      expandTarget && expanded.current.has(id)
+        ? chainScope
+        : chainScope.slice(0, -1);
     onScope(scope.current);
+    if (scrollToTarget) scrollTarget.current = id;
     redraw();
   }
   async function reloadFirst(parent: string) {
@@ -414,7 +441,10 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
   }
   useImperativeHandle(ref, () => ({
     navigate: (id, dir) => {
-      void navigate(id, dir);
+      void revealNode(id, dir, false);
+    },
+    reveal: (id, expandTarget) => {
+      void revealNode(id, expandTarget, true);
     },
   }));
   useEffect(() => {
@@ -427,6 +457,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
     const generation = epoch.current;
     navigation.current++;
     anchor.current = null;
+    scrollTarget.current = null;
     viewport.current = [];
     pages.current.clear();
     expanded.current.clear();
@@ -466,13 +497,14 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
       }
       if (!(await load(""))) return;
       if (!changesOnly && reveal?.comparisonId === comparisonId) {
-        setHint("已关闭“仅变化”，以定位占用图中的目录。");
+        setHint("已关闭“仅变化”，以定位占用图中的项目。");
         for (const p of reveal.path) {
           if (generation !== epoch.current) return;
-          await navigate(p.nodeId, true);
+          await revealNode(p.nodeId, true, false);
           if (scope.current.at(-1)?.nodeId !== p.nodeId) return;
         }
-        if (generation === epoch.current) await navigate(reveal.nodeId, true);
+        if (generation === epoch.current)
+          await revealNode(reveal.nodeId, reveal.expand ?? true, true);
       }
     })();
     return () => {
@@ -525,18 +557,27 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
   const getIcon = useSystemIcons(visibleIconKeys);
   useLayoutEffect(() => {
     const saved = anchor.current;
-    if (!saved) return;
+    const target = scrollTarget.current;
+    if (!saved && !target) return;
     anchor.current = null;
+    scrollTarget.current = null;
     const generation = epoch.current,
       nav = navigation.current;
     // The virtualizer synchronously notifies React on scroll. Restore outside
     // React’s layout lifecycle, and discard an anchor from a superseded view.
     queueMicrotask(() => {
       if (generation !== epoch.current || nav !== navigation.current) return;
-      const index = currentVisible.current.findIndex(
-        (v) => visibleKey(v) === saved.key,
-      );
-      if (index >= 0) virtual.scrollToOffset(index * 28 + saved.offset);
+      if (saved) {
+        const index = currentVisible.current.findIndex(
+          (v) => visibleKey(v) === saved.key,
+        );
+        if (index >= 0) virtual.scrollToOffset(index * 28 + saved.offset);
+      } else if (target) {
+        const index = currentVisible.current.findIndex(
+          (v) => "row" in v && v.row.nodeId === target,
+        );
+        if (index >= 0) virtual.scrollToIndex(index, { align: "center" });
+      }
     });
   });
   function key(event: React.KeyboardEvent) {
@@ -569,7 +610,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
       }
     } else if (node) {
       if (event.key === "ArrowRight" && node.row.expandable)
-        void navigate(node.row.nodeId, true);
+        void revealNode(node.row.nodeId, true, false);
       if (event.key === "ArrowLeft") {
         if (expanded.current.has(node.row.nodeId)) collapse(node.row.nodeId);
         else if (node.parent) select(node.parent);
@@ -718,7 +759,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
                     return;
                   }
                   if (expanded.current.has(r.nodeId)) collapse(r.nodeId);
-                  else void navigate(r.nodeId, true);
+                  else void revealNode(r.nodeId, true, false);
                 }}
               >
                 <span
@@ -736,7 +777,7 @@ export const DiffTree = forwardRef<TreeHandle, Props>(function DiffTree(
                       e.stopPropagation();
                       expanded.current.has(r.nodeId)
                         ? collapse(r.nodeId)
-                        : void navigate(r.nodeId, true);
+                        : void revealNode(r.nodeId, true, false);
                     }}
                     onDoubleClick={(e) => e.stopPropagation()}
                   >
