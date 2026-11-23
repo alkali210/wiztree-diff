@@ -75,3 +75,23 @@ it("uses icon-only independent panel toggles without a collapse notice", async (
   expect(screen.getByRole("separator", {name: "调整目录树与扩展名宽度"})).toBeTruthy();
   expect(api.getFullTreemap).not.toHaveBeenCalled();
 });
+
+it("allows switching global mode and metric from the top toolbar even while treemap is collapsed", async () => {
+  const largeSummary = summary("large", 500001);
+  largeSummary.before = { ...largeSummary.before, size: "1024", allocated: "4096" };
+  largeSummary.after = { ...largeSummary.after, size: "2048", allocated: "8192" };
+  vi.mocked(api.getComparison).mockResolvedValue(largeSummary);
+  render(<App />);
+  await choose("large");
+  expect(api.getFullTreemap).not.toHaveBeenCalled();
+  expect(screen.getByTitle("2048 B").textContent).toBe("2.00 KiB");
+  fireEvent.click(screen.getByRole("button", { name: "分配大小" }));
+  fireEvent.click(screen.getByRole("button", { name: "差异视图" }));
+  await act(async () => {});
+  expect(api.getFullTreemap).not.toHaveBeenCalled();
+  expect(screen.getByTitle("8192 B").textContent).toBe("8.00 KiB");
+  fireEvent.click(screen.getByRole("button", { name: "展开占用图" }));
+  await act(async () => {});
+  expect(api.getFullTreemap).toHaveBeenCalledTimes(1);
+  expect(api.getFullTreemap).toHaveBeenLastCalledWith("large", "allocated", "delta", 0);
+});

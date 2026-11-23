@@ -216,14 +216,27 @@ main {
   flex: 1;
   min-height: 0;
 }
+.workspace-bar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.workspace-view-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 .workspace-controls {
   display: flex;
   flex: none;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
+  justify-content: flex-end;
+  gap: 3px;
 }
-.workspace-controls { justify-content: flex-end; gap: 3px; }
 .workspace-controls .panel-toggle {
   display: inline-flex;
   align-items: center;

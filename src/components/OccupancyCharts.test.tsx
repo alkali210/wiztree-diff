@@ -56,7 +56,7 @@ function frame(layoutId: string, fileCount: number, comparisonId = "one"): FullT
 }
 function chart(comparisonId: string, mode: ChartMode, selectedId: string | null = null, onSelect = (_id: string) => {}, active = true) {
   return <OccupancyCharts comparisonId={comparisonId} metric="size" mode={mode}
-    active={active} onMetricChange={() => {}} onModeChange={() => {}} selectedId={selectedId} onSelect={onSelect} />;
+    active={active} selectedId={selectedId} onSelect={onSelect} />;
 }
 async function flush() { await act(async () => {}); }
 async function load() { await act(async () => Bitmap.instances.at(-1)!.load()); }

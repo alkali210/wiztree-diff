@@ -155,13 +155,51 @@ export default function App() {
       )}
       {comparison && (
         <>
-          <div className="workspace-controls">
-            <PanelToggle panel="left" label="左侧栏" expanded={!sidebarCollapsed} controls="workspace-sidebar"
-              onClick={() => setSidebarCollapsed((value) => !value)} />
-            <PanelToggle panel="bottom" label="占用图" expanded={!treemapCollapsed} controls="workspace-treemap" disabled={!allowed}
-              onClick={() => setTreemapPreference({ comparisonId: comparison.comparisonId, collapsed: !treemapCollapsed })} />
-            <PanelToggle panel="right" label="右侧栏" expanded={!extensionsCollapsed} controls="workspace-extensions"
-              onClick={() => setExtensionsCollapsed((value) => !value)} />
+          <div className="workspace-bar">
+            <div className="workspace-view-controls">
+              <div className="segmented" role="group" aria-label="视图模式">
+                {(["before", "after", "delta"] as const).map((m, i) => (
+                  <button
+                    key={m}
+                    type="button"
+                    aria-label={["之前视图", "之后视图", "差异视图"][i]}
+                    aria-pressed={mode === m}
+                    className={mode === m ? "active" : ""}
+                    onClick={() => setMode(m)}
+                  >
+                    {["之前", "之后", "差异"][i]}
+                  </button>
+                ))}
+              </div>
+              <div className="segmented" role="group" aria-label="统计指标">
+                <button
+                  type="button"
+                  aria-label="逻辑大小"
+                  aria-pressed={metric === "size"}
+                  className={metric === "size" ? "active" : ""}
+                  onClick={() => setMetric("size")}
+                >
+                  大小
+                </button>
+                <button
+                  type="button"
+                  aria-label="分配大小"
+                  aria-pressed={metric === "allocated"}
+                  className={metric === "allocated" ? "active" : ""}
+                  onClick={() => setMetric("allocated")}
+                >
+                  分配
+                </button>
+              </div>
+            </div>
+            <div className="workspace-controls">
+              <PanelToggle panel="left" label="左侧栏" expanded={!sidebarCollapsed} controls="workspace-sidebar"
+                onClick={() => setSidebarCollapsed((value) => !value)} />
+              <PanelToggle panel="bottom" label="占用图" expanded={!treemapCollapsed} controls="workspace-treemap" disabled={!allowed}
+                onClick={() => setTreemapPreference({ comparisonId: comparison.comparisonId, collapsed: !treemapCollapsed })} />
+              <PanelToggle panel="right" label="右侧栏" expanded={!extensionsCollapsed} controls="workspace-extensions"
+                onClick={() => setExtensionsCollapsed((value) => !value)} />
+            </div>
           </div>
           <div className="workspace">
             <aside id="workspace-sidebar" className="left-pane" hidden={sidebarCollapsed}>
@@ -348,8 +386,6 @@ export default function App() {
                     active={!treemapCollapsed}
                     metric={metric}
                     mode={mode}
-                    onMetricChange={setMetric}
-                    onModeChange={setMode}
                     selectedId={selected}
                     comparisonId={comparison.comparisonId}
                     onSelect={setSelected}

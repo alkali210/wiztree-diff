@@ -22,8 +22,6 @@ interface Props {
   comparisonId: string;
   metric: Metric;
   mode: ChartMode;
-  onMetricChange: (v: Metric) => void;
-  onModeChange: (v: ChartMode) => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
 }
@@ -53,8 +51,6 @@ export function OccupancyCharts({
   comparisonId,
   metric,
   mode,
-  onMetricChange,
-  onModeChange,
   selectedId,
   onSelect,
 }: Props) {
@@ -337,37 +333,6 @@ export function OccupancyCharts({
             </button>
             <small>0 = 无限制</small>
           </form>
-          <div className="segmented">
-            {(["before", "after", "delta"] as const).map((m, i) => (
-              <button
-                key={m}
-                aria-label={["之前占用图", "之后占用图", "差异占用图"][i]}
-                aria-pressed={mode === m}
-                className={mode === m ? "active" : ""}
-                onClick={() => onModeChange(m)}
-              >
-                {["之前", "之后", "差异"][i]}
-              </button>
-            ))}
-          </div>
-          <div className="segmented">
-            <button
-              aria-label="逻辑大小图表"
-              aria-pressed={metric === "size"}
-              className={metric === "size" ? "active" : ""}
-              onClick={() => onMetricChange("size")}
-            >
-              大小
-            </button>
-            <button
-              aria-label="分配大小图表"
-              aria-pressed={metric === "allocated"}
-              className={metric === "allocated" ? "active" : ""}
-              onClick={() => onMetricChange("allocated")}
-            >
-              分配
-            </button>
-          </div>
         </div>
       </header>
       {error ? (
